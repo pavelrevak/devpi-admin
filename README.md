@@ -1,98 +1,133 @@
 # devpi-admin
 
-A static web frontend for managing [devpi](https://devpi.net/) servers — a full-featured alternative to the
-read-only `devpi-web` UI.
+A modern web UI plugin for [devpi-server](https://devpi.net/) — a drop-in replacement for
+`devpi-web`. Ships as a Python package that registers itself as a devpi-server plugin via the
+standard entry point mechanism, so a single `pip install devpi-admin` is enough.
 
-Pure HTML + CSS + vanilla JS. No build step, no framework, no backend — just copy the files and serve them
-behind the same origin as devpi.
+The UI itself is a bundled single-page application (pure HTML + CSS + vanilla JavaScript, no
+build step) served under `/+admin/`. All devpi REST API endpoints remain untouched — the SPA
+talks to the standard devpi JSON API directly.
 
 ## Features
 
-- **Dashboard** with server info and cache metrics (from `/+status`)
+- **Dashboard** with server info and cache metrics (`/+status`)
 - **Index browser** with visual cards color-coded by type (stage / volatile / mirror)
 - **Users** management — create, edit, delete (admin only)
-- **Index** management — create / edit / delete, configure `bases` (with drag & drop priority and
+- **Index** management — create / edit / delete, configure `bases` (drag & drop priority,
   transitive inheritance detection), `volatile`, `acl_upload` (tag picker), `mirror_url`
-- **Package browser** with client-side search and pagination for large mirrors (e.g. `root/pypi`'s 780k
-  packages — explicit download prompt before fetching the 17 MB index)
-- **Package detail** in a PyPI-like layout: sidebar with metadata, version list, install command,
-  file downloads; main area renders the README (markdown via `marked.js`)
-- **Copy-to-clipboard** `pip install` commands with a toggle for `pip.conf` mode (short form vs. full
-  `--index-url` / `--trusted-host`)
+- **Package browser** with client-side search and pagination, including an explicit
+  download prompt for huge mirrors (e.g. `root/pypi`'s ~780 k packages / 17 MB index)
+- **Package detail** in a PyPI-like layout: sidebar with metadata, version list, install
+  command, file downloads; main area renders the README (markdown via `marked.js`)
+- **Copy-to-clipboard `pip install`** commands with a `pip.conf` toggle
+  (short form vs. full `--index-url` / `--trusted-host`)
 - **`pip.conf` generator** — download a ready-to-use config per index
-- **Anonymous browsing** — users can explore public indexes without logging in; admin actions appear only
-  after authentication
-- **Dark / light / auto theme**, mobile menu, ESC + outside-click dismissal of dialogs
+- **Anonymous browsing** — visitors can explore public indexes without logging in; admin
+  actions appear only after authentication
+- **Dark / light / auto theme**, responsive mobile menu, ESC + outside-click dismissal of
+  dialogs
+
+## Installation
+
+```bash
+pip install devpi-admin
+```
+
+This pulls in `devpi-server` as a dependency. If you are using devpi in a dedicated venv
+(recommended), install the plugin into the same venv:
+
+```bash
+/var/lib/pypi/venv/bin/pip install devpi-admin
+systemctl --user restart devpi      # or however you run devpi-server
+```
+
+You should uninstall `devpi-web` first — `devpi-admin` provides all the web UI you need:
+
+```bash
+pip uninstall devpi-web
+```
+
+## Usage
+
+After restart, open:
+
+```
+http://<your-devpi-host>:3141/
+```
+
+Browser visits to `/` are redirected to `/+admin/`, which serves the SPA. Direct links like
+`http://<host>:3141/+admin/#packages/ci/testing` work and can be bookmarked.
+
+devpi CLI tools and other JSON clients are unaffected — they send `Accept: application/json`
+and bypass the redirect.
+
+## How it works
+
+`devpi-admin` registers a `devpi_server` entry point that hooks into `devpiserver_pyramid_configure`
+to:
+
+1. Serve the bundled static assets under `/+admin/` via a Pyramid static view.
+2. Add an explicit view at `/+admin/` that returns `index.html` (so the directory itself
+   resolves to the SPA entry point).
+3. Install a tween that redirects HTML browser requests on `/` to `/+admin/` while leaving
+   JSON requests intact.
+
+No changes are made to the devpi REST API.
 
 ## Requirements
 
-- A running devpi server (tested against devpi-server 6.19, devpi-web 5.0)
-- A reverse proxy (e.g. nginx) that serves the static files **on the same origin** as the devpi API, so
-  the browser can hit the devpi REST endpoints without CORS
+- Python 3.9+
+- devpi-server 6.0+
+- A browser with ES6 support and `Promise`, `fetch`, `sessionStorage`
 
-## Deployment
+## Routes (UI)
 
-1. Copy the contents of this directory to your web server (`index.html`, `css/`, `js/`).
-2. Configure nginx to serve the app alongside devpi on the same host, e.g.:
+Routing is hash-based, so any of these URLs can be bookmarked or shared:
 
-   ```nginx
-   server {
-       listen 80;
-       server_name devpi.example.com;
-
-       # Admin UI
-       location /admin/ {
-           alias /var/www/devpi-admin/;
-           try_files $uri $uri/ /admin/index.html;
-       }
-
-       # devpi API + devpi-web
-       location / {
-           proxy_pass http://127.0.0.1:3141;
-           proxy_set_header Host $host;
-           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-       }
-   }
-   ```
-
-3. Open `http://devpi.example.com/admin/` in your browser.
-
-The app calls the devpi REST API directly from the browser using relative URLs (`/`, `/+login`,
-`/<user>/<index>`, ...), so all requests land on the nginx proxy which forwards them to devpi.
-
-## Authentication
-
-Login uses `POST /+login`. The returned token is stored in `sessionStorage` and sent as a
-base64-encoded `X-Devpi-Auth: <user>:<token>` header with subsequent requests. Tokens expire after
-10 hours (devpi default).
-
-Unauthenticated visitors can browse the status dashboard, indexes, packages, and READMEs — anything
-devpi exposes publicly.
+- `/+admin/#` — Status dashboard (default)
+- `/+admin/#indexes` — all indexes
+- `/+admin/#indexes/<user>` — filtered to one user
+- `/+admin/#packages/<user>/<index>` — packages in an index
+- `/+admin/#package/<user>/<index>/<name>` — package detail (latest version)
+- `/+admin/#package/<user>/<index>/<name>?version=<ver>` — specific version
+- `/+admin/#users` — users admin (requires login)
 
 ## Project layout
 
 ```
 devpi-admin/
-├── index.html          — single entry point
-├── css/style.css       — all styles (light + dark theme via CSS variables)
-├── js/
-│   ├── api.js          — tiny devpi REST wrapper (login, auth, CRUD)
-│   ├── theme.js        — theme toggle (light / dark / auto)
-│   ├── marked.min.js   — vendored markdown renderer
-│   └── app.js          — routing, views, rendering
-└── README.md           — this file
+├── pyproject.toml
+├── README.md
+└── src/
+    └── devpi_admin/
+        ├── __init__.py
+        ├── main.py              — Pyramid hooks & tween
+        └── static/
+            ├── index.html       — SPA entry
+            ├── css/style.css
+            └── js/
+                ├── api.js       — devpi REST wrapper
+                ├── theme.js     — theme toggle (light/dark/auto)
+                ├── marked.min.js  — vendored markdown renderer
+                └── app.js       — routing, views, rendering
 ```
 
-Routing is hash-based:
+## Development
 
-- `#` — Status dashboard (default)
-- `#indexes` — all indexes
-- `#indexes/<user>` — filtered to one user
-- `#packages/<user>/<index>` — packages in an index
-- `#package/<user>/<index>/<name>` — package detail (latest version)
-- `#package/<user>/<index>/<name>?version=<ver>` — specific version
-- `#users` — users admin (requires login)
+```bash
+git clone <repo>
+cd devpi-admin
+pip install -e .
+```
+
+The static files live at `src/devpi_admin/static/` and can be edited in place — changes
+show up on the next browser reload, no restart of devpi-server required (static views
+read from disk on each request).
+
+## Author
+
+Pavel Revak <pavelrevak@gmail.com>
 
 ## License
 
-Internal tool. No license declared.
+MIT — see [LICENSE](LICENSE).

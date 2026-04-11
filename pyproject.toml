@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devpi-admin"
+dynamic = ["version"]
+description = "Modern web UI plugin for devpi-server — drop-in replacement for devpi-web"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Pavel Revak", email = "pavelrevak@gmail.com" },
+]
+keywords = ["devpi", "pypi", "admin", "web", "ui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Pyramid",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Software Distribution",
+]
+dependencies = [
+    "devpi-server>=6.0",
+]
+
+[project.entry-points.devpi_server]
+devpi-admin = "devpi_admin.main"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/devpi_admin/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/devpi_admin"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/devpi_admin",
+    "tests",
+    "README.md",
+    "pyproject.toml",
+    "LICENSE",
+]
