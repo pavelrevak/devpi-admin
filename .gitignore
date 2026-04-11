@@ -1,0 +1,15 @@
+__pycache__
+build
+*.egg-info
+*.venv
+*.whl
+.DS_Store
+.uuid
+*.pyc
+.*
+!.gitignore
+!.github
+!.gitea
+lpr_db/_version.py
+*.md
+!README*.md
