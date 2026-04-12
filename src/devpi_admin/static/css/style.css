@@ -198,15 +198,27 @@ body {
     font-weight: 600;
     color: var(--text);
     background: var(--bg);
+    cursor: pointer;
+}
+
+.user-btn-name:hover {
+    background: var(--bg-alt);
+    color: var(--accent);
+}
+
+.user-btn-sep {
+    padding: 4px 0;
+    color: var(--border);
+    font-size: 0.85em;
+    user-select: none;
 }
 
 .user-btn-action {
     padding: 4px 10px;
     color: var(--text-muted);
-    border-left: 1px solid var(--border);
 }
 
-.user-btn:hover .user-btn-action {
+.user-btn-action:hover {
     background: var(--error);
     color: #fff;
 }
@@ -349,6 +361,31 @@ body {
     gap: 8px;
     margin-left: auto;
     flex-shrink: 0;
+}
+
+/* --- User cards --- */
+
+.user-card {
+    border-left-color: var(--text-faint);
+}
+
+.user-card .kebab-menu {
+    margin-left: auto;
+}
+
+.user-card-indexes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.user-card-indexes .tag {
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.user-card-indexes .tag:hover {
+    opacity: 0.8;
 }
 
 /* --- Index cards --- */

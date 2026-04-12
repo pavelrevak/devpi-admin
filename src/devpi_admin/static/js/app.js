@@ -405,13 +405,7 @@
     }
 
     function handleApiError(err) {
-        if (err && err.status === 401) {
-            Api.logout();
-            updateAuthUI();
-            showError(new Error('Session expired. Please log in again.'));
-        } else {
-            showError(err);
-        }
+        showError(err);
     }
 
     function updateNav() {
@@ -462,11 +456,14 @@
         var user = Api.getUser();
         if (user) {
             clear(logoutBtn);
-            logoutBtn.appendChild(el('span', {className: 'user-btn-name', textContent: user}));
+            var nameSpan = el('span', {className: 'user-btn-name', textContent: user});
+            nameSpan.title = 'Change password';
+            logoutBtn.appendChild(nameSpan);
+            logoutBtn.appendChild(el('span', {className: 'user-btn-sep', textContent: '|'}));
             logoutBtn.appendChild(el('span', {className: 'user-btn-action', textContent: 'Logout'}));
             loginBtn.hidden = true;
             logoutBtn.hidden = false;
-            navUsers.hidden = false;
+            navUsers.hidden = user !== 'root';
             document.body.classList.add('authenticated');
         } else {
             loginBtn.hidden = false;
@@ -515,6 +512,7 @@
                 closeModal();
                 updateAuthUI();
                 navigate();
+                _triggerPasswordSave(user, pass);
             })
             .catch(showModalError);
     }
@@ -545,7 +543,19 @@
         });
     }
 
-    logoutBtn.addEventListener('click', function () {
+    logoutBtn.addEventListener('click', function (e) {
+        // Clicking the username part opens change-password modal
+        if (e.target.classList.contains('user-btn-name')) {
+            var user = Api.getUser();
+            if (user) {
+                fetchRoot().then(function (result) {
+                    showUserModal(user, result[user] || {});
+                }).catch(function () {
+                    showUserModal(user, {});
+                });
+            }
+            return;
+        }
         Api.logout();
         updateAuthUI();
         window.location.hash = '#';
@@ -581,7 +591,7 @@
         } else if ((m = path.match(/^package\/([^/]+\/[^/]+)\/(.+)$/))) {
             loadPackageDetail(m[1], m[2], query.version);
         } else if (path === 'users') {
-            if (!Api.getUser()) {
+            if (!Api.getUser() || Api.getUser() !== 'root') {
                 loadStatus();
                 return;
             }
@@ -603,73 +613,82 @@
         showLoading();
         fetchRoot().then(function (result) {
             clear(content);
-            var header = el('div', {className: 'view-header'}, [
-                el('h2', {textContent: 'Users'}),
-                el('button', {
+            var headerChildren = [el('h2', {textContent: 'Users'})];
+            if (Api.getUser() === 'root') {
+                headerChildren.push(el('button', {
                     className: 'btn btn-primary',
                     textContent: '+ New User',
                     onclick: function () { showUserModal(null, null); },
-                }),
-            ]);
+                }));
+            }
+            var header = el('div', {className: 'view-header'}, headerChildren);
             content.appendChild(header);
 
             var userNames = getAllUserNames(result);
-            var table = el('table', {className: 'data-table'});
-            var thead = el('thead');
-            thead.appendChild(el('tr', null, [
-                el('th', {textContent: 'User'}),
-                el('th', {textContent: 'Email'}),
-                el('th', {textContent: 'Indexes'}),
-                el('th', {textContent: 'Actions'}),
-            ]));
-            table.appendChild(thead);
-            var tbody = el('tbody');
+            var grid = el('div', {className: 'index-grid'});
             for (var i = 0; i < userNames.length; i++) {
                 (function (name) {
                     var info = result[name];
                     var indexes = info.indexes || {};
-                    var indexNames = Object.keys(indexes);
-                    var indexCell = el('td');
-                    var indexList = el('div', {className: 'index-list'});
-                    for (var j = 0; j < indexNames.length; j++) {
-                        var idx = indexes[indexNames[j]];
-                        var tagClass = 'tag';
-                        if (idx.type === 'mirror') tagClass += ' tag-mirror';
-                        if (idx.volatile) tagClass += ' tag-volatile';
-                        indexList.appendChild(
-                            el('span', {
+                    var indexNames = Object.keys(indexes).sort();
+                    var currentUser = Api.getUser();
+                    var canEdit = currentUser === name || currentUser === 'root';
+
+                    var card = el('div', {className: 'index-card user-card'});
+
+                    // Card head: username + kebab menu
+                    var cardHead = el('div', {className: 'index-card-head'});
+                    cardHead.appendChild(el('a', {
+                        href: '#indexes/' + name,
+                        className: 'index-card-name',
+                        textContent: name,
+                    }));
+                    var menuItems = [];
+                    if (canEdit) {
+                        menuItems.push({label: 'Edit', onclick: function () { closeAllKebabs(); showUserModal(name, info); }});
+                    }
+                    if (currentUser === 'root' && name !== 'root') {
+                        menuItems.push({label: 'Delete', danger: true, onclick: function () { closeAllKebabs(); deleteUser(name); }});
+                    }
+                    if (menuItems.length) {
+                        cardHead.appendChild(buildKebabMenu(menuItems));
+                    }
+                    card.appendChild(cardHead);
+
+                    // Details
+                    var details = el('div', {className: 'index-card-details'});
+                    if (info.email) {
+                        details.appendChild(el('div', {className: 'index-card-row'}, [
+                            el('span', {className: 'index-card-label', textContent: 'Email'}),
+                            el('span', {textContent: info.email}),
+                        ]));
+                    }
+                    if (indexNames.length) {
+                        var tagsWrap = el('div', {className: 'index-card-row'});
+                        tagsWrap.appendChild(el('span', {className: 'index-card-label', textContent: 'Indexes'}));
+                        var tagsGroup = el('div', {className: 'user-card-indexes'});
+                        for (var j = 0; j < indexNames.length; j++) {
+                            var idx = indexes[indexNames[j]];
+                            var tagClass = 'tag';
+                            if (idx.type === 'mirror') tagClass += ' tag-mirror';
+                            else if (idx.volatile) tagClass += ' tag-volatile';
+                            tagsGroup.appendChild(el('a', {
+                                href: '#packages/' + name + '/' + indexNames[j],
                                 className: tagClass,
                                 textContent: indexNames[j],
-                                title: idx.type +
-                                    (idx.volatile ? ', volatile' : '') +
-                                    (idx.bases ? ', bases: ' + idx.bases.join(', ') : ''),
-                            })
-                        );
+                                title: idx.type + (idx.volatile ? ', volatile' : '') +
+                                    (idx.bases && idx.bases.length ? ', bases: ' + idx.bases.join(', ') : ''),
+                            }));
+                        }
+                        tagsWrap.appendChild(tagsGroup);
+                        details.appendChild(tagsWrap);
                     }
-                    indexCell.appendChild(indexList);
-                    var actions = el('td', {className: 'actions'}, [
-                        el('button', {
-                            className: 'btn btn-small',
-                            textContent: 'Edit',
-                            onclick: function () { showUserModal(name, info); },
-                        }),
-                        el('button', {
-                            className: 'btn btn-small btn-danger',
-                            textContent: 'Delete',
-                            onclick: function () { deleteUser(name); },
-                        }),
-                    ]);
-                    var tr = el('tr', null, [
-                        el('td', {textContent: name}),
-                        el('td', {textContent: info.email || ''}),
-                        indexCell,
-                        actions,
-                    ]);
-                    tbody.appendChild(tr);
+                    card.appendChild(details);
+
+                    grid.appendChild(card);
                 })(userNames[i]);
             }
-            table.appendChild(tbody);
-            content.appendChild(table);
+            content.appendChild(grid);
         }).catch(handleApiError);
     }
 
@@ -686,9 +705,30 @@
                     id: 'form-email',
                     value: (editInfo && editInfo.email) || '',
                 })));
+                var isSelf = isEdit && editName === Api.getUser();
+                // Hidden username input so browser associates saved password correctly
+                if (isSelf) {
+                    var hiddenUser = el('input', {type: 'text', id: 'form-hidden-username'});
+                    hiddenUser.setAttribute('autocomplete', 'username');
+                    hiddenUser.setAttribute('aria-hidden', 'true');
+                    hiddenUser.style.display = 'none';
+                    hiddenUser.value = editName;
+                    body.appendChild(hiddenUser);
+                }
+                var pwInput;
+                if (isSelf) {
+                    // Own password: type="password" + autocomplete so browser offers to save
+                    pwInput = el('input', {type: 'password', id: 'form-password'});
+                    pwInput.setAttribute('autocomplete', 'new-password');
+                } else {
+                    // Other user: plain text — Safari won't offer to save text fields
+                    pwInput = el('input', {type: 'text', id: 'form-password'});
+                    pwInput.setAttribute('autocomplete', 'off');
+                    pwInput.setAttribute('spellcheck', 'false');
+                }
                 body.appendChild(formGroup(
                     isEdit ? 'New Password (leave empty to keep)' : 'Password',
-                    el('input', {type: 'password', id: 'form-password'})
+                    pwInput
                 ));
             },
             [
@@ -722,7 +762,8 @@
             }
         }
         var email = document.getElementById('form-email').value.trim();
-        var password = document.getElementById('form-password').value;
+        var passwordEl = document.getElementById('form-password');
+        var password = passwordEl ? passwordEl.value : null;
 
         if (email) data.email = email;
         if (password) data.password = password;
@@ -732,10 +773,41 @@
         var method = isEdit ? Api.patch : Api.put;
         method(url, data)
             .then(function () {
-                closeModal();
+                if (password && isEdit && editName === Api.getUser()) {
+                    // Own password — trigger "Save Password" before closing modal
+                    closeModal();
+                    _triggerPasswordSave(editName, password, 'users');
+                } else {
+                    // Other user — wipe field value before close so browser has nothing to save
+                    if (passwordEl) passwordEl.value = '';
+                    closeModal();
+                }
                 loadUsers();
             })
             .catch(showModalError);
+    }
+
+    function _triggerPasswordSave(user, password, hash) {
+        var form = document.createElement('form');
+        form.method = 'post';
+        form.action = '/+admin' + (hash ? '#' + hash : '');  // devpi 302-redirects to /+admin/ — PRG pattern, Ctrl+R won't resubmit
+        form.style.cssText = 'display:none';
+        var u = document.createElement('input');
+        u.type = 'text';
+        u.name = 'username';
+        u.setAttribute('autocomplete', 'username');
+        u.value = user;
+        var p = document.createElement('input');
+        p.type = 'password';
+        p.name = 'password';
+        p.setAttribute('autocomplete', 'current-password');
+        p.value = password;
+        form.appendChild(u);
+        form.appendChild(p);
+        form.addEventListener('submit', function (e) { e.preventDefault(); });
+        document.body.appendChild(form);
+        form.submit();
+        document.body.removeChild(form);
     }
 
     function deleteUser(name) {
@@ -774,16 +846,17 @@
             headingChildren.push(el('a', {href: '#indexes/' + _filterUser, textContent: _filterUser}));
         }
         var heading = el('h2', {className: 'page-heading'}, headingChildren);
-        headerContainer.appendChild(el('div', {className: 'view-header'}, [
-            heading,
-            el('button', {
-                className: 'btn btn-primary auth-only',
+        var viewHeaderChildren = [heading];
+        if (Api.getUser() === 'root') {
+            viewHeaderChildren.push(el('button', {
+                className: 'btn btn-primary',
                 textContent: '+ New Index',
                 onclick: function () {
                     showIndexModal(null, result, _filterUser);
                 },
-            }),
-        ]));
+            }));
+        }
+        headerContainer.appendChild(el('div', {className: 'view-header'}, viewHeaderChildren));
 
         var container = document.getElementById('indexes-content');
         clear(container);
@@ -872,15 +945,19 @@
                         ]));
                     }
                 }
+
                 card.appendChild(details);
 
                 card.appendChild(buildIndexPipBlock(idx._full));
 
-                // Kebab menu (top-right)
-                cardHead.appendChild(buildKebabMenu([
-                    {label: 'Edit', onclick: function () { closeAllKebabs(); showIndexModal(idx, result); }},
-                    {label: 'Delete', danger: true, onclick: function () { closeAllKebabs(); deleteIndex(idx._full); }},
-                ]));
+                // Kebab menu — only for root or the index owner
+                var loggedIn = Api.getUser();
+                if (loggedIn === 'root' || loggedIn === idx._user) {
+                    cardHead.appendChild(buildKebabMenu([
+                        {label: 'Edit', onclick: function () { closeAllKebabs(); showIndexModal(idx, result); }},
+                        {label: 'Delete', danger: true, onclick: function () { closeAllKebabs(); deleteIndex(idx._full); }},
+                    ]));
+                }
 
                 grid.appendChild(card);
             })(indexes[i]);
@@ -940,14 +1017,16 @@
             isEdit ? 'Edit Index: ' + editIdx._full : 'New Index',
             function (body) {
                 if (!isEdit) {
+                    var currentUser = Api.getUser();
+                    var owners = currentUser === 'root' ? userNames : [currentUser];
                     var ownerSelect = el('select', {id: 'form-owner'});
-                    for (var u = 0; u < userNames.length; u++) {
+                    for (var u = 0; u < owners.length; u++) {
                         ownerSelect.appendChild(el('option', {
-                            value: userNames[u],
-                            textContent: userNames[u],
+                            value: owners[u],
+                            textContent: owners[u],
                         }));
                     }
-                    ownerSelect.value = preOwner || Api.getUser();
+                    ownerSelect.value = preOwner || currentUser;
                     body.appendChild(formGroup('Owner', ownerSelect));
                     body.appendChild(formGroup('Index Name', el('input', {type: 'text', id: 'form-index-name'})));
                 }
@@ -992,10 +1071,10 @@
                     ]),
                 ]));
 
-                var aclInitial = isEdit ? (editIdx.acl_upload || []) : [Api.getUser()];
+                var aclUploadInitial = isEdit ? (editIdx.acl_upload || []) : [Api.getUser()];
                 stageFields.appendChild(el('div', {className: 'form-group'}, [
                     el('label', {textContent: 'ACL Upload'}),
-                    buildTagPicker('form-acl-upload', aclInitial, userNames, [':ANONYMOUS:']),
+                    buildTagPicker('form-acl-upload', aclUploadInitial, userNames, [':ANONYMOUS:']),
                 ]));
 
                 mirrorFields.appendChild(formGroup('Mirror URL', el('input', {
@@ -1891,6 +1970,12 @@
     }
 
     // --- Init ---
+
+    window.onSessionExpired = function () {
+        updateAuthUI();
+        closeModal();
+        showError(new Error('Session expired. Please log in again.'));
+    };
 
     Api.restore();
     updateAuthUI();

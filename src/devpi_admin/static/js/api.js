@@ -26,6 +26,13 @@ var Api = (function () {
         }
         return fetch(url, opts).then(function (res) {
             if (res.status === 204) return null;
+            if (res.status === 401 && _user) {
+                logout();
+                if (typeof onSessionExpired === 'function') onSessionExpired();
+                var err = new Error('Session expired. Please log in again.');
+                err.status = 401;
+                throw err;
+            }
             return res.json().then(function (json) {
                 if (!res.ok) {
                     var msg = json.message || json.error || 'Request failed';
