@@ -10,22 +10,57 @@ talks to the standard devpi JSON API directly.
 
 ## Features
 
-- **Dashboard** with server info and cache metrics (`/+status`)
-- **Index browser** with visual cards color-coded by type (stage / volatile / mirror)
-- **Users** management — create, edit, delete (admin only)
-- **Index** management — create / edit / delete, configure `bases` (drag & drop priority,
-  transitive inheritance detection), `volatile`, `acl_upload` (tag picker), `mirror_url`
-- **Package browser** with client-side search and pagination, including an explicit
-  download prompt for huge mirrors (e.g. `root/pypi`'s ~780 k packages / 17 MB index)
-- **Package detail** in a PyPI-like layout: sidebar with metadata, version list, install
-  command, file downloads; main area renders the README (markdown via `marked.js`)
-- **Copy-to-clipboard `pip install`** commands with a `pip.conf` toggle
-  (short form vs. full `--index-url` / `--trusted-host`)
-- **`pip.conf` generator** — download a ready-to-use config per index
+### Dashboard
+- Server info with version of devpi-server and all installed plugins (auto-detected)
+- Cache metrics with hit-rate bars (storage, changelog, relpath caches)
+- Whoosh search index queue status
+
+### Indexes
+- Visual cards color-coded by type: green (stage), amber (volatile stage), blue (mirror)
+- `pip install` command with copy-to-clipboard (click to copy, green flash feedback)
+- `pip.conf` toggle — switch between short form and full `--index-url` / `--trusted-host`
+- `pip.conf` generator — download a ready-to-use config per index
+- Create / edit / delete indexes via modal dialogs
+- `bases` editor with drag & drop priority ordering and transitive inheritance display
+- `acl_upload` tag picker with user selection dropdown
+- `volatile`, `mirror_url`, `title` configuration
+
+### Users
+- Create, edit (email, password), delete users (admin only)
+
+### Packages
+- Client-side search with PEP 503 name normalization
+- Mirror indexes: shows only cached packages (fast filesystem scan, no 17 MB index download);
+  "Download full index" button available for complete browse
+- Package cards with latest version and `pip install` command
+
+### Package detail (PyPI-like layout)
+- **Sidebar**: metadata (author, license, Python version, keywords, platform, maintainer,
+  extras, project URLs, dependencies), `pip install` command, file downloads with upload dates
+- **Version list**: cached versions shown normally, uncached versions link to pypi.org (↗);
+  "Load all versions" button for mirrors
+- **README**: rendered markdown (via `marked.js`); fetched from PyPI.org for mirror packages
+  where devpi doesn't cache the description
+
+### General
 - **Anonymous browsing** — visitors can explore public indexes without logging in; admin
-  actions appear only after authentication
-- **Dark / light / auto theme**, responsive mobile menu, ESC + outside-click dismissal of
-  dialogs
+  actions (create/edit/delete) appear only after authentication
+- **Dark / light / auto theme** with half-circle icon for auto mode
+- **Responsive mobile menu** with hamburger toggle
+- **ESC + outside-click** dismissal for modals, dropdown menus, mobile menu
+- **Login via modal** — no separate login page
+
+## Plugin API endpoints
+
+In addition to serving the SPA, `devpi-admin` registers custom API endpoints under
+`/+admin-api/` for features that the standard devpi REST API doesn't provide efficiently:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/+admin-api/cached/{user}/{index}` | GET | List cached package names for a mirror index (filesystem scan) |
+| `/+admin-api/versions/{user}/{index}/{project}` | GET | Version list with cached/uncached distinction |
+| `/+admin-api/versions/{user}/{index}/{project}?all=1` | GET | Include all upstream versions (mirrors) |
+| `/+admin-api/versiondata/{user}/{index}/{project}/{version}` | GET | Metadata + file links for a single version |
 
 ## Installation
 
@@ -41,11 +76,15 @@ This pulls in `devpi-server` as a dependency. If you are using devpi in a dedica
 systemctl --user restart devpi      # or however you run devpi-server
 ```
 
-You should uninstall `devpi-web` first — `devpi-admin` provides all the web UI you need:
+You should uninstall `devpi-web` — `devpi-admin` replaces it entirely:
 
 ```bash
 pip uninstall devpi-web
 ```
+
+Both plugins can technically coexist but it is not recommended. `devpi-admin` intercepts `/`
+for HTML requests while `devpi-web` would still serve its own HTML on other routes like
+`/<user>/<index>/<package>`, leading to a confusing mixed experience.
 
 ## Usage
 
@@ -63,34 +102,38 @@ and bypass the redirect.
 
 ## How it works
 
-`devpi-admin` registers a `devpi_server` entry point that hooks into `devpiserver_pyramid_configure`
-to:
+`devpi-admin` registers a `devpi_server` entry point that hooks into
+`devpiserver_pyramid_configure` (with `@hookimpl` from pluggy) to:
 
 1. Serve the bundled static assets under `/+admin/` via a Pyramid static view.
-2. Add an explicit view at `/+admin/` that returns `index.html` (so the directory itself
-   resolves to the SPA entry point).
-3. Install a tween that redirects HTML browser requests on `/` to `/+admin/` while leaving
+2. Add an explicit view at `/+admin/` that returns `index.html`.
+3. Register custom API views under `/+admin-api/` for cached-package and per-version queries.
+4. Install a tween that redirects HTML browser requests on `/` to `/+admin/` while leaving
    JSON requests intact.
 
-No changes are made to the devpi REST API.
+The plugin uses devpi-server internals (`xom.model.getstage`, `stage.list_versions`,
+`stage.get_versiondata`, `stage.get_releaselinks`) and direct filesystem access
+(`serverdir/+files/`) for the cached-packages API.
 
 ## Requirements
 
 - Python 3.9+
 - devpi-server 6.0+
-- A browser with ES6 support and `Promise`, `fetch`, `sessionStorage`
+- A browser with ES6 support (`Promise`, `fetch`, `sessionStorage`)
 
 ## Routes (UI)
 
 Routing is hash-based, so any of these URLs can be bookmarked or shared:
 
-- `/+admin/#` — Status dashboard (default)
-- `/+admin/#indexes` — all indexes
-- `/+admin/#indexes/<user>` — filtered to one user
-- `/+admin/#packages/<user>/<index>` — packages in an index
-- `/+admin/#package/<user>/<index>/<name>` — package detail (latest version)
-- `/+admin/#package/<user>/<index>/<name>?version=<ver>` — specific version
-- `/+admin/#users` — users admin (requires login)
+| Hash | View |
+|------|------|
+| `#` | Status dashboard (default) |
+| `#indexes` | All indexes |
+| `#indexes/<user>` | Indexes filtered by user |
+| `#packages/<user>/<index>` | Packages in an index |
+| `#package/<user>/<index>/<name>` | Package detail (latest cached version) |
+| `#package/<user>/<index>/<name>?version=<ver>` | Specific version |
+| `#users` | User management (requires login) |
 
 ## Project layout
 
@@ -98,18 +141,30 @@ Routing is hash-based, so any of these URLs can be bookmarked or shared:
 devpi-admin/
 ├── pyproject.toml
 ├── README.md
-└── src/
-    └── devpi_admin/
-        ├── __init__.py
-        ├── main.py              — Pyramid hooks & tween
-        └── static/
-            ├── index.html       — SPA entry
-            ├── css/style.css
-            └── js/
-                ├── api.js       — devpi REST wrapper
-                ├── theme.js     — theme toggle (light/dark/auto)
-                ├── marked.min.js  — vendored markdown renderer
-                └── app.js       — routing, views, rendering
+├── LICENSE
+├── .github/workflows/
+│   ├── tests.yml            — CI on push/PR (Python 3.10 + 3.14)
+│   └── publish.yml          — publish to PyPI on release
+├── src/
+│   └── devpi_admin/
+│       ├── __init__.py      — version (from git tag via hatch-vcs)
+│       ├── main.py          — Pyramid hooks, tween, API views
+│       └── static/
+│           ├── index.html   — SPA entry point
+│           ├── css/style.css
+│           └── js/
+│               ├── api.js       — devpi REST wrapper + auth
+│               ├── theme.js     — theme toggle (light/dark/auto)
+│               ├── marked.min.js  — vendored markdown renderer
+│               └── app.js       — routing, views, rendering
+└── tests/
+    ├── test_cached_versions.py  — filesystem scan (tmpdir)
+    ├── test_helpers.py          — filename parsing, normalization
+    ├── test_hooks.py            — pluggy hook registration
+    ├── test_json_safe.py        — readonly view conversion
+    ├── test_package.py          — entry point, static files
+    ├── test_tween.py            — redirect behavior
+    └── test_wants_html.py       — Accept header heuristic
 ```
 
 ## Development
@@ -117,12 +172,13 @@ devpi-admin/
 ```bash
 git clone <repo>
 cd devpi-admin
-pip install -e .
+python -m venv .venv
+.venv/bin/pip install -e .
 ```
 
 The static files live at `src/devpi_admin/static/` and can be edited in place — changes
 show up on the next browser reload, no restart of devpi-server required (static views
-read from disk on each request).
+read from disk on each request). Python changes (`main.py`) require a devpi-server restart.
 
 Run the unit tests:
 
@@ -132,6 +188,15 @@ PYTHONWARNINGS="ignore::UserWarning" python -m unittest discover -v tests/
 
 (The `PYTHONWARNINGS` shim hides an unrelated deprecation warning emitted by Pyramid 2.1
 when it imports `pkg_resources`.)
+
+## Releasing
+
+Version is derived from the git tag via `hatch-vcs`. To release:
+
+1. `git tag v0.1.0 && git push --tags`
+2. On GitHub: Releases → Draft new release → select tag → Publish
+3. The `publish.yml` workflow runs tests, builds wheel+sdist, and uploads to PyPI via trusted
+   publishing (no API tokens needed — configure the GitHub environment `pypi` in PyPI settings).
 
 ## Author
 

@@ -321,7 +321,21 @@
 
     document.addEventListener('click', closeAllKebabs);
 
+    var _activeTimers = [];
+
+    function registerTimer(id) {
+        _activeTimers.push(id);
+    }
+
+    function clearActiveTimers() {
+        for (var i = 0; i < _activeTimers.length; i++) {
+            clearTimeout(_activeTimers[i]);
+        }
+        _activeTimers = [];
+    }
+
     function showLoading() {
+        clearActiveTimers();
         clear(content);
         content.appendChild(el('p', {className: 'loading', textContent: 'Loading...'}));
     }
@@ -698,7 +712,6 @@
     function loadIndexes() {
         showLoading();
         fetchRoot().then(function (result) {
-            _indexResult = result;
             clear(content);
 
             content.appendChild(el('div', {id: 'indexes-header'}));
@@ -706,8 +719,6 @@
             renderIndexCards(result);
         }).catch(handleApiError);
     }
-
-    var _indexResult = null;
 
     function renderIndexCards(result) {
         // Update heading
@@ -1142,59 +1153,94 @@
             el('a', {href: '#packages/' + indexPath, textContent: idxName}),
         ]));
 
-        // Check index type first via cached root listing — if unknown, use GET to learn type
-        // We need to know if it's mirror BEFORE fetching /<user>/<index> because
-        // mirror indexes return 17MB+ JSON. Use the indexes listing instead.
+        // Detect mirror type to decide fetching strategy.
         Api.get('/' + idxUser).then(function (userData) {
             var indexInfo = (userData.result.indexes || {})[idxName];
             if (indexInfo && indexInfo.type === 'mirror') {
-                // Show download prompt
-                var warn = el('div', {className: 'mirror-warning'});
-                warn.appendChild(el('div', {className: 'mirror-warning-title', textContent: 'Large mirror index'}));
-                warn.appendChild(el('p', {
-                    textContent: 'This is a mirror index that may contain hundreds of thousands of packages. Downloading the full index can take several seconds and use ~17 MB of data.',
-                }));
-                warn.appendChild(el('button', {
-                    className: 'btn btn-primary',
-                    textContent: 'Download index',
-                    onclick: function () { fetchAndRender(true); },
-                }));
-                content.appendChild(warn);
+                fetchMirror();
             } else {
-                fetchAndRender(false);
+                fetchStage();
             }
         }).catch(function () {
-            // Fall back to direct fetch if we can't determine type
-            fetchAndRender(false);
+            fetchStage();
         });
 
-        function fetchAndRender(isMirror) {
-            // Replace with loading
+        function fetchStage() {
+            showHeadingAndLoading();
+            Api.get('/' + indexPath).then(function (data) {
+                renderPackages(indexPath, data.result, false);
+            }).catch(handleApiError);
+        }
+
+        function fetchMirror() {
+            showHeadingAndLoading(true);
+            Api.get('/+admin-api/cached/' + indexPath).then(function (data) {
+                var cached = data.result || [];
+                var total = data.total || 0;
+                var fakeResult = {projects: cached, type: 'mirror', _total: total};
+                renderPackages(indexPath, fakeResult, true);
+            }).catch(function () {
+                // Plugin API not available — show only the download button
+                var loading = content.querySelector('.loading');
+                if (loading) loading.remove();
+                content.appendChild(el('p', {
+                    className: 'text-muted',
+                    textContent: 'Cached packages API not available. Use the "Download full index" button to browse.',
+                }));
+            });
+        }
+
+        function showHeadingAndLoading(isMirror) {
             clear(content);
-            content.appendChild(el('h2', {className: 'page-heading'}, [
+            var heading = el('h2', {className: 'page-heading'}, [
                 el('a', {href: '#indexes', textContent: 'Indexes'}),
                 ' / ',
                 el('a', {href: '#indexes/' + idxUser, textContent: idxUser}),
                 ' / ',
                 el('a', {href: '#packages/' + indexPath, textContent: idxName}),
-            ]));
+            ]);
+            if (isMirror) {
+                var dlBtn = el('button', {
+                    className: 'btn btn-small',
+                    textContent: 'Download full index',
+                    onclick: function () {
+                        showHeadingAndLoading(true);
+                        Api.get('/' + indexPath).then(function (data) {
+                            renderPackages(indexPath, data.result, true);
+                        }).catch(handleApiError);
+                    },
+                });
+                content.appendChild(el('div', {className: 'view-header'}, [
+                    heading, dlBtn,
+                ]));
+            } else {
+                content.appendChild(heading);
+            }
             content.appendChild(el('p', {className: 'loading', textContent: 'Loading...'}));
-
-            Api.get('/' + indexPath).then(function (data) {
-                renderPackages(indexPath, data.result, isMirror);
-            }).catch(handleApiError);
         }
     }
 
     function renderPackages(indexPath, result, isMirror) {
         var projects = result.projects || [];
+        var totalUpstream = result._total || 0;
         var loading = content.querySelector('.loading');
         if (loading) loading.remove();
+
+        // Mirror cached summary
+        if (isMirror && totalUpstream) {
+            content.appendChild(el('div', {className: 'mirror-info'}, [
+                el('span', {textContent: projects.length + ' cached'}),
+                ' of ',
+                el('span', {textContent: formatNum(totalUpstream) + ' upstream packages'}),
+            ]));
+        }
 
         if (projects.length === 0) {
             content.appendChild(el('p', {
                 className: 'text-muted',
-                textContent: 'No packages in this index.',
+                textContent: isMirror
+                    ? 'No cached packages yet. Packages are cached on first access via pip.'
+                    : 'No packages in this index.',
             }));
             return;
         }
@@ -1203,9 +1249,7 @@
         var searchInput = el('input', {
             type: 'text',
             className: 'pkg-search-input',
-            placeholder: isMirror
-                ? 'Search ' + formatNum(projects.length) + ' packages...'
-                : 'Filter packages...',
+            placeholder: 'Filter ' + projects.length + ' packages...',
         });
         searchBar.appendChild(searchInput);
         content.appendChild(searchBar);
@@ -1257,6 +1301,7 @@
         searchInput.addEventListener('input', function () {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(render, 150);
+            registerTimer(debounceTimer);
         });
         searchInput.focus();
         render();
@@ -1275,12 +1320,37 @@
 
     function loadPackageDetail(indexPath, pkg, selectedVersion) {
         showLoading();
-        Api.get('/' + indexPath + '/' + pkg).then(function (data) {
+        var versionsUrl = '/+admin-api/versions/' + indexPath + '/' + pkg;
+        Api.get(versionsUrl).then(function (verData) {
+            var cachedVersions = (verData.cached || []).sort(compareVersions);
+            var allVersions = verData.all ? verData.all.sort(compareVersions) : null;
+            var versions = cachedVersions;
+            var currentVer = selectedVersion && versions.indexOf(selectedVersion) !== -1
+                ? selectedVersion : versions[0];
+            if (!currentVer && allVersions) {
+                currentVer = selectedVersion && allVersions.indexOf(selectedVersion) !== -1
+                    ? selectedVersion : allVersions[0];
+            }
+            if (!currentVer) {
+                clear(content);
+                showError(new Error('No versions found'));
+                return;
+            }
+            var detailUrl = '/+admin-api/versiondata/' + indexPath + '/' + pkg + '/' + currentVer;
+            return Api.get(detailUrl).then(function (detail) {
+                return {cachedVersions: cachedVersions, allVersions: allVersions,
+                    currentVer: currentVer, info: detail.result || {}};
+            }).catch(function () {
+                return {cachedVersions: cachedVersions, allVersions: allVersions,
+                    currentVer: currentVer, info: {version: currentVer, name: pkg}};
+            });
+        }).then(function (ctx) {
+            if (!ctx) return;
+            var cachedVersions = ctx.cachedVersions;
+            var allVersions = ctx.allVersions;
+            var currentVer = ctx.currentVer;
+            var info = ctx.info;
             clear(content);
-            var result = data.result;
-            var versions = Object.keys(result).sort(compareVersions);
-            var currentVer = selectedVersion && result[selectedVersion] ? selectedVersion : versions[0];
-            var info = result[currentVer] || {};
 
             // Breadcrumb
             var parts = indexPath.split('/');
@@ -1297,7 +1367,7 @@
                 el('span', {className: 'page-heading-version', textContent: 'v' + currentVer}),
             ]));
 
-            if (versions.length === 0) {
+            if (cachedVersions.length === 0 && !allVersions) {
                 content.appendChild(el('p', {
                     className: 'text-muted',
                     textContent: 'No versions found.',
@@ -1338,7 +1408,9 @@
             if (info.home_page) infoRows.push(['Home', info.home_page]);
             if (info.keywords) infoRows.push(['Keywords', info.keywords]);
             if (info.platform && info.platform.length) {
-                infoRows.push(['Platform', info.platform.join(', ')]);
+                var plat = Array.isArray(info.platform)
+                    ? info.platform.join(', ') : String(info.platform);
+                infoRows.push(['Platform', plat]);
             }
             for (var ri = 0; ri < infoRows.length; ri++) {
                 infoCard.appendChild(el('div', {className: 'pkg-sidebar-row'}, [
@@ -1385,13 +1457,18 @@
                 var urlList = el('ul', {className: 'pkg-sidebar-list'});
                 for (var ue = 0; ue < urlEntries.length; ue++) {
                     var li = el('li');
-                    li.appendChild(el('a', {
-                        href: urlEntries[ue][1],
-                        textContent: urlEntries[ue][0],
-                        target: '_blank',
-                        rel: 'noopener',
-                        className: 'pkg-sidebar-link',
-                    }));
+                    var urlHref = urlEntries[ue][1];
+                    if (isSafeUrl(urlHref)) {
+                        li.appendChild(el('a', {
+                            href: urlHref,
+                            textContent: urlEntries[ue][0],
+                            target: '_blank',
+                            rel: 'noopener',
+                            className: 'pkg-sidebar-link',
+                        }));
+                    } else {
+                        li.appendChild(el('span', {textContent: urlEntries[ue][0] + ': ' + urlHref}));
+                    }
                     urlList.appendChild(li);
                 }
                 infoCard.appendChild(urlList);
@@ -1439,26 +1516,35 @@
 
             // Versions list
             var versCard = el('div', {className: 'pkg-sidebar-section'});
+            var cachedSet = {};
+            for (var ci = 0; ci < cachedVersions.length; ci++) {
+                cachedSet[cachedVersions[ci]] = true;
+            }
+            var hasMirrorAll = allVersions !== null && allVersions.length > cachedVersions.length;
+
             var versHead = el('div', {className: 'pkg-sidebar-versions-head'}, [
                 el('span', {className: 'pkg-sidebar-title', textContent: 'Versions'}),
-                el('span', {className: 'pkg-sidebar-count', textContent: String(versions.length)}),
+                el('span', {className: 'pkg-sidebar-count',
+                    textContent: String(cachedVersions.length) +
+                        (hasMirrorAll ? ' / ' + allVersions.length : '')}),
             ]);
             versCard.appendChild(versHead);
 
             var versList = el('div', {className: 'pkg-version-list'});
-            for (var v = 0; v < versions.length; v++) {
-                (function (ver) {
-                    var isCurrent = ver === currentVer;
-                    var row = el('div', {className: 'pkg-version-row' + (isCurrent ? ' pkg-version-active' : '')});
-                    var link = el('a', {
+
+            function buildVersionRow(ver, isCached) {
+                var isCurrent = ver === currentVer;
+                var cls = 'pkg-version-row';
+                if (isCurrent) cls += ' pkg-version-active';
+                if (!isCached) cls += ' pkg-version-uncached';
+                var row = el('div', {className: cls});
+                if (isCached) {
+                    row.appendChild(el('a', {
                         href: '#package/' + indexPath + '/' + pkg + '?version=' + encodeURIComponent(ver),
                         className: 'pkg-version-link',
                         textContent: 'v' + ver,
-                    });
-                    row.appendChild(link);
-
-                    // Delete button
-                    var delBtn = el('button', {
+                    }));
+                    row.appendChild(el('button', {
                         className: 'pkg-version-del auth-only',
                         textContent: '\u00d7',
                         title: 'Delete version',
@@ -1467,40 +1553,192 @@
                             e.stopPropagation();
                             deleteVersion(indexPath, pkg, ver);
                         },
-                    });
-                    row.appendChild(delBtn);
-                    versList.appendChild(row);
-                })(versions[v]);
+                    }));
+                } else {
+                    row.appendChild(el('a', {
+                        href: 'https://pypi.org/project/' + pkg + '/' + ver + '/',
+                        className: 'pkg-version-link',
+                        textContent: 'v' + ver,
+                        target: '_blank',
+                        rel: 'noopener',
+                        title: 'View on PyPI (not cached)',
+                    }));
+                    row.appendChild(el('span', {
+                        className: 'pkg-version-ext',
+                        textContent: '\u2197',
+                    }));
+                }
+                return row;
             }
+
+            // Show cached versions
+            for (var v = 0; v < cachedVersions.length; v++) {
+                versList.appendChild(buildVersionRow(cachedVersions[v], true));
+            }
+
+            // "Show all versions" button for mirrors
+            if (hasMirrorAll) {
+                var allList = el('div', {className: 'pkg-version-hidden', hidden: true});
+                var uncachedVersions = [];
+                for (var a = 0; a < allVersions.length; a++) {
+                    if (!cachedSet[allVersions[a]]) {
+                        uncachedVersions.push(allVersions[a]);
+                    }
+                }
+                for (var u = 0; u < uncachedVersions.length; u++) {
+                    allList.appendChild(buildVersionRow(uncachedVersions[u], false));
+                }
+                versList.appendChild(allList);
+
+                var showAllBtn = el('button', {
+                    className: 'pkg-version-more',
+                    textContent: 'Show all ' + allVersions.length + ' versions',
+                    onclick: function () {
+                        allList.hidden = false;
+                        showAllBtn.hidden = true;
+                    },
+                });
+                versList.appendChild(showAllBtn);
+            } else if (!allVersions) {
+                // Mirror: all versions not yet loaded
+                var loadAllBtn = el('button', {
+                    className: 'pkg-version-more',
+                    textContent: 'Load all versions...',
+                    onclick: function () {
+                        loadAllBtn.textContent = 'Loading...';
+                        loadAllBtn.disabled = true;
+                        Api.get('/+admin-api/versions/' + indexPath + '/' + pkg + '?all=1')
+                            .then(function (data) {
+                                var all = (data.all || []).sort(compareVersions);
+                                loadAllBtn.hidden = true;
+                                var uncached = [];
+                                for (var i = 0; i < all.length; i++) {
+                                    if (!cachedSet[all[i]]) uncached.push(all[i]);
+                                }
+                                for (var j = 0; j < uncached.length; j++) {
+                                    versList.insertBefore(
+                                        buildVersionRow(uncached[j], false),
+                                        loadAllBtn);
+                                }
+                                // Update count
+                                var countEl = versHead.querySelector('.pkg-sidebar-count');
+                                if (countEl) {
+                                    countEl.textContent = cachedVersions.length + ' / ' + all.length;
+                                }
+                            })
+                            .catch(function () {
+                                loadAllBtn.textContent = 'Failed to load';
+                            });
+                    },
+                });
+                versList.appendChild(loadAllBtn);
+            }
+
             versCard.appendChild(versList);
             sidebar.appendChild(versCard);
 
             layout.appendChild(sidebar);
 
-            // === Main content: README ===
+            // === Main content: README (loaded async) ===
             var main = el('main', {className: 'pkg-main'});
-
-            if (info.description) {
-                var body = el('div', {className: 'markdown-body'});
-                var isMarkdown = (info.description_content_type || '').indexOf('markdown') !== -1;
-                if (isMarkdown && window.marked) {
-                    body.innerHTML = marked.parse(info.description);
-                } else {
-                    var pre = document.createElement('pre');
-                    pre.textContent = info.description;
-                    body.appendChild(pre);
-                }
-                main.appendChild(body);
-            } else {
-                main.appendChild(el('p', {
-                    className: 'text-muted',
-                    textContent: 'No description / README available for this version.',
-                }));
-            }
-
+            var readmeSlot = el('div', {className: 'readme-slot'});
+            readmeSlot.appendChild(el('p', {className: 'loading', textContent: 'Loading README...'}));
+            main.appendChild(readmeSlot);
             layout.appendChild(main);
             content.appendChild(layout);
+
+            if (info.description) {
+                clear(readmeSlot);
+                renderReadme(readmeSlot, info.description, info.description_content_type);
+            } else {
+                fetchUpstreamReadme(indexPath, pkg, currentVer, function (desc, contentType) {
+                    clear(readmeSlot);
+                    if (desc) {
+                        renderReadme(readmeSlot, desc, contentType);
+                    } else {
+                        readmeSlot.appendChild(el('p', {
+                            className: 'text-muted',
+                            textContent: 'No description / README available for this version.',
+                        }));
+                    }
+                });
+            }
         }).catch(handleApiError);
+    }
+
+    function isSafeUrl(url) {
+        return /^https?:\/\//i.test(url);
+    }
+
+    function sanitizeHtml(html) {
+        // Strip dangerous tags and attributes from rendered markdown
+        var tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        var dangerous = tmp.querySelectorAll('script,iframe,object,embed,form,base,meta,link');
+        for (var i = 0; i < dangerous.length; i++) {
+            dangerous[i].remove();
+        }
+        // Remove event handlers and javascript: URLs from all elements
+        var all = tmp.querySelectorAll('*');
+        for (var j = 0; j < all.length; j++) {
+            var attrs = all[j].attributes;
+            for (var k = attrs.length - 1; k >= 0; k--) {
+                var name = attrs[k].name.toLowerCase();
+                if (name.indexOf('on') === 0) {
+                    all[j].removeAttribute(attrs[k].name);
+                } else if ((name === 'href' || name === 'src' || name === 'action') &&
+                        /^\s*javascript\s*:/i.test(attrs[k].value)) {
+                    all[j].removeAttribute(attrs[k].name);
+                }
+            }
+        }
+        return tmp.innerHTML;
+    }
+
+    function renderReadme(container, description, contentType) {
+        var body = el('div', {className: 'markdown-body'});
+        var isMarkdown = (contentType || '').indexOf('markdown') !== -1;
+        if (isMarkdown && window.marked) {
+            body.innerHTML = sanitizeHtml(marked.parse(description));
+        } else {
+            var pre = document.createElement('pre');
+            pre.textContent = description;
+            body.appendChild(pre);
+        }
+        container.appendChild(body);
+    }
+
+    function fetchUpstreamReadme(indexPath, pkg, version, callback) {
+        // Detect mirror URL from index info
+        var parts = indexPath.split('/');
+        Api.get('/' + parts[0]).then(function (userData) {
+            var indexInfo = (userData.result.indexes || {})[parts[1]];
+            if (!indexInfo || indexInfo.type !== 'mirror') {
+                callback(null);
+                return;
+            }
+            var mirrorUrl = indexInfo.mirror_url || '';
+            // Only support pypi.org for now
+            if (mirrorUrl.indexOf('pypi.org') === -1) {
+                callback(null);
+                return;
+            }
+            var url = 'https://pypi.org/pypi/' + pkg + '/' + version + '/json';
+            fetch(url).then(function (res) {
+                if (!res.ok) throw new Error('not found');
+                return res.json();
+            }).then(function (data) {
+                var info = data.info || {};
+                callback(
+                    info.description || null,
+                    info.description_content_type || null
+                );
+            }).catch(function () {
+                callback(null);
+            });
+        }).catch(function () {
+            callback(null);
+        });
     }
 
     function deleteVersion(indexPath, pkg, ver) {
@@ -1521,16 +1759,35 @@
         return n < 10 ? '0' + n : '' + n;
     }
 
+    var _preReleaseOrder = {dev: 0, a: 1, alpha: 1, b: 2, beta: 2, rc: 3, c: 3};
+
+    function _parseVersion(v) {
+        // Split into numeric release and optional pre-release suffix
+        var m = v.match(/^(\d[\d.]*?)(?:(dev|a|alpha|b|beta|rc|c)(\d*))?(?:\+.*)?$/i);
+        if (!m) return {parts: [0], pre: [4, 0]}; // unparseable → treat as release
+        var parts = m[1].split('.').map(function (s) { return parseInt(s) || 0; });
+        var pre;
+        if (m[2]) {
+            pre = [_preReleaseOrder[m[2].toLowerCase()] || 0, parseInt(m[3]) || 0];
+        } else {
+            pre = [4, 0]; // final release sorts after all pre-releases
+        }
+        return {parts: parts, pre: pre};
+    }
+
     function compareVersions(a, b) {
-        // Simple reverse sort — newest first
-        var pa = a.split(/[.\-+]/);
-        var pb = b.split(/[.\-+]/);
-        for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
-            var na = parseInt(pa[i]) || 0;
-            var nb = parseInt(pb[i]) || 0;
+        // Reverse sort — newest first. Handles PEP 440 pre-releases.
+        var va = _parseVersion(a);
+        var vb = _parseVersion(b);
+        var len = Math.max(va.parts.length, vb.parts.length);
+        for (var i = 0; i < len; i++) {
+            var na = va.parts[i] || 0;
+            var nb = vb.parts[i] || 0;
             if (na !== nb) return nb - na;
         }
-        return 0;
+        // Compare pre-release: [type, number]
+        if (va.pre[0] !== vb.pre[0]) return vb.pre[0] - va.pre[0];
+        return vb.pre[1] - va.pre[1];
     }
 
     // ========== STATUS ==========
@@ -1553,13 +1810,16 @@
             var infoCard = el('div', {className: 'status-card'});
             infoCard.appendChild(el('div', {className: 'status-card-title', textContent: 'Server'}));
             var ver = status.versioninfo || {};
-            var infoRows = [
-                ['devpi-server', ver['devpi-server'] || '?'],
-                ['devpi-web', ver['devpi-web'] || '?'],
+            var infoRows = [];
+            var verKeys = Object.keys(ver).sort();
+            for (var vk = 0; vk < verKeys.length; vk++) {
+                infoRows.push([verKeys[vk], ver[verKeys[vk]]]);
+            }
+            infoRows.push(
                 ['Role', status.role || '?'],
                 ['Host', status.host + ':' + status.port],
-                ['Serial', String(status.serial || 0)],
-            ];
+                ['Serial', String(status.serial || 0)]
+            );
             if (api.features && api.features.length) {
                 infoRows.push(['Features', api.features.join(', ')]);
             }

@@ -654,16 +654,6 @@ body {
     color: var(--tag-text);
 }
 
-.tag-mirror {
-    background: var(--tag-bg);
-    color: var(--tag-text);
-}
-
-[data-theme="dark"] .tag-mirror {
-    background: var(--tag-bg);
-    color: var(--tag-text);
-}
-
 .tag-volatile {
     background: #fef3c7;
     color: #92400e;
@@ -672,6 +662,17 @@ body {
 [data-theme="dark"] .tag-volatile {
     background: #452a08;
     color: #fbbf24;
+}
+
+.tag-upstream {
+    background: #ede9fe;
+    color: #6d28d9;
+    margin-left: 4px;
+}
+
+[data-theme="dark"] .tag-upstream {
+    background: #2e1065;
+    color: #c4b5fd;
 }
 
 /* --- Table actions --- */
@@ -766,7 +767,18 @@ body {
 .modal-body input[type="text"],
 .modal-body input[type="email"],
 .modal-body input[type="password"],
-.modal-body input[type="url"],
+.modal-body input[type="url"] {
+    width: 100%;
+    height: 36px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 14px;
+    outline: none;
+    background: var(--bg);
+    color: var(--text);
+}
+
 .modal-body select:not(.tag-picker-add) {
     width: 100%;
     height: 36px;
@@ -791,6 +803,18 @@ body {
 .modal-body input[type="url"]:focus,
 .modal-body select:not(.tag-picker-add):focus {
     border-color: var(--accent);
+}
+
+/* --- Focus visibility for keyboard navigation --- */
+
+.btn:focus-visible,
+.kebab-btn:focus-visible,
+.pip-toggle-btn:focus-visible,
+.pkg-version-del:focus-visible,
+.pkg-version-more:focus-visible,
+.theme-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 .modal-footer {
@@ -1082,6 +1106,15 @@ body {
     font-weight: 600;
 }
 
+.pkg-version-uncached .pkg-version-link {
+    color: var(--text-faint);
+    font-style: italic;
+}
+
+.pkg-version-uncached .pkg-version-link:hover {
+    color: var(--text-muted);
+}
+
 .pkg-version-del {
     background: none;
     border: none;
@@ -1095,6 +1128,29 @@ body {
 
 .pkg-version-del:hover {
     color: var(--error);
+    background: var(--table-hover);
+}
+
+.pkg-version-ext {
+    font-size: 11px;
+    color: var(--text-faint);
+    padding: 0 6px;
+}
+
+.pkg-version-more {
+    display: block;
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font-size: 12px;
+    cursor: pointer;
+    text-align: left;
+    border-radius: 4px;
+}
+
+.pkg-version-more:hover {
     background: var(--table-hover);
 }
 
@@ -1312,6 +1368,24 @@ body {
     color: var(--text-muted);
     margin-bottom: 16px;
     line-height: 1.5;
+}
+
+/* --- Mirror info --- */
+
+.mirror-info {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    display: inline-block;
+}
+
+.mirror-info span:first-child {
+    font-weight: 600;
+    color: var(--text);
 }
 
 /* --- Package search --- */
