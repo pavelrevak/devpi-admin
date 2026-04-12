@@ -124,6 +124,15 @@ The static files live at `src/devpi_admin/static/` and can be edited in place â€
 show up on the next browser reload, no restart of devpi-server required (static views
 read from disk on each request).
 
+Run the unit tests:
+
+```bash
+PYTHONWARNINGS="ignore::UserWarning" python -m unittest discover -v tests/
+```
+
+(The `PYTHONWARNINGS` shim hides an unrelated deprecation warning emitted by Pyramid 2.1
+when it imports `pkg_resources`.)
+
 ## Author
 
 Pavel Revak <pavelrevak@gmail.com>

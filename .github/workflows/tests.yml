@@ -28,3 +28,5 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -v tests/
+        env:
+          PYTHONWARNINGS: "ignore::UserWarning"

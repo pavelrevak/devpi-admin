@@ -7,6 +7,7 @@ the standard devpi JSON API (``/+login``, ``/<user>/<index>``, ...).
 """
 from pathlib import Path
 
+from devpi_server.config import hookimpl
 from pyramid.httpexceptions import HTTPFound
 from pyramid.response import FileResponse
 
@@ -14,11 +15,12 @@ from pyramid.response import FileResponse
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+@hookimpl
 def devpiserver_get_features():
-    # Advertise the plugin to devpi-server
     return {"devpi-admin"}
 
 
+@hookimpl
 def devpiserver_pyramid_configure(config, pyramid_config):
     # Serve bundled static assets (index.html, css/, js/) under /+admin/.
     pyramid_config.add_static_view(
