@@ -49,6 +49,62 @@
         while (node.firstChild) node.removeChild(node.firstChild);
     }
 
+    function formGroup(label, inputEl) {
+        return el('div', {className: 'form-group'}, [
+            el('label', {textContent: label}),
+            inputEl,
+        ]);
+    }
+
+    function statusRow(label, value) {
+        return el('div', {className: 'status-row'}, [
+            el('span', {className: 'status-label', textContent: label}),
+            el('span', {textContent: value}),
+        ]);
+    }
+
+    function buildBreadcrumb(indexPath, extra) {
+        var parts = indexPath.split('/');
+        var children = [
+            el('a', {href: '#indexes', textContent: 'Indexes'}),
+            ' / ',
+            el('a', {href: '#indexes/' + parts[0], textContent: parts[0]}),
+            ' / ',
+            el('a', {href: '#packages/' + indexPath, textContent: parts[1]}),
+        ];
+        if (extra) {
+            for (var i = 0; i < extra.length; i++) {
+                children.push(extra[i]);
+            }
+        }
+        return el('h2', {className: 'page-heading'}, children);
+    }
+
+    function buildKebabMenu(items) {
+        var menu = el('div', {className: 'kebab-menu auth-only'});
+        menu.appendChild(el('button', {
+            className: 'kebab-btn',
+            textContent: '\u22ee',
+            onclick: function (e) {
+                e.stopPropagation();
+                var dd = menu.querySelector('.kebab-dropdown');
+                var wasOpen = !dd.hidden;
+                closeAllKebabs();
+                dd.hidden = wasOpen;
+            },
+        }));
+        var dropdownItems = [];
+        for (var i = 0; i < items.length; i++) {
+            dropdownItems.push(el('button', {
+                className: 'kebab-item' + (items[i].danger ? ' kebab-item-danger' : ''),
+                textContent: items[i].label,
+                onclick: items[i].onclick,
+            }));
+        }
+        menu.appendChild(el('div', {className: 'kebab-dropdown', hidden: true}, dropdownItems));
+        return menu;
+    }
+
     // --- Modal ---
 
     function openModal(title, bodyFn, buttons) {
@@ -67,8 +123,10 @@
         modalOverlay.hidden = true;
     }
 
-    function showModalError(msg) {
-        modalError.textContent = msg;
+    function showModalError(msgOrErr) {
+        var text = (typeof msgOrErr === 'string') ? msgOrErr
+            : (msgOrErr && msgOrErr.message) || 'Operation failed';
+        modalError.textContent = text;
         modalError.hidden = false;
     }
 
@@ -422,14 +480,8 @@
         openModal(
             'Login',
             function (body) {
-                body.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: 'Username'}),
-                    el('input', {type: 'text', id: 'login-user'}),
-                ]));
-                body.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: 'Password'}),
-                    el('input', {type: 'password', id: 'login-pass'}),
-                ]));
+                body.appendChild(formGroup('Username', el('input', {type: 'text', id: 'login-user'})));
+                body.appendChild(formGroup('Password', el('input', {type: 'password', id: 'login-pass'})));
             },
             [
                 el('button', {
@@ -464,9 +516,7 @@
                 updateAuthUI();
                 navigate();
             })
-            .catch(function (err) {
-                showModalError(err.message || 'Login failed');
-            });
+            .catch(showModalError);
     }
 
     loginBtn.addEventListener('click', showLoginModal);
@@ -629,23 +679,17 @@
             isEdit ? 'Edit User: ' + editName : 'New User',
             function (body) {
                 if (!isEdit) {
-                    body.appendChild(el('div', {className: 'form-group'}, [
-                        el('label', {textContent: 'Username'}),
-                        el('input', {type: 'text', id: 'form-username'}),
-                    ]));
+                    body.appendChild(formGroup('Username', el('input', {type: 'text', id: 'form-username'})));
                 }
-                body.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: 'Email'}),
-                    el('input', {
-                        type: 'email',
-                        id: 'form-email',
-                        value: (editInfo && editInfo.email) || '',
-                    }),
-                ]));
-                body.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: isEdit ? 'New Password (leave empty to keep)' : 'Password'}),
-                    el('input', {type: 'password', id: 'form-password'}),
-                ]));
+                body.appendChild(formGroup('Email', el('input', {
+                    type: 'email',
+                    id: 'form-email',
+                    value: (editInfo && editInfo.email) || '',
+                })));
+                body.appendChild(formGroup(
+                    isEdit ? 'New Password (leave empty to keep)' : 'Password',
+                    el('input', {type: 'password', id: 'form-password'})
+                ));
             },
             [
                 el('button', {
@@ -691,9 +735,7 @@
                 closeModal();
                 loadUsers();
             })
-            .catch(function (err) {
-                showModalError(err.message || 'Operation failed');
-            });
+            .catch(showModalError);
     }
 
     function deleteUser(name) {
@@ -835,33 +877,10 @@
                 card.appendChild(buildIndexPipBlock(idx._full));
 
                 // Kebab menu (top-right)
-                var menu = el('div', {className: 'kebab-menu auth-only'});
-                var menuBtn = el('button', {
-                    className: 'kebab-btn',
-                    textContent: '\u22ee',
-                    onclick: function (e) {
-                        e.stopPropagation();
-                        var dropdown = menu.querySelector('.kebab-dropdown');
-                        var wasOpen = !dropdown.hidden;
-                        closeAllKebabs();
-                        dropdown.hidden = wasOpen;
-                    },
-                });
-                var dropdown = el('div', {className: 'kebab-dropdown', hidden: true}, [
-                    el('button', {
-                        className: 'kebab-item',
-                        textContent: 'Edit',
-                        onclick: function () { closeAllKebabs(); showIndexModal(idx, result); },
-                    }),
-                    el('button', {
-                        className: 'kebab-item kebab-item-danger',
-                        textContent: 'Delete',
-                        onclick: function () { closeAllKebabs(); deleteIndex(idx._full); },
-                    }),
-                ]);
-                menu.appendChild(menuBtn);
-                menu.appendChild(dropdown);
-                cardHead.appendChild(menu);
+                cardHead.appendChild(buildKebabMenu([
+                    {label: 'Edit', onclick: function () { closeAllKebabs(); showIndexModal(idx, result); }},
+                    {label: 'Delete', danger: true, onclick: function () { closeAllKebabs(); deleteIndex(idx._full); }},
+                ]));
 
                 grid.appendChild(card);
             })(indexes[i]);
@@ -929,14 +948,8 @@
                         }));
                     }
                     ownerSelect.value = preOwner || Api.getUser();
-                    body.appendChild(el('div', {className: 'form-group'}, [
-                        el('label', {textContent: 'Owner'}),
-                        ownerSelect,
-                    ]));
-                    body.appendChild(el('div', {className: 'form-group'}, [
-                        el('label', {textContent: 'Index Name'}),
-                        el('input', {type: 'text', id: 'form-index-name'}),
-                    ]));
+                    body.appendChild(formGroup('Owner', ownerSelect));
+                    body.appendChild(formGroup('Index Name', el('input', {type: 'text', id: 'form-index-name'})));
                 }
 
                 var typeSelect = el('select', {id: 'form-type'});
@@ -944,10 +957,7 @@
                 typeSelect.appendChild(el('option', {value: 'mirror', textContent: 'mirror'}));
                 if (isEdit) typeSelect.value = editIdx.type || 'stage';
 
-                body.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: 'Type'}),
-                    typeSelect,
-                ]));
+                body.appendChild(formGroup('Type', typeSelect));
 
                 var stageFields = el('div', {id: 'stage-fields'});
                 var mirrorFields = el('div', {id: 'mirror-fields'});
@@ -988,26 +998,20 @@
                     buildTagPicker('form-acl-upload', aclInitial, userNames, [':ANONYMOUS:']),
                 ]));
 
-                mirrorFields.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: 'Mirror URL'}),
-                    el('input', {
-                        type: 'url',
-                        id: 'form-mirror-url',
-                        value: isEdit && editIdx.mirror_url ? editIdx.mirror_url : 'https://pypi.org/simple/',
-                    }),
-                ]));
+                mirrorFields.appendChild(formGroup('Mirror URL', el('input', {
+                    type: 'url',
+                    id: 'form-mirror-url',
+                    value: isEdit && editIdx.mirror_url ? editIdx.mirror_url : 'https://pypi.org/simple/',
+                })));
 
                 body.appendChild(stageFields);
                 body.appendChild(mirrorFields);
 
-                body.appendChild(el('div', {className: 'form-group'}, [
-                    el('label', {textContent: 'Title (optional)'}),
-                    el('input', {
-                        type: 'text',
-                        id: 'form-title',
-                        value: isEdit && editIdx.title ? editIdx.title : '',
-                    }),
-                ]));
+                body.appendChild(formGroup('Title (optional)', el('input', {
+                    type: 'text',
+                    id: 'form-title',
+                    value: isEdit && editIdx.title ? editIdx.title : '',
+                })));
 
                 function updateTypeFields() {
                     var isMirror = typeSelect.value === 'mirror';
@@ -1073,9 +1077,7 @@
                 closeModal();
                 loadIndexes();
             })
-            .catch(function (err) {
-                showModalError(err.message || 'Operation failed');
-            });
+            .catch(showModalError);
     }
 
     function deleteIndex(fullName) {
@@ -1100,26 +1102,9 @@
             textContent: pkg,
         }));
 
-        var menu = el('div', {className: 'kebab-menu auth-only'});
-        menu.appendChild(el('button', {
-            className: 'kebab-btn',
-            textContent: '\u22ee',
-            onclick: function (e) {
-                e.stopPropagation();
-                var dd = menu.querySelector('.kebab-dropdown');
-                var wasOpen = !dd.hidden;
-                closeAllKebabs();
-                dd.hidden = wasOpen;
-            },
-        }));
-        menu.appendChild(el('div', {className: 'kebab-dropdown', hidden: true}, [
-            el('button', {
-                className: 'kebab-item kebab-item-danger',
-                textContent: 'Delete all versions',
-                onclick: function () { closeAllKebabs(); deletePackage(indexPath, pkg); },
-            }),
+        cardHead.appendChild(buildKebabMenu([
+            {label: 'Delete all versions', danger: true, onclick: function () { closeAllKebabs(); deletePackage(indexPath, pkg); }},
         ]));
-        cardHead.appendChild(menu);
         card.appendChild(cardHead);
 
         card.appendChild(buildPipBlock(indexPath, pkg));
@@ -1145,18 +1130,13 @@
 
         var parts = indexPath.split('/');
         var idxUser = parts[0], idxName = parts[1];
-        content.appendChild(el('h2', {className: 'page-heading'}, [
-            el('a', {href: '#indexes', textContent: 'Indexes'}),
-            ' / ',
-            el('a', {href: '#indexes/' + idxUser, textContent: idxUser}),
-            ' / ',
-            el('a', {href: '#packages/' + indexPath, textContent: idxName}),
-        ]));
+        var indexInfo = {};
+        content.appendChild(buildBreadcrumb(indexPath));
 
         // Detect mirror type to decide fetching strategy.
         Api.get('/' + idxUser).then(function (userData) {
-            var indexInfo = (userData.result.indexes || {})[idxName];
-            if (indexInfo && indexInfo.type === 'mirror') {
+            indexInfo = (userData.result.indexes || {})[idxName] || {};
+            if (indexInfo.type === 'mirror') {
                 fetchMirror();
             } else {
                 fetchStage();
@@ -1166,7 +1146,7 @@
         });
 
         function fetchStage() {
-            showHeadingAndLoading();
+            showHeadingAndLoading(false);
             Api.get('/' + indexPath).then(function (data) {
                 renderPackages(indexPath, data.result, false);
             }).catch(handleApiError);
@@ -1192,16 +1172,11 @@
 
         function showHeadingAndLoading(isMirror) {
             clear(content);
-            var heading = el('h2', {className: 'page-heading'}, [
-                el('a', {href: '#indexes', textContent: 'Indexes'}),
-                ' / ',
-                el('a', {href: '#indexes/' + idxUser, textContent: idxUser}),
-                ' / ',
-                el('a', {href: '#packages/' + indexPath, textContent: idxName}),
-            ]);
+            var heading = buildBreadcrumb(indexPath);
+            var actions = [];
             if (isMirror) {
-                var dlBtn = el('button', {
-                    className: 'btn btn-small',
+                actions.push(el('button', {
+                    className: 'btn',
                     textContent: 'Download full index',
                     onclick: function () {
                         showHeadingAndLoading(true);
@@ -1209,13 +1184,29 @@
                             renderPackages(indexPath, data.result, true);
                         }).catch(handleApiError);
                     },
-                });
-                content.appendChild(el('div', {className: 'view-header'}, [
-                    heading, dlBtn,
-                ]));
-            } else {
-                content.appendChild(heading);
+                }));
             }
+            actions.push(el('button', {
+                className: 'btn auth-only',
+                textContent: 'Edit',
+                onclick: function () {
+                    fetchRoot().then(function (result) {
+                        var idx = Object.assign(
+                            {}, indexInfo,
+                            {_user: idxUser, _name: idxName, _full: indexPath});
+                        showIndexModal(idx, result);
+                    }).catch(handleApiError);
+                },
+            }));
+            actions.push(el('button', {
+                className: 'btn btn-danger auth-only',
+                textContent: 'Delete',
+                onclick: function () { deleteIndex(indexPath); },
+            }));
+            content.appendChild(el('div', {className: 'view-header'}, [
+                heading,
+                el('div', {className: 'view-header-actions'}, actions),
+            ]));
             content.appendChild(el('p', {className: 'loading', textContent: 'Loading...'}));
         }
     }
@@ -1352,19 +1343,21 @@
             var info = ctx.info;
             clear(content);
 
-            // Breadcrumb
-            var parts = indexPath.split('/');
-            var idxUser = parts[0], idxName = parts[1];
-            content.appendChild(el('h2', {className: 'page-heading'}, [
-                el('a', {href: '#indexes', textContent: 'Indexes'}),
-                ' / ',
-                el('a', {href: '#indexes/' + idxUser, textContent: idxUser}),
-                ' / ',
-                el('a', {href: '#packages/' + indexPath, textContent: idxName}),
-                ' / ',
-                el('a', {href: '#package/' + indexPath + '/' + pkg, textContent: pkg}),
-                ' ',
-                el('span', {className: 'page-heading-version', textContent: 'v' + currentVer}),
+            // Breadcrumb + delete button
+            content.appendChild(el('div', {className: 'view-header'}, [
+                buildBreadcrumb(indexPath, [
+                    ' / ',
+                    el('a', {href: '#package/' + indexPath + '/' + pkg, textContent: pkg}),
+                    ' ',
+                    el('span', {className: 'page-heading-version', textContent: 'v' + currentVer}),
+                ]),
+                el('div', {className: 'view-header-actions'}, [
+                    el('button', {
+                        className: 'btn btn-danger auth-only',
+                        textContent: 'Delete package',
+                        onclick: function () { deletePackage(indexPath, pkg); },
+                    }),
+                ]),
             ]));
 
             if (cachedVersions.length === 0 && !allVersions) {
@@ -1824,10 +1817,7 @@
                 infoRows.push(['Features', api.features.join(', ')]);
             }
             for (var i = 0; i < infoRows.length; i++) {
-                infoCard.appendChild(el('div', {className: 'status-row'}, [
-                    el('span', {className: 'status-label', textContent: infoRows[i][0]}),
-                    el('span', {textContent: infoRows[i][1]}),
-                ]));
+                infoCard.appendChild(statusRow(infoRows[i][0], infoRows[i][1]));
             }
             grid.appendChild(infoCard);
 
@@ -1862,10 +1852,7 @@
                 var barFill = el('div', {className: 'hit-rate-fill'});
                 barFill.style.width = lookups > 0 ? ((hits / lookups) * 100) + '%' : '0%';
                 barContainer.appendChild(barFill);
-                cacheCard.appendChild(el('div', {className: 'status-row'}, [
-                    el('span', {className: 'status-label', textContent: 'Hit rate'}),
-                    el('span', {className: 'hit-rate-value', textContent: hitRate}),
-                ]));
+                cacheCard.appendChild(statusRow('Hit rate', hitRate));
                 cacheCard.appendChild(barContainer);
 
                 var cacheRows = [
@@ -1877,10 +1864,7 @@
                 if (size !== undefined) cacheRows.push(['Max size', formatNum(size)]);
                 if (items !== undefined) cacheRows.push(['Items', formatNum(items)]);
                 for (var r = 0; r < cacheRows.length; r++) {
-                    cacheCard.appendChild(el('div', {className: 'status-row'}, [
-                        el('span', {className: 'status-label', textContent: cacheRows[r][0]}),
-                        el('span', {textContent: cacheRows[r][1]}),
-                    ]));
+                    cacheCard.appendChild(statusRow(cacheRows[r][0], cacheRows[r][1]));
                 }
                 grid.appendChild(cacheCard);
             }
@@ -1891,14 +1875,8 @@
             if (whooshQueue !== undefined) {
                 var whooshCard = el('div', {className: 'status-card'});
                 whooshCard.appendChild(el('div', {className: 'status-card-title', textContent: 'Search Index'}));
-                whooshCard.appendChild(el('div', {className: 'status-row'}, [
-                    el('span', {className: 'status-label', textContent: 'Queue'}),
-                    el('span', {textContent: String(whooshQueue)}),
-                ]));
-                whooshCard.appendChild(el('div', {className: 'status-row'}, [
-                    el('span', {className: 'status-label', textContent: 'Errors'}),
-                    el('span', {textContent: String(whooshErrors || 0)}),
-                ]));
+                whooshCard.appendChild(statusRow('Queue', String(whooshQueue)));
+                whooshCard.appendChild(statusRow('Errors', String(whooshErrors || 0)));
                 grid.appendChild(whooshCard);
             }
 

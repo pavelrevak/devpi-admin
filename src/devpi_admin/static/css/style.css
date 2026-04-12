@@ -343,6 +343,14 @@ body {
     margin-bottom: 0;
 }
 
+.view-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
 /* --- Index cards --- */
 
 .index-grid {
@@ -548,7 +556,6 @@ body {
 
 .kebab-menu {
     position: relative;
-    margin-left: auto;
 }
 
 .kebab-btn {
@@ -1118,7 +1125,7 @@ body {
 .pkg-version-del {
     background: none;
     border: none;
-    color: var(--text-faint);
+    color: var(--error);
     cursor: pointer;
     padding: 4px 8px;
     font-size: 16px;
@@ -1127,7 +1134,6 @@ body {
 }
 
 .pkg-version-del:hover {
-    color: var(--error);
     background: var(--table-hover);
 }
 

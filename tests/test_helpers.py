@@ -1,11 +1,7 @@
 """Tests for helper functions in main.py."""
 import unittest
 
-from devpi_admin.main import (
-    _normalize,
-    _project_name_from_filename,
-    _version_from_filename,
-)
+from devpi_admin.main import _normalize, _parse_filename
 
 
 class NormalizeTests(unittest.TestCase):
@@ -26,76 +22,79 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(_normalize("foo__bar"), "foo-bar")
 
 
-class ProjectNameFromFilenameTests(unittest.TestCase):
+class ParseFilenameTests(unittest.TestCase):
 
-    def test_wheel(self):
-        self.assertEqual(
-            _project_name_from_filename(
-                "setuptools-82.0.1-py3-none-any.whl"),
-            "setuptools")
+    # --- project name extraction ---
 
-    def test_wheel_underscore(self):
-        self.assertEqual(
-            _project_name_from_filename(
-                "charset_normalizer-3.4.7-cp314-cp314-manylinux_2_17_x86_64.whl"),
-            "charset-normalizer")
+    def test_wheel_name(self):
+        name, _ver = _parse_filename(
+            "setuptools-82.0.1-py3-none-any.whl")
+        self.assertEqual(name, "setuptools")
 
-    def test_sdist_tar_gz(self):
-        self.assertEqual(
-            _project_name_from_filename(
-                "requests-2.33.1.tar.gz"),
-            "requests")
+    def test_wheel_underscore_name(self):
+        name, _ver = _parse_filename(
+            "charset_normalizer-3.4.7-cp314-cp314-manylinux_2_17_x86_64.whl")
+        self.assertEqual(name, "charset-normalizer")
 
-    def test_sdist_zip(self):
-        self.assertEqual(
-            _project_name_from_filename(
-                "my-package-1.0.0.zip"),
-            "my-package")
+    def test_sdist_tar_gz_name(self):
+        name, _ver = _parse_filename("requests-2.33.1.tar.gz")
+        self.assertEqual(name, "requests")
 
-    def test_unknown_extension(self):
-        self.assertIsNone(
-            _project_name_from_filename("readme.txt"))
+    def test_sdist_zip_name(self):
+        name, _ver = _parse_filename("my-package-1.0.0.zip")
+        self.assertEqual(name, "my-package")
 
-    def test_no_version_separator(self):
-        self.assertIsNone(
-            _project_name_from_filename("noversion.tar.gz"))
+    def test_unknown_extension_name(self):
+        name, ver = _parse_filename("readme.txt")
+        self.assertIsNone(name)
+        self.assertIsNone(ver)
 
+    def test_no_version_separator_name(self):
+        name, ver = _parse_filename("noversion.tar.gz")
+        self.assertIsNone(name)
+        self.assertIsNone(ver)
 
-class VersionFromFilenameTests(unittest.TestCase):
+    # --- version extraction ---
 
-    def test_wheel(self):
-        self.assertEqual(
-            _version_from_filename(
-                "setuptools-82.0.1-py3-none-any.whl"),
-            "82.0.1")
+    def test_wheel_version(self):
+        _name, ver = _parse_filename(
+            "setuptools-82.0.1-py3-none-any.whl")
+        self.assertEqual(ver, "82.0.1")
 
-    def test_wheel_with_build(self):
-        self.assertEqual(
-            _version_from_filename(
-                "foo-1.2.3-1-py3-none-any.whl"),
-            "1.2.3")
+    def test_wheel_with_build_version(self):
+        _name, ver = _parse_filename(
+            "foo-1.2.3-1-py3-none-any.whl")
+        self.assertEqual(ver, "1.2.3")
 
-    def test_sdist_tar_gz(self):
-        self.assertEqual(
-            _version_from_filename(
-                "requests-2.33.1.tar.gz"),
-            "2.33.1")
+    def test_sdist_tar_gz_version(self):
+        _name, ver = _parse_filename("requests-2.33.1.tar.gz")
+        self.assertEqual(ver, "2.33.1")
 
-    def test_sdist_zip(self):
-        self.assertEqual(
-            _version_from_filename(
-                "my-package-1.0.0.zip"),
-            "1.0.0")
+    def test_sdist_zip_version(self):
+        _name, ver = _parse_filename("my-package-1.0.0.zip")
+        self.assertEqual(ver, "1.0.0")
 
     def test_dev_version(self):
-        self.assertEqual(
-            _version_from_filename(
-                "villapro_lpr_db-0.0.1.dev35+ga50425652-py3-none-any.whl"),
-            "0.0.1.dev35+ga50425652")
+        _name, ver = _parse_filename(
+            "villapro_lpr_db-0.0.1.dev35+ga50425652-py3-none-any.whl")
+        self.assertEqual(ver, "0.0.1.dev35+ga50425652")
 
-    def test_unknown(self):
-        self.assertIsNone(
-            _version_from_filename("readme.txt"))
+    def test_unknown_version(self):
+        name, ver = _parse_filename("readme.txt")
+        self.assertIsNone(ver)
+
+    # --- both together ---
+
+    def test_wheel_name_and_version(self):
+        name, ver = _parse_filename(
+            "setuptools-82.0.1-py3-none-any.whl")
+        self.assertEqual(name, "setuptools")
+        self.assertEqual(ver, "82.0.1")
+
+    def test_sdist_name_and_version(self):
+        name, ver = _parse_filename("requests-2.33.1.tar.gz")
+        self.assertEqual(name, "requests")
+        self.assertEqual(ver, "2.33.1")
 
 
 if __name__ == "__main__":

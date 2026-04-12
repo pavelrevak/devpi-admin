@@ -12,12 +12,13 @@ from pathlib import Path
 
 from devpi_server.config import hookimpl
 from devpi_server.mirror import MirrorStage
-from pyramid.httpexceptions import HTTPFound, HTTPNotFound
+from pyramid.httpexceptions import HTTPFound, HTTPForbidden, HTTPNotFound
 from pyramid.response import FileResponse, Response
 
 
 STATIC_DIR = Path(__file__).parent / "static"
 _NORMALIZE_RE = re.compile(r"[-_.]+")
+_SDIST_EXTENSIONS = (".tar.gz", ".tar.bz2", ".zip")
 _log = logging.getLogger(__name__)
 
 
@@ -81,6 +82,39 @@ def _serve_index(request):
         content_type="text/html")
 
 
+def _get_stage_or_404(xom, user, index):
+    """Return stage object or raise HTTPNotFound."""
+    stage = xom.model.getstage(user, index)
+    if stage is None:
+        raise HTTPNotFound(json_body={"error": "index not found"})
+    return stage
+
+
+def _check_read_access(request, stage):
+    """Raise HTTPForbidden if the request has no read access to the stage.
+
+    Mirrors the ACL check devpi's own views perform: the stage's acl_read
+    list controls who may read.  An empty list means public access.
+    """
+    acl_read = getattr(stage.ixconfig, "acl_read", None)
+    if not acl_read:
+        return  # public index
+    principals = request.authenticated_userid
+    if principals is None:
+        raise HTTPForbidden(json_body={"error": "authentication required"})
+    # ':ANONYMOUS:' in acl_read means public
+    if ":ANONYMOUS:" in acl_read:
+        return
+    if principals not in acl_read:
+        raise HTTPForbidden(json_body={"error": "read access denied"})
+
+
+def _json_response(data):
+    """Return a JSON Response from a dict."""
+    body = json.dumps(data)
+    return Response(body=body.encode("utf-8"), content_type="application/json")
+
+
 def _validate_path_component(value):
     """Reject path components that could cause traversal."""
     if "/" in value or "\\" in value or value in (".", ".."):
@@ -105,43 +139,48 @@ def _cached_packages_view(request):
     index = request.matchdict["index"]
     xom = request.registry["xom"]
 
-    stage = xom.model.getstage(user, index)
-    if stage is None:
-        return HTTPNotFound(json_body={"error": "index not found"})
+    stage = _get_stage_or_404(xom, user, index)
+    _check_read_access(request, stage)
     if not isinstance(stage, MirrorStage):
         return HTTPNotFound(
             json_body={"error": "not a mirror index"})
 
     files_dir = _files_dir(xom, user, index)
     projects = set()
-    if files_dir.is_dir():
+    try:
         for whl in files_dir.rglob("*"):
             if not whl.is_file():
                 continue
-            name = _project_name_from_filename(whl.name)
+            name, _ver = _parse_filename(whl.name)
             if name:
                 projects.add(name)
+    except OSError:
+        _log.warning("Cannot scan %s", files_dir, exc_info=True)
 
     cached = sorted(projects)
-    body = json.dumps({"result": cached, "total": len(cached)})
-    return Response(body=body.encode("utf-8"), content_type="application/json")
+    return _json_response({"result": cached, "total": len(cached)})
 
 
-def _project_name_from_filename(filename):
-    """Extract normalized project name from wheel or sdist filename."""
+def _parse_filename(filename):
+    """Extract (normalized_name, version) from wheel or sdist filename.
+
+    Returns (None, None) if the filename is not recognized.
+    """
     # wheel: {name}-{ver}(-{build})?-{python}-{abi}-{platform}.whl
     if filename.endswith(".whl"):
         parts = filename.split("-")
         if len(parts) >= 3:
-            return _normalize(parts[0])
+            return _normalize(parts[0]), parts[1]
+        return None, None
     # sdist: {name}-{ver}.tar.gz or {name}-{ver}.zip
-    for ext in (".tar.gz", ".tar.bz2", ".zip"):
+    for ext in _SDIST_EXTENSIONS:
         if filename.endswith(ext):
             base = filename[:-len(ext)]
             idx = base.rfind("-")
             if idx > 0:
-                return _normalize(base[:idx])
-    return None
+                return _normalize(base[:idx]), base[idx + 1:]
+            return None, None
+    return None, None
 
 
 def _normalize(name):
@@ -161,31 +200,27 @@ def _versions_view(request):
     index = request.matchdict["index"]
     project = request.matchdict["project"]
     xom = request.registry["xom"]
-    stage = xom.model.getstage(user, index)
-    if stage is None:
-        return HTTPNotFound(json_body={"error": "index not found"})
+    stage = _get_stage_or_404(xom, user, index)
+    _check_read_access(request, stage)
 
     is_mirror = isinstance(stage, MirrorStage)
     want_all = request.params.get("all") == "1"
 
     if is_mirror:
-        # Cached versions: scan filesystem for downloaded files
         cached_versions = _cached_versions_for_project(
             xom, user, index, project)
         all_versions = None
         if want_all:
             all_versions = sorted(
                 stage.list_versions(project), reverse=True)
-        body = json.dumps({
+        return _json_response({
             "cached": cached_versions,
             "all": all_versions,
         })
-    else:
-        # Stage index: everything is local
-        versions = sorted(stage.list_versions(project), reverse=True)
-        body = json.dumps({"cached": versions, "all": versions})
 
-    return Response(body=body.encode("utf-8"), content_type="application/json")
+    # Stage index: everything is local
+    versions = sorted(stage.list_versions(project), reverse=True)
+    return _json_response({"cached": versions, "all": versions})
 
 
 def _cached_versions_for_project(xom, user, index, project):
@@ -193,31 +228,16 @@ def _cached_versions_for_project(xom, user, index, project):
     files_dir = _files_dir(xom, user, index)
     versions = set()
     norm_project = _normalize(project)
-    if files_dir.is_dir():
+    try:
         for f in files_dir.rglob("*"):
             if not f.is_file():
                 continue
-            name = _project_name_from_filename(f.name)
-            if name == norm_project:
-                ver = _version_from_filename(f.name)
-                if ver:
-                    versions.add(ver)
+            name, ver = _parse_filename(f.name)
+            if name == norm_project and ver:
+                versions.add(ver)
+    except OSError:
+        _log.warning("Cannot scan %s", files_dir, exc_info=True)
     return sorted(versions, reverse=True)
-
-
-def _version_from_filename(filename):
-    """Extract version string from wheel or sdist filename."""
-    if filename.endswith(".whl"):
-        parts = filename.split("-")
-        if len(parts) >= 3:
-            return parts[1]
-    for ext in (".tar.gz", ".tar.bz2", ".zip"):
-        if filename.endswith(ext):
-            base = filename[:-len(ext)]
-            idx = base.rfind("-")
-            if idx > 0:
-                return base[idx + 1:]
-    return None
 
 
 def _versiondata_view(request):
@@ -227,9 +247,8 @@ def _versiondata_view(request):
     project = request.matchdict["project"]
     version = request.matchdict["version"]
     xom = request.registry["xom"]
-    stage = xom.model.getstage(user, index)
-    if stage is None:
-        return HTTPNotFound(json_body={"error": "index not found"})
+    stage = _get_stage_or_404(xom, user, index)
+    _check_read_access(request, stage)
     verdata = stage.get_versiondata(project, version)
     if not verdata:
         return HTTPNotFound(json_body={"error": "version not found"})
@@ -262,8 +281,7 @@ def _versiondata_view(request):
         except (AttributeError, TypeError):
             pass
         result["+links"].append(link_info)
-    body = json.dumps({"result": result})
-    return Response(body=body.encode("utf-8"), content_type="application/json")
+    return _json_response({"result": result})
 
 
 def _to_json_safe(obj):
