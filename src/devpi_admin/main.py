@@ -44,6 +44,14 @@ def devpiserver_pyramid_configure(config, pyramid_config):
         lambda request: HTTPFound("/+admin/"),
         route_name="devpi_admin_spa_noslash")
 
+    # Session validity check.
+    pyramid_config.add_route(
+        "devpi_admin_session",
+        "/+admin-api/session")
+    pyramid_config.add_view(
+        _session_view, route_name="devpi_admin_session",
+        request_method="GET")
+
     # Cached packages API for mirror indexes.
     pyramid_config.add_route(
         "devpi_admin_cached",
@@ -80,6 +88,14 @@ def _serve_index(request):
         str(STATIC_DIR / "index.html"),
         request=request,
         content_type="text/html")
+
+
+def _session_view(request):
+    """Return whether the current request carries a valid authenticated session."""
+    user = request.authenticated_userid
+    if user:
+        return _json_response({"valid": True, "user": user})
+    raise HTTPForbidden(json_body={"valid": False, "error": "not authenticated"})
 
 
 def _get_stage_or_404(xom, user, index):

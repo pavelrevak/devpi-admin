@@ -196,14 +196,18 @@ body {
 .user-btn-name {
     padding: 4px 10px;
     font-weight: 600;
-    color: var(--text);
+    color: #22c55e;
     background: var(--bg);
     cursor: pointer;
 }
 
 .user-btn-name:hover {
     background: var(--bg-alt);
-    color: var(--accent);
+    opacity: 0.8;
+}
+
+.user-btn.is-root .user-btn-name {
+    color: #f59e0b;
 }
 
 .user-btn-sep {
@@ -366,7 +370,19 @@ body {
 /* --- User cards --- */
 
 .user-card {
-    border-left-color: var(--text-faint);
+    border-left-color: #22c55e;
+}
+
+.user-card.user-root {
+    border-left-color: #f59e0b;
+}
+
+.user-card .index-card-name {
+    color: #22c55e;
+}
+
+.user-card.user-root .index-card-name {
+    color: #f59e0b;
 }
 
 .user-card .kebab-menu {

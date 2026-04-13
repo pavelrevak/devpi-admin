@@ -463,6 +463,7 @@
             logoutBtn.appendChild(el('span', {className: 'user-btn-action', textContent: 'Logout'}));
             loginBtn.hidden = true;
             logoutBtn.hidden = false;
+            logoutBtn.classList.toggle('is-root', user === 'root');
             navUsers.hidden = user !== 'root';
             document.body.classList.add('authenticated');
         } else {
@@ -542,6 +543,18 @@
             headerInner.classList.remove('menu-open');
         });
     }
+
+    // Reload current view when clicking an already-active nav link
+    document.getElementById('main-nav').addEventListener('click', function (e) {
+        if (e.target.tagName === 'A') {
+            var href = e.target.getAttribute('href') || '#';
+            var current = window.location.hash || '#';
+            if (href === current) {
+                e.preventDefault();
+                navigate();
+            }
+        }
+    });
 
     logoutBtn.addEventListener('click', function (e) {
         // Clicking the username part opens change-password modal
@@ -634,7 +647,7 @@
                     var currentUser = Api.getUser();
                     var canEdit = currentUser === name || currentUser === 'root';
 
-                    var card = el('div', {className: 'index-card user-card'});
+                    var card = el('div', {className: 'index-card user-card' + (name === 'root' ? ' user-root' : '')});
 
                     // Card head: username + kebab menu
                     var cardHead = el('div', {className: 'index-card-head'});
@@ -1981,4 +1994,22 @@
     updateAuthUI();
     updateNav();
     navigate();
+
+    var _sessionCheckReady = false;
+    setTimeout(function () { _sessionCheckReady = true; }, 2000);
+
+    function checkSession() {
+        if (!_sessionCheckReady || !Api.getUser()) return;
+        Api.get('/+admin-api/session').catch(function (err) {
+            if (err.status === 403 || err.status === 401) {
+                Api.logout();
+                updateAuthUI();
+                showError(new Error('Session expired. Please log in again.'));
+            }
+        });
+    }
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') checkSession();
+    });
+    window.addEventListener('focus', checkSession);
 })();

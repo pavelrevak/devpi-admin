@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Box bottom face -->
+  <polygon points="16,18 2,11 16,4 30,11" fill="#4a9eff" opacity="0.85"/>
+  <!-- Box left face -->
+  <polygon points="2,11 2,23 16,30 16,18" fill="#2563eb"/>
+  <!-- Box right face -->
+  <polygon points="30,11 30,23 16,30 16,18" fill="#1d4ed8"/>
+  <!-- Highlight stripe on top face -->
+  <polygon points="16,6 26,10.5 16,15 6,10.5" fill="#93c5fd" opacity="0.4"/>
+</svg>
