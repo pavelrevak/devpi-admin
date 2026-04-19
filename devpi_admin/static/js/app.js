@@ -1996,7 +1996,7 @@
                     var rep = pollingReplicas[uuid];
                     var lastRequest = rep['last-request'] || 0;
                     var age = now - lastRequest;
-                    var isOnline = age < OFFLINE_THRESHOLD;
+                    var isOnline = rep['in-request'] || age < OFFLINE_THRESHOLD;
                     var lag = masterSerial - (rep['serial'] || 0);
                     var label = rep['remote-ip'] || uuid.substring(0, 8);
 
