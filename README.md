@@ -14,6 +14,8 @@ talks to the standard devpi JSON API directly.
 - Server info with version of devpi-server and all installed plugins (auto-detected)
 - Cache metrics with hit-rate bars (storage, changelog, relpath caches)
 - Whoosh search index queue status
+- **Replica status** (master only) — per-replica cards with online/offline badge, serial lag,
+  and last-seen timestamp; visible only when replicas are connected
 
 ### Indexes
 - Visual cards color-coded by type: green (stage), amber (volatile stage), blue (mirror)
@@ -30,7 +32,7 @@ talks to the standard devpi JSON API directly.
 
 ### Packages
 - Client-side search with PEP 503 name normalization
-- Mirror indexes: shows only cached packages (fast filesystem scan, no 17 MB index download);
+- Mirror indexes: shows only cached packages (filesystem scan, no 17 MB index download);
   "Download full index" button available for complete browse
 - Package cards with latest version and `pip install` command
 

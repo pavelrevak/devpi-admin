@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "devpi-admin"
@@ -31,21 +31,9 @@ dependencies = [
 [project.entry-points.devpi_server]
 devpi-admin = "devpi_admin.main"
 
-[tool.hatch.version]
-source = "vcs"
-fallback-version = "0.0.0"
+[tool.setuptools.packages.find]
+include = ["devpi_admin*"]
 
-[tool.hatch.build.hooks.vcs]
-version-file = "src/devpi_admin/_version.py"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/devpi_admin"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "src/devpi_admin",
-    "tests",
-    "README.md",
-    "pyproject.toml",
-    "LICENSE",
-]
+[tool.setuptools_scm]
+write_to = "devpi_admin/_version.py"
+fallback_version = "0.0.0"

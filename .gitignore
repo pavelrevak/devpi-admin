@@ -10,6 +10,6 @@ build
 !.gitignore
 !.github
 !.gitea
-src/devpi_admin/_version.py
+devpi_admin/_version.py
 *.md
 !README*.md

@@ -1185,6 +1185,12 @@
 
     var PKG_LIMIT = 100;
 
+    function canDeleteFromIndex(indexPath) {
+        var user = Api.getUser();
+        if (!user) return false;
+        return user === 'root' || user === indexPath.split('/')[0];
+    }
+
     function buildPackageCard(indexPath, pkg, fetchVersion) {
         var card = el('div', {className: 'pkg-card'});
         var cardHead = el('div', {className: 'pkg-card-head'});
@@ -1194,9 +1200,11 @@
             textContent: pkg,
         }));
 
-        cardHead.appendChild(buildKebabMenu([
-            {label: 'Delete all versions', danger: true, onclick: function () { closeAllKebabs(); deletePackage(indexPath, pkg); }},
-        ]));
+        if (canDeleteFromIndex(indexPath)) {
+            cardHead.appendChild(buildKebabMenu([
+                {label: 'Delete all versions', danger: true, onclick: function () { closeAllKebabs(); deletePackage(indexPath, pkg); }},
+            ]));
+        }
         card.appendChild(cardHead);
 
         card.appendChild(buildPipBlock(indexPath, pkg));
@@ -1240,7 +1248,8 @@
         function fetchStage() {
             showHeadingAndLoading(false);
             Api.get('/' + indexPath).then(function (data) {
-                renderPackages(indexPath, data.result, false);
+                var resultIsMirror = !!(data.result && data.result.type === 'mirror');
+                renderPackages(indexPath, data.result, resultIsMirror);
             }).catch(handleApiError);
         }
 
@@ -1443,13 +1452,13 @@
                     ' ',
                     el('span', {className: 'page-heading-version', textContent: 'v' + currentVer}),
                 ]),
-                el('div', {className: 'view-header-actions'}, [
+                el('div', {className: 'view-header-actions'}, canDeleteFromIndex(indexPath) ? [
                     el('button', {
-                        className: 'btn btn-danger auth-only',
+                        className: 'btn btn-danger',
                         textContent: 'Delete package',
                         onclick: function () { deletePackage(indexPath, pkg); },
                     }),
-                ]),
+                ] : []),
             ]));
 
             if (cachedVersions.length === 0 && !allVersions) {
@@ -1972,8 +1981,53 @@
                 grid.appendChild(whooshCard);
             }
 
+            // Replicas — only shown on master with connected replicas
+            var pollingReplicas = status.polling_replicas || {};
+            var replicaUuids = Object.keys(pollingReplicas);
+            if (status.role === 'MASTER' && replicaUuids.length > 0) {
+                var masterSerial = status.serial || 0;
+                var now = Date.now() / 1000;
+                // Replica is considered offline if it hasn't polled in >90s
+                // (normal polling interval is ~37.5s)
+                var OFFLINE_THRESHOLD = 90;
+
+                for (var ri = 0; ri < replicaUuids.length; ri++) {
+                    var uuid = replicaUuids[ri];
+                    var rep = pollingReplicas[uuid];
+                    var lastRequest = rep['last-request'] || 0;
+                    var age = now - lastRequest;
+                    var isOnline = age < OFFLINE_THRESHOLD;
+                    var lag = masterSerial - (rep['serial'] || 0);
+                    var label = rep['remote-ip'] || uuid.substring(0, 8);
+
+                    var repCard = el('div', {className: 'status-card'});
+                    var titleRow = el('div', {className: 'status-card-title replica-title'}, [
+                        el('span', {textContent: 'Replica: ' + label}),
+                        el('span', {
+                            className: 'replica-badge ' + (isOnline ? 'replica-online' : 'replica-offline'),
+                            textContent: isOnline ? 'online' : 'offline',
+                        }),
+                    ]);
+                    repCard.appendChild(titleRow);
+                    repCard.appendChild(statusRow('Serial lag', lag === 0 ? 'in sync' : '+' + lag));
+                    repCard.appendChild(statusRow('Last seen', _formatAge(age)));
+                    repCard.appendChild(statusRow('Polling', rep['in-request'] ? 'active' : 'idle'));
+                    if (rep['outside-url']) {
+                        repCard.appendChild(statusRow('URL', rep['outside-url']));
+                    }
+                    grid.appendChild(repCard);
+                }
+            }
+
             content.appendChild(grid);
         }).catch(handleApiError);
+    }
+
+    function _formatAge(seconds) {
+        if (seconds < 5) return 'just now';
+        if (seconds < 60) return Math.floor(seconds) + 's ago';
+        if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+        return Math.floor(seconds / 3600) + 'h ago';
     }
 
     function formatNum(n) {
