@@ -545,21 +545,6 @@ body {
     gap: 4px;
 }
 
-.pip-conf-link {
-    align-self: flex-start;
-    background: none;
-    border: none;
-    color: var(--accent);
-    font-size: 11px;
-    cursor: pointer;
-    padding: 2px 0;
-    text-decoration: underline;
-}
-
-.pip-conf-link:hover {
-    color: var(--accent-hover);
-}
-
 .pip-conf-actions {
     display: flex;
     gap: 8px;
