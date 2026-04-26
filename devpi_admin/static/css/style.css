@@ -545,37 +545,6 @@ body {
     gap: 4px;
 }
 
-.pip-toggle {
-    display: inline-flex;
-}
-
-.pip-toggle-btn {
-    padding: 4px 12px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12px;
-    cursor: pointer;
-}
-
-.pip-toggle-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-}
-
-.pip-toggle-on {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-}
-
-.pip-toggle-on:hover {
-    background: var(--accent-hover);
-    border-color: var(--accent-hover);
-    color: #fff;
-}
-
 .pip-conf-link {
     align-self: flex-start;
     background: none;
@@ -589,6 +558,119 @@ body {
 
 .pip-conf-link:hover {
     color: var(--accent-hover);
+}
+
+.pip-conf-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.pip-conf-result {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+}
+
+.pipconf-notice {
+    margin-right: auto;
+    align-self: center;
+    color: #e07c1a;
+    font-size: 12px;
+    opacity: 1;
+    transition: opacity 0.6s ease-out;
+}
+
+.pipconf-notice-fade {
+    opacity: 0;
+}
+
+.pipconf-section-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin: 12px 0 4px;
+}
+
+.pipconf-section-label:first-child {
+    margin-top: 0;
+}
+
+.pip-oneoff-row {
+    display: flex;
+    gap: 8px;
+}
+
+.pip-oneoff-input {
+    flex: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    padding: 6px 10px;
+    background: var(--table-head-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+}
+
+.tokens-link {
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.tokens-link:hover {
+    color: var(--accent-hover);
+}
+
+.tokens-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.tokens-table th,
+.tokens-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border-light);
+    text-align: left;
+}
+
+.tokens-table th {
+    background: var(--table-head-bg);
+    font-weight: 600;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.tokens-table td.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+.tokens-empty {
+    text-align: center;
+    color: var(--text-faint);
+    padding: 24px 12px;
+}
+
+.pip-conf-preview {
+    background: var(--table-head-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0;
 }
 
 .pip-url.pip-copied .pip-cmd,
@@ -804,6 +886,12 @@ body {
     margin-bottom: 12px;
 }
 
+.modal-body .form-hint {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
 .modal-body label {
     display: block;
     font-size: 12px;
@@ -869,7 +957,6 @@ body {
 
 .btn:focus-visible,
 .kebab-btn:focus-visible,
-.pip-toggle-btn:focus-visible,
 .pkg-version-del:focus-visible,
 .pkg-version-more:focus-visible,
 .theme-btn:focus-visible {

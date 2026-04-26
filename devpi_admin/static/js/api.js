@@ -80,11 +80,16 @@ var Api = (function () {
         return _user;
     }
 
+    function getToken() {
+        return _token;
+    }
+
     return {
         login: login,
         restore: restore,
         logout: logout,
         getUser: getUser,
+        getToken: getToken,
         get: function (url) { return request('GET', url); },
         post: function (url, data) { return request('POST', url, data); },
         put: function (url, data) { return request('PUT', url, data); },

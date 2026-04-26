@@ -81,7 +81,7 @@
     }
 
     function buildKebabMenu(items) {
-        var menu = el('div', {className: 'kebab-menu auth-only'});
+        var menu = el('div', {className: 'kebab-menu'});
         menu.appendChild(el('button', {
             className: 'kebab-btn',
             textContent: '\u22ee',
@@ -243,106 +243,526 @@
 
     // --- Common ---
 
-    function downloadPipConf(indexPath) {
-        var content = '[global]\n' +
-            'index-url = ' + location.origin + '/' + indexPath + '/+simple/\n' +
-            'trusted-host = ' + location.hostname + '\n';
+    function downloadFile(content, filename) {
         var blob = new Blob([content], {type: 'text/plain'});
         var url = URL.createObjectURL(blob);
         var a = document.createElement('a');
         a.href = url;
-        a.download = 'pip.conf';
+        a.download = filename;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
         setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
     }
 
-    // Global toggle state — persisted
-    var _hasConfig = localStorage.getItem('devpi-has-config') !== 'false';
+    var TTL_OPTIONS = [
+        {value: 3600, label: '1 hour'},
+        {value: 86400, label: '1 day'},
+        {value: 604800, label: '7 days'},
+        {value: 2592000, label: '30 days'},
+        {value: 7776000, label: '90 days'},
+        {value: 31536000, label: '1 year'},
+    ];
 
-    // Build pip block for package contexts (no toggle, uses header toggle)
-    function buildPipBlock(indexPath, pkg) {
-        var wrapper = el('div', {className: 'pip-block'});
-        var urlSlot = el('div', {className: 'pip-url-slot'});
-        wrapper.appendChild(urlSlot);
-        function render() {
-            clear(urlSlot);
-            urlSlot.appendChild(buildPipUrl(indexPath, pkg, _hasConfig));
+    var _pipConfLastTokenId = null;
+    var _pipConfLastTokenKept = false;
+
+    function isPublicAclRead(aclRead) {
+        if (!aclRead || !aclRead.length) return true;
+        for (var i = 0; i < aclRead.length; i++) {
+            if (aclRead[i] === ':ANONYMOUS:') return true;
         }
-        wrapper._renderPip = render;
-        render();
-        return wrapper;
+        return false;
     }
 
-    // Index card pip block: download link (with config) or full command (without)
-    function buildIndexPipBlock(indexPath) {
-        var wrapper = el('div', {className: 'pip-block'});
-        function render() {
-            clear(wrapper);
-            if (_hasConfig) {
-                wrapper.appendChild(el('button', {
-                    className: 'pip-conf-link',
-                    textContent: 'Download pip.conf',
-                    onclick: function () { downloadPipConf(indexPath); },
-                }));
-            } else {
-                wrapper.appendChild(buildPipUrl(indexPath, null, false));
-            }
+    function showPipConfModal(indexPath, aclRead) {
+        _pipConfLastTokenId = null;
+        _pipConfLastTokenKept = false;
+        var currentUser = Api.getUser();
+        var isPublic = isPublicAclRead(aclRead);
+        // No need to issue a token for indexes anyone can read,
+        // or when the visitor isn't authenticated.
+        if (isPublic || !currentUser) {
+            return showPipConfStaticModal(indexPath);
         }
-        wrapper._renderPip = render;
-        render();
-        return wrapper;
-    }
 
-    // Header toggle — rendered once, shown/hidden per route
-    var _headerToggle = document.getElementById('pip-toggle-header');
-
-    function renderHeaderPipToggle() {
-        clear(_headerToggle);
-        var btn = el('button', {
-            className: 'pip-toggle-btn' + (_hasConfig ? ' pip-toggle-on' : ''),
-            textContent: 'pip.conf',
-            title: _hasConfig ? 'pip.conf enabled — click to disable' : 'pip.conf disabled — click to enable',
-        });
-        btn.addEventListener('click', function () {
-            _hasConfig = !_hasConfig;
-            localStorage.setItem('devpi-has-config', _hasConfig ? 'true' : 'false');
-            updateAllPipBlocks();
-            renderHeaderPipToggle();
-        });
-        _headerToggle.appendChild(btn);
-    }
-    renderHeaderPipToggle();
-
-    function updateAllPipBlocks() {
-        var blocks = document.querySelectorAll('.pip-block');
-        for (var i = 0; i < blocks.length; i++) {
-            if (blocks[i]._renderPip) blocks[i]._renderPip();
-        }
-    }
-
-    function buildPipUrl(indexPath, pkg, withConfig) {
-        var args = '--index-url ' + location.origin + '/' + indexPath + '/+simple/' +
-            ' --trusted-host ' + location.hostname;
-        var cmd;
-        var div = el('div', {className: 'pip-url'});
-        div.appendChild(el('span', {className: 'pip-cmd', textContent: 'pip install'}));
-        if (withConfig) {
-            cmd = 'pip install' + (pkg ? ' ' + pkg : '');
-            if (pkg) {
-                div.appendChild(document.createTextNode(' '));
-                div.appendChild(el('span', {className: 'pip-pkg', textContent: pkg}));
-            } else {
-                div.appendChild(document.createTextNode(' <package>'));
+        var isRoot = currentUser === 'root';
+        var candidateUsers = [];
+        if (isRoot) {
+            candidateUsers.push('root');
+            for (var i = 0; i < (aclRead || []).length; i++) {
+                var u = aclRead[i];
+                if (!u || u.indexOf(':') === 0) continue;
+                if (candidateUsers.indexOf(u) < 0) candidateUsers.push(u);
             }
         } else {
-            cmd = 'pip install ' + args + (pkg ? ' ' + pkg : '');
-            div.appendChild(document.createTextNode(' ' + args));
-            if (pkg) {
-                div.appendChild(document.createTextNode(' '));
-                div.appendChild(el('span', {className: 'pip-pkg', textContent: pkg}));
+            candidateUsers.push(currentUser);
+        }
+
+        openModal(
+            'pip.conf for ' + indexPath,
+            function (body) {
+                body.appendChild(formGroup('User', (function () {
+                    var sel = el('select', {id: 'pipconf-user'});
+                    for (var i = 0; i < candidateUsers.length; i++) {
+                        sel.appendChild(el('option', {
+                            value: candidateUsers[i],
+                            textContent: candidateUsers[i],
+                        }));
+                    }
+                    sel.disabled = candidateUsers.length === 1;
+                    return sel;
+                })()));
+
+                body.appendChild(formGroup('Token TTL', (function () {
+                    var sel = el('select', {id: 'pipconf-ttl'});
+                    for (var i = 0; i < TTL_OPTIONS.length; i++) {
+                        var opt = TTL_OPTIONS[i];
+                        var optEl = el('option', {
+                            value: String(opt.value),
+                            textContent: opt.label,
+                        });
+                        if (opt.value === 86400) optEl.selected = true;
+                        sel.appendChild(optEl);
+                    }
+                    return sel;
+                })()));
+
+                body.appendChild(formGroup('Label (optional)', el('input', {
+                    type: 'text',
+                    id: 'pipconf-label',
+                    value: 'pip-conf ' + indexPath,
+                    maxLength: 200,
+                })));
+
+                body.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'Token is read-only — it cannot change passwords or be exchanged for a session token. The pip.conf will contain credentials in the URL; treat it as a secret.',
+                }));
+
+                body.appendChild(el('div', {
+                    id: 'pipconf-result',
+                    className: 'pip-conf-result',
+                    hidden: true,
+                }));
+            },
+            [
+                el('span', {
+                    id: 'pipconf-notice',
+                    className: 'pipconf-notice',
+                    hidden: true,
+                }),
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Generate',
+                    id: 'pipconf-generate',
+                    onclick: function () { generatePipConf(indexPath); },
+                }),
+                el('button', {
+                    className: 'btn',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ]);
+    }
+
+    function generatePipConf(indexPath) {
+        var user = document.getElementById('pipconf-user').value;
+        var ttl = parseInt(document.getElementById('pipconf-ttl').value, 10);
+        var label = document.getElementById('pipconf-label').value;
+        var btn = document.getElementById('pipconf-generate');
+        btn.disabled = true;
+        var orig = btn.textContent;
+        btn.textContent = 'Generating…';
+
+        // Revoke previously-generated token from this same modal session
+        // unless the user committed to it (Copy or Download). Prevents
+        // piles of unused tokens while not killing one already in clipboard.
+        var prevId = _pipConfLastTokenId;
+        var prevKept = _pipConfLastTokenKept;
+        var didRevoke = false;
+        _pipConfLastTokenId = null;
+        _pipConfLastTokenKept = false;
+        var revokePromise;
+        if (prevId && !prevKept) {
+            didRevoke = true;
+            revokePromise = Api.del('/+admin-api/tokens/' + encodeURIComponent(prevId))
+                .catch(function () {});
+        } else {
+            revokePromise = Promise.resolve();
+        }
+
+        var url = '/+admin-api/pip-conf?index=' + encodeURIComponent(indexPath)
+            + '&user=' + encodeURIComponent(user)
+            + '&ttl=' + ttl
+            + '&label=' + encodeURIComponent(label);
+
+        revokePromise.then(function () {
+            // Need raw text/plain response, so use fetch directly instead of Api.get
+            return fetch(url, {
+                method: 'GET',
+                headers: {
+                    'X-Devpi-Auth': btoa(Api.getUser() + ':' + Api.getToken()),
+                    'Accept': 'text/plain',
+                },
+            });
+        }).then(function (res) {
+            if (!res.ok) {
+                return res.json().then(function (j) {
+                    throw new Error(j.error || ('Status ' + res.status));
+                });
             }
+            return res.text();
+        }).then(function (content) {
+            var token = extractTokenSecret(content);
+            _pipConfLastTokenId = token ? token.substring(4) : null;  // strip adm_
+            renderPipConfResult(content, indexPath, didRevoke);
+            btn.textContent = 'Regenerate';
+        }).catch(function (err) {
+            showModalError(err);
+            btn.textContent = orig;
+        }).finally(function () {
+            btn.disabled = false;
+        });
+    }
+
+    function showUserTokensModal(username) {
+        openModal(
+            'Tokens for ' + username,
+            function (body) {
+                body.appendChild(el('div', {
+                    id: 'tokens-list-container',
+                    textContent: 'Loading…',
+                }));
+            },
+            [
+                el('button', {
+                    className: 'btn',
+                    textContent: 'Reset all',
+                    onclick: function () {
+                        if (!confirm('Revoke ALL tokens for ' + username + '?')) return;
+                        Api.del('/+admin-api/users/' + encodeURIComponent(username) + '/tokens')
+                            .then(function () { renderTokensList(username); })
+                            .catch(showModalError);
+                    },
+                }),
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ]);
+        renderTokensList(username);
+    }
+
+    function renderTokensList(username) {
+        var container = document.getElementById('tokens-list-container');
+        if (!container) return;
+        Api.get('/+admin-api/users/' + encodeURIComponent(username) + '/tokens')
+            .then(function (data) {
+                clear(container);
+                var tokens = data.result || [];
+                if (!tokens.length) {
+                    container.appendChild(el('div', {
+                        className: 'tokens-empty',
+                        textContent: 'No active tokens.',
+                    }));
+                    return;
+                }
+                var table = el('table', {className: 'tokens-table'});
+                var thead = el('thead');
+                thead.appendChild(el('tr', null, [
+                    el('th', {textContent: 'Label'}),
+                    el('th', {textContent: 'Expires'}),
+                    el('th', {textContent: 'Issuer'}),
+                    el('th', {textContent: 'IP'}),
+                    el('th', {textContent: 'ID'}),
+                    el('th', {}),
+                ]));
+                table.appendChild(thead);
+                var tbody = el('tbody');
+                for (var i = 0; i < tokens.length; i++) {
+                    tbody.appendChild(buildTokenRow(tokens[i], username));
+                }
+                table.appendChild(tbody);
+                container.appendChild(table);
+            })
+            .catch(function (err) {
+                clear(container);
+                container.appendChild(el('div', {
+                    className: 'error-text',
+                    textContent: 'Failed to load tokens: ' + err.message,
+                }));
+            });
+    }
+
+    function buildTokenRow(t, username) {
+        return el('tr', null, [
+            el('td', {textContent: t.label || '(no label)'}),
+            el('td', {textContent: formatExpiry(t.expires_in)}),
+            el('td', {textContent: t.issuer}),
+            el('td', {textContent: t.client_ip || '—'}),
+            el('td', {className: 'mono', textContent: t.id_short}),
+            el('td', null, [
+                el('button', {
+                    className: 'btn btn-small',
+                    textContent: 'Revoke',
+                    onclick: function () {
+                        if (!confirm('Revoke token "' + (t.label || t.id_short) + '"?')) return;
+                        Api.del('/+admin-api/tokens/' + encodeURIComponent(t.id))
+                            .then(function () { renderTokensList(username); })
+                            .catch(showModalError);
+                    },
+                }),
+            ]),
+        ]);
+    }
+
+    function formatExpiry(seconds) {
+        if (seconds <= 0) return 'expired';
+        if (seconds < 3600) return Math.round(seconds / 60) + ' min';
+        if (seconds < 86400) return Math.round(seconds / 3600) + ' h';
+        if (seconds < 30 * 86400) return Math.round(seconds / 86400) + ' d';
+        return Math.round(seconds / (30 * 86400)) + ' mo';
+    }
+
+    function showPipConfStaticModal(indexPath) {
+        // Public index — no auth needed. Show plain pip.conf without
+        // generating a token.
+        var content = '[global]\n'
+            + 'index-url = ' + location.origin + '/' + indexPath + '/+simple/\n'
+            + 'trusted-host = ' + location.hostname + '\n';
+        var oneOffCmd = 'pip install --index-url ' + location.origin + '/'
+            + indexPath + '/+simple/ --trusted-host ' + location.hostname + ' <package>';
+
+        openModal(
+            'pip.conf for ' + indexPath,
+            function (body) {
+                body.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'This index is public — no token needed.',
+                }));
+
+                // pip.conf
+                body.appendChild(el('label', {
+                    className: 'pipconf-section-label',
+                    textContent: 'pip.conf',
+                }));
+                var actions = el('div', {className: 'pip-conf-actions'});
+                var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+                copyBtn.addEventListener('click', function () {
+                    copyText(content).then(function () { flashCopied(copyBtn); });
+                });
+                actions.appendChild(copyBtn);
+                actions.appendChild(el('button', {
+                    className: 'btn',
+                    textContent: 'Download',
+                    onclick: function () { downloadFile(content, 'pip.conf'); },
+                }));
+                body.appendChild(actions);
+                body.appendChild(el('pre', {
+                    className: 'pip-conf-preview',
+                    textContent: content,
+                }));
+
+                // One-off install
+                body.appendChild(el('label', {
+                    className: 'pipconf-section-label',
+                    textContent: 'One-off install command',
+                }));
+                var cmdRow = el('div', {className: 'pip-oneoff-row'});
+                var cmdInput = el('input', {
+                    type: 'text',
+                    className: 'pip-oneoff-input',
+                    value: oneOffCmd,
+                    readOnly: true,
+                    spellcheck: false,
+                });
+                cmdInput.addEventListener('focus', function () { this.select(); });
+                cmdRow.appendChild(cmdInput);
+                var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+                cmdCopyBtn.addEventListener('click', function () {
+                    copyText(oneOffCmd).then(function () { flashCopied(cmdCopyBtn); });
+                });
+                cmdRow.appendChild(cmdCopyBtn);
+                body.appendChild(cmdRow);
+            },
+            [
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ]);
+    }
+
+    function showRevokedNotice() {
+        var notice = document.getElementById('pipconf-notice');
+        if (!notice) return;
+        notice.textContent = 'Previous token was revoked.';
+        notice.classList.remove('pipconf-notice-fade');
+        notice.hidden = false;
+        clearTimeout(notice._fadeTimer);
+        clearTimeout(notice._hideTimer);
+        notice._fadeTimer = setTimeout(function () {
+            notice.classList.add('pipconf-notice-fade');
+        }, 3000);
+        notice._hideTimer = setTimeout(function () {
+            notice.hidden = true;
+            notice.textContent = '';
+            notice.classList.remove('pipconf-notice-fade');
+        }, 3700);
+    }
+
+    function renderPipConfResult(content, indexPath, didRevoke) {
+        var result = document.getElementById('pipconf-result');
+        clear(result);
+        result.hidden = false;
+
+        if (didRevoke) {
+            showRevokedNotice();
+        }
+
+        // Block 1: pip.conf file
+        result.appendChild(el('label', {
+            className: 'pipconf-section-label',
+            textContent: 'pip.conf',
+        }));
+        var actions = el('div', {className: 'pip-conf-actions'});
+        var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+        copyBtn.addEventListener('click', function () {
+            copyText(content).then(function () {
+                _pipConfLastTokenKept = true;
+                flashCopied(copyBtn);
+            });
+        });
+        actions.appendChild(copyBtn);
+        actions.appendChild(el('button', {
+            className: 'btn',
+            textContent: 'Download',
+            onclick: function () {
+                _pipConfLastTokenKept = true;
+                downloadFile(content, 'pip.conf');
+            },
+        }));
+        result.appendChild(actions);
+        result.appendChild(el('pre', {
+            className: 'pip-conf-preview',
+            textContent: content,
+        }));
+
+        // Block 2: one-off install command (most ready-to-use)
+        var indexUrl = extractIndexUrl(content);
+        if (indexUrl) {
+            var oneOffCmd = 'pip install --index-url ' + indexUrl
+                + ' --trusted-host ' + location.hostname + ' <package>';
+            result.appendChild(el('label', {
+                className: 'pipconf-section-label',
+                textContent: 'One-off install command',
+            }));
+            var cmdRow = el('div', {className: 'pip-oneoff-row'});
+            var cmdInput = el('input', {
+                type: 'text',
+                className: 'pip-oneoff-input',
+                value: oneOffCmd,
+                readOnly: true,
+                spellcheck: false,
+            });
+            cmdInput.addEventListener('focus', function () { this.select(); });
+            cmdRow.appendChild(cmdInput);
+            var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+            cmdCopyBtn.addEventListener('click', function () {
+                copyText(oneOffCmd).then(function () {
+                    _pipConfLastTokenKept = true;
+                    flashCopied(cmdCopyBtn);
+                });
+            });
+            cmdRow.appendChild(cmdCopyBtn);
+            result.appendChild(cmdRow);
+            result.appendChild(el('div', {
+                className: 'form-hint',
+                textContent: 'Replace <package> with the package name.',
+            }));
+        }
+
+        // Block 3: raw user:token credential pair (most generic)
+        var creds = extractCreds(content);
+        if (creds) {
+            result.appendChild(el('label', {
+                className: 'pipconf-section-label',
+                textContent: 'User : token (for curl -u, devpi login, custom tools)',
+            }));
+            var tokRow = el('div', {className: 'pip-oneoff-row'});
+            var tokInput = el('input', {
+                type: 'text',
+                className: 'pip-oneoff-input',
+                value: creds,
+                readOnly: true,
+                spellcheck: false,
+            });
+            tokInput.addEventListener('focus', function () { this.select(); });
+            tokRow.appendChild(tokInput);
+            var tokCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+            tokCopyBtn.addEventListener('click', function () {
+                copyText(creds).then(function () {
+                    _pipConfLastTokenKept = true;
+                    flashCopied(tokCopyBtn);
+                });
+            });
+            tokRow.appendChild(tokCopyBtn);
+            result.appendChild(tokRow);
+        }
+    }
+
+    function flashCopied(btn) {
+        var orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(function () { btn.textContent = orig; }, 1200);
+    }
+
+    function extractIndexUrl(pipConfContent) {
+        var m = pipConfContent.match(/^index-url\s*=\s*(\S+)/m);
+        return m ? m[1] : null;
+    }
+
+    function extractTokenSecret(pipConfContent) {
+        var m = pipConfContent.match(/^index-url\s*=\s*https?:\/\/[^:]+:([^@]+)@/m);
+        if (!m) return null;
+        try {
+            return decodeURIComponent(m[1]);
+        } catch (e) {
+            return m[1];
+        }
+    }
+
+    function extractCreds(pipConfContent) {
+        // Returns "user:token" extracted (URL-decoded) from the index-url.
+        var m = pipConfContent.match(/^index-url\s*=\s*https?:\/\/([^:]+):([^@]+)@/m);
+        if (!m) return null;
+        try {
+            return decodeURIComponent(m[1]) + ':' + decodeURIComponent(m[2]);
+        } catch (e) {
+            return m[1] + ':' + m[2];
+        }
+    }
+
+    // Pip block for package detail: shows clickable "pip install <pkg>" command.
+    // Assumes pip.conf has been configured separately via the per-index modal.
+    function buildPipBlock(indexPath, pkg) {
+        var wrapper = el('div', {className: 'pip-block'});
+        wrapper.appendChild(buildPipShortCmd(pkg));
+        return wrapper;
+    }
+
+    function buildPipShortCmd(pkg) {
+        var cmd = 'pip install' + (pkg ? ' ' + pkg : '');
+        var div = el('div', {className: 'pip-url'});
+        div.appendChild(el('span', {className: 'pip-cmd', textContent: 'pip install'}));
+        if (pkg) {
+            div.appendChild(document.createTextNode(' '));
+            div.appendChild(el('span', {className: 'pip-pkg', textContent: pkg}));
+        } else {
+            div.appendChild(document.createTextNode(' <package>'));
         }
         var overlay = el('span', {className: 'pip-copied-overlay', textContent: 'Copied!'});
         div.appendChild(overlay);
@@ -696,6 +1116,22 @@
                         tagsWrap.appendChild(tagsGroup);
                         details.appendChild(tagsWrap);
                     }
+                    if (canEdit) {
+                        var tokensRow = el('div', {className: 'index-card-row'});
+                        tokensRow.appendChild(el('span', {className: 'index-card-label', textContent: 'Tokens'}));
+                        tokensRow.appendChild((function (uname) {
+                            return el('a', {
+                                href: '#',
+                                className: 'tokens-link',
+                                textContent: 'manage…',
+                                onclick: function (e) {
+                                    e.preventDefault();
+                                    showUserTokensModal(uname);
+                                },
+                            });
+                        })(name));
+                        details.appendChild(tokensRow);
+                    }
                     card.appendChild(details);
 
                     grid.appendChild(card);
@@ -958,18 +1394,42 @@
                         ]));
                     }
                 }
+                if (idx.acl_read && idx.acl_read.length
+                        && !(idx.acl_read.length === 1 && idx.acl_read[0] === ':ANONYMOUS:')) {
+                    details.appendChild(el('div', {className: 'index-card-row'}, [
+                        el('span', {className: 'index-card-label', textContent: 'Read'}),
+                        el('span', {textContent: idx.acl_read.join(', ')}),
+                    ]));
+                }
 
                 card.appendChild(details);
 
-                card.appendChild(buildIndexPipBlock(idx._full));
-
-                // Kebab menu — only for root or the index owner
+                // Kebab menu items: pip.conf for everyone, edit/delete for owners
                 var loggedIn = Api.getUser();
+                var menuItems = [];
+                (function (path, aclRead) {
+                    menuItems.push({
+                        label: 'pip.conf',
+                        onclick: function () {
+                            closeAllKebabs();
+                            showPipConfModal(path, aclRead);
+                        },
+                    });
+                })(idx._full, idx.acl_read);
                 if (loggedIn === 'root' || loggedIn === idx._user) {
-                    cardHead.appendChild(buildKebabMenu([
-                        {label: 'Edit', onclick: function () { closeAllKebabs(); showIndexModal(idx, result); }},
-                        {label: 'Delete', danger: true, onclick: function () { closeAllKebabs(); deleteIndex(idx._full); }},
-                    ]));
+                    (function (idxRef) {
+                        menuItems.push({
+                            label: 'Edit',
+                            onclick: function () { closeAllKebabs(); showIndexModal(idxRef, result); },
+                        });
+                        menuItems.push({
+                            label: 'Delete', danger: true,
+                            onclick: function () { closeAllKebabs(); deleteIndex(idxRef._full); },
+                        });
+                    })(idx);
+                }
+                if (menuItems.length) {
+                    cardHead.appendChild(buildKebabMenu(menuItems));
                 }
 
                 grid.appendChild(card);
@@ -1099,6 +1559,18 @@
                 body.appendChild(stageFields);
                 body.appendChild(mirrorFields);
 
+                var aclReadInitial = isEdit ? (editIdx.acl_read || [':ANONYMOUS:']) : [':ANONYMOUS:'];
+                body.appendChild(el('div', {className: 'form-group'}, [
+                    el('label', {textContent: 'ACL Read'}),
+                    buildTagPicker(
+                        'form-acl-read', aclReadInitial, userNames,
+                        [':ANONYMOUS:', ':AUTHENTICATED:']),
+                    el('div', {
+                        className: 'form-hint',
+                        textContent: ':ANONYMOUS: = public, :AUTHENTICATED: = any logged-in user',
+                    }),
+                ]));
+
                 body.appendChild(formGroup('Title (optional)', el('input', {
                     type: 'text',
                     id: 'form-title',
@@ -1149,6 +1621,7 @@
         } else {
             data.mirror_url = document.getElementById('form-mirror-url').value.trim();
         }
+        data.acl_read = getTagPickerValues('form-acl-read');
 
         var url;
         if (isEdit) {
@@ -1287,6 +1760,15 @@
                     },
                 }));
             }
+            actions.push(el('button', {
+                className: 'btn',
+                textContent: 'pip.conf',
+                onclick: function () {
+                    showPipConfModal(
+                        indexPath,
+                        (indexInfo && indexInfo.acl_read) || []);
+                },
+            }));
             actions.push(el('button', {
                 className: 'btn auth-only',
                 textContent: 'Edit',
