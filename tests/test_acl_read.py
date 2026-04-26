@@ -6,8 +6,9 @@ from unittest.mock import MagicMock
 
 from devpi_admin import main
 from devpi_admin.main import (
-    _ADMIN_TOKEN_BLOCKED_PATHS, _INDEX_PATH_RE, _NAME_RE, _SIMPLE_PATH_RE,
+    _INDEX_ANY_RE, _NAME_RE, _TOKEN_ALLOWED_PATH_RE, _USER_PATH_RE,
     _admin_token_check, _filter_root_listing, _request_carries_admin_token,
+    _user_listing_check,
     devpiserver_indexconfig_defaults, devpiserver_stage_get_principals_for_pkg_read)
 
 
@@ -19,14 +20,11 @@ class IndexconfigDefaultsTests(unittest.TestCase):
         self.assertEqual(list(result["acl_read"]), [":ANONYMOUS:"])
 
     def test_value_is_acllist_for_devpi_validation(self):
-        # ACLList marker tells devpi to apply ensure_acl_list normalization
-        # on every PUT/PATCH (case-folds principals, accepts comma strings).
         from devpi_server.model import ACLList
         result = devpiserver_indexconfig_defaults("stage")
         self.assertIsInstance(result["acl_read"], ACLList)
 
     def test_same_default_for_mirror_indexes(self):
-        # Mirror indexes can also be private; default must be public though.
         result = devpiserver_indexconfig_defaults("mirror")
         self.assertEqual(list(result["acl_read"]), [":ANONYMOUS:"])
 
@@ -45,35 +43,44 @@ class PrincipalsForPkgReadTests(unittest.TestCase):
 
 class PathRegexTests(unittest.TestCase):
 
-    def test_index_path_matches_user_index(self):
-        self.assertTrue(_INDEX_PATH_RE.match("/alice/dev"))
-        self.assertTrue(_INDEX_PATH_RE.match("/alice/dev/"))
+    def test_user_path_matches(self):
+        self.assertTrue(_USER_PATH_RE.match("/alice"))
+        self.assertTrue(_USER_PATH_RE.match("/alice/"))
 
-    def test_index_path_rejects_plus_segments(self):
-        self.assertFalse(_INDEX_PATH_RE.match("/+login"))
-        self.assertFalse(_INDEX_PATH_RE.match("/+api"))
-        self.assertFalse(_INDEX_PATH_RE.match("/alice/+api"))
+    def test_user_path_rejects_plus_and_deeper(self):
+        self.assertFalse(_USER_PATH_RE.match("/+login"))
+        self.assertFalse(_USER_PATH_RE.match("/alice/dev"))
+        self.assertFalse(_USER_PATH_RE.match("/"))
 
-    def test_index_path_rejects_deeper_paths(self):
-        # Project paths and simple paths must not be caught here.
-        self.assertFalse(_INDEX_PATH_RE.match("/alice/dev/foo"))
-        self.assertFalse(_INDEX_PATH_RE.match("/alice/dev/+simple/"))
+    def test_index_any_matches_index_and_subpaths(self):
+        self.assertTrue(_INDEX_ANY_RE.match("/alice/dev"))
+        self.assertTrue(_INDEX_ANY_RE.match("/alice/dev/"))
+        self.assertTrue(_INDEX_ANY_RE.match("/alice/dev/+simple/"))
+        self.assertTrue(_INDEX_ANY_RE.match("/alice/dev/+simple/foo"))
+        self.assertTrue(_INDEX_ANY_RE.match("/alice/dev/foo"))
+        self.assertTrue(_INDEX_ANY_RE.match("/alice/dev/foo/1.0"))
 
-    def test_simple_path(self):
-        self.assertTrue(_SIMPLE_PATH_RE.match("/alice/dev/+simple/"))
-        self.assertTrue(_SIMPLE_PATH_RE.match("/alice/dev/+simple"))
-        self.assertFalse(_SIMPLE_PATH_RE.match("/alice/dev/+simple/foo/"))
+    def test_index_any_rejects_plus_segments(self):
+        self.assertFalse(_INDEX_ANY_RE.match("/+login"))
+        self.assertFalse(_INDEX_ANY_RE.match("/+api"))
+        self.assertFalse(_INDEX_ANY_RE.match("/alice/+api"))
 
-    def test_admin_token_blocked_paths(self):
-        # Paths that escalate identity: must block any non-GET method.
-        self.assertTrue(_ADMIN_TOKEN_BLOCKED_PATHS.match("/+login"))
-        self.assertTrue(_ADMIN_TOKEN_BLOCKED_PATHS.match("/+login/"))
-        self.assertTrue(_ADMIN_TOKEN_BLOCKED_PATHS.match("/alice"))
-        self.assertTrue(_ADMIN_TOKEN_BLOCKED_PATHS.match("/alice/"))
-        # Index/package paths must NOT be blocked here — devpi ACL handles them.
-        self.assertFalse(_ADMIN_TOKEN_BLOCKED_PATHS.match("/alice/dev"))
-        self.assertFalse(_ADMIN_TOKEN_BLOCKED_PATHS.match("/alice/dev/foo"))
-        self.assertFalse(_ADMIN_TOKEN_BLOCKED_PATHS.match("/+api"))
+    def test_token_allowed_path_re(self):
+        # /+api allowed (devpi client discovery).
+        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/+api"))
+        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/+api/"))
+        # Index/archive paths allowed.
+        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev"))
+        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev/+simple/"))
+        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev/+f/foo.whl"))
+        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev/foo/1.0"))
+        # Management / login / single-segment / SPA paths denied.
+        for bad in ("/", "/+login", "/+admin/", "/+admin-api/token",
+                    "/+admin-api/users/alice/tokens", "/+status", "/alice",
+                    "/alice/"):
+            self.assertFalse(
+                _TOKEN_ALLOWED_PATH_RE.match(bad),
+                "expected token path %r to be denied" % bad)
 
     def test_name_regex_accepts_typical_names(self):
         for name in ("alice", "ci-runner", "team_a", "user.bot", "u1"):
@@ -93,9 +100,12 @@ class AdminTokenHeaderDetectionTests(unittest.TestCase):
         req.headers = {"X-Devpi-Auth": raw}
         return req
 
+    def _valid_token(self):
+        # Match the new format: adm_<id>.<secret>
+        return "adm_" + ("x" * 22) + "." + ("y" * 43)
+
     def test_detects_adm_token_in_devpi_auth(self):
-        token = "adm_" + "x" * 40
-        req = self._request_with_devpi_auth("alice", token)
+        req = self._request_with_devpi_auth("alice", self._valid_token())
         self.assertTrue(_request_carries_admin_token(req))
 
     def test_ignores_devpi_session_token(self):
@@ -107,14 +117,18 @@ class AdminTokenHeaderDetectionTests(unittest.TestCase):
         req = self._request_with_devpi_auth("alice", "secret123")
         self.assertFalse(_request_carries_admin_token(req))
 
+    def test_ignores_old_format_without_dot(self):
+        # Old single-blob format must no longer be considered a valid token.
+        req = self._request_with_devpi_auth("alice", "adm_" + "x" * 40)
+        self.assertFalse(_request_carries_admin_token(req))
+
     def test_no_headers(self):
         req = MagicMock()
         req.headers = {}
         self.assertFalse(_request_carries_admin_token(req))
 
     def test_falls_back_to_basic_auth_header(self):
-        token = "adm_" + "x" * 40
-        raw = base64.b64encode(("alice:" + token).encode()).decode()
+        raw = base64.b64encode(("alice:" + self._valid_token()).encode()).decode()
         req = MagicMock()
         req.headers = {"Authorization": "Basic " + raw}
         self.assertTrue(_request_carries_admin_token(req))
@@ -122,7 +136,6 @@ class AdminTokenHeaderDetectionTests(unittest.TestCase):
     def test_malformed_base64_does_not_throw(self):
         req = MagicMock()
         req.headers = {"X-Devpi-Auth": "!!!!!!!"}
-        # Should return False, not raise.
         self.assertFalse(_request_carries_admin_token(req))
 
 
@@ -134,39 +147,61 @@ class AdminTokenCheckTests(unittest.TestCase):
         req.path = path
         return req
 
-    def test_get_always_allowed(self):
-        for path in ("/+login", "/alice", "/alice/dev", "/alice/dev/foo"):
+    def test_get_index_paths_allowed(self):
+        for path in ("/+api", "/alice/dev", "/alice/dev/+simple/",
+                     "/alice/dev/+f/foo.whl", "/alice/dev/foo/1.0"):
             self.assertIsNone(
                 _admin_token_check(self._make("GET", path)),
-                "GET %s should not be blocked" % path)
+                "GET %s should be allowed" % path)
 
-    def test_head_always_allowed(self):
-        self.assertIsNone(_admin_token_check(self._make("HEAD", "/+login")))
+    def test_get_management_paths_blocked(self):
+        for path in ("/", "/+login", "/+admin/", "/+admin-api/token",
+                     "/+admin-api/users/alice/tokens", "/+status",
+                     "/alice", "/alice/"):
+            self.assertIsNotNone(
+                _admin_token_check(self._make("GET", path)),
+                "GET %s should be blocked" % path)
 
-    def test_post_login_blocked(self):
-        result = _admin_token_check(self._make("POST", "/+login"))
+    def test_head_treated_like_get(self):
+        self.assertIsNone(_admin_token_check(self._make("HEAD", "/alice/dev")))
+        self.assertIsNotNone(_admin_token_check(self._make("HEAD", "/+login")))
+
+    def test_any_write_method_blocked_everywhere(self):
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            for path in ("/+login", "/alice", "/alice/dev",
+                         "/alice/dev/foo", "/+admin-api/token"):
+                self.assertIsNotNone(
+                    _admin_token_check(self._make(method, path)),
+                    "%s %s must be blocked for admin tokens" % (method, path))
+
+
+class UserListingCheckTests(unittest.TestCase):
+
+    def _make(self, path, auth_user=None):
+        req = MagicMock()
+        req.path = path
+        req.authenticated_userid = auth_user
+        return req
+
+    def test_non_user_paths_passthrough(self):
+        for path in ("/", "/alice/dev", "/+login"):
+            self.assertIsNone(_user_listing_check(self._make(path)))
+
+    def test_anonymous_blocked(self):
+        result = _user_listing_check(self._make("/alice", auth_user=None))
         self.assertIsNotNone(result)
 
-    def test_patch_user_blocked(self):
-        result = _admin_token_check(self._make("PATCH", "/alice"))
-        self.assertIsNotNone(result)
+    def test_owner_allowed(self):
+        result = _user_listing_check(self._make("/alice/", auth_user="alice"))
+        self.assertIsNone(result)
 
-    def test_delete_user_blocked(self):
-        result = _admin_token_check(self._make("DELETE", "/alice"))
-        self.assertIsNotNone(result)
+    def test_root_allowed_for_others(self):
+        result = _user_listing_check(self._make("/alice", auth_user="root"))
+        self.assertIsNone(result)
 
-    def test_put_user_blocked(self):
-        result = _admin_token_check(self._make("PUT", "/alice"))
+    def test_other_user_blocked(self):
+        result = _user_listing_check(self._make("/alice", auth_user="bob"))
         self.assertIsNotNone(result)
-
-    def test_index_management_passes_through(self):
-        # Operations on indexes (PATCH /<user>/<index>) flow through devpi ACL.
-        # Our tween only blocks user-management paths.
-        for method in ("PATCH", "PUT", "DELETE", "POST"):
-            self.assertIsNone(
-                _admin_token_check(self._make(method, "/alice/dev")),
-                "%s /alice/dev should not be blocked by admin token guard"
-                % method)
 
 
 class FilterRootListingTests(unittest.TestCase):
@@ -177,10 +212,10 @@ class FilterRootListingTests(unittest.TestCase):
         resp.body = json.dumps(body).encode()
         resp.content_type = "application/json"
         resp.status_code = 200
+        resp.headers = {}
         return resp
 
     def _make_xom(self, stage_visibility):
-        # stage_visibility maps "user/index" -> True/False (has pkg_read)
         xom = MagicMock()
         def getstage(user, index):
             key = "%s/%s" % (user, index)
@@ -194,7 +229,6 @@ class FilterRootListingTests(unittest.TestCase):
 
     def _make_request(self, xom):
         req = MagicMock()
-        # has_permission returns True iff stage._adm_visible is True
         req.has_permission.side_effect = (
             lambda perm, context=None: getattr(context, "_adm_visible", False))
         return req
@@ -218,12 +252,16 @@ class FilterRootListingTests(unittest.TestCase):
         self.assertEqual(set(filtered["result"]["alice"]["indexes"]), {"public"})
         self.assertEqual(set(filtered["result"]["bob"]["indexes"]), {"team"})
 
+    def test_sets_private_cache_control(self):
+        body = {"result": {"alice": {"indexes": {}}}}
+        xom = self._make_xom({})
+        resp = self._make_response(body)
+        req = self._make_request(xom)
+        out = _filter_root_listing(req, resp, xom)
+        self.assertIn("private", out.headers.get("Cache-Control", ""))
+
     def test_keeps_users_with_no_visible_indexes_but_empty(self):
-        body = {
-            "result": {
-                "alice": {"indexes": {"secret": {}}},
-            },
-        }
+        body = {"result": {"alice": {"indexes": {"secret": {}}}}}
         xom = self._make_xom({"alice/secret": False})
         resp = self._make_response(body)
         req = self._make_request(xom)
@@ -236,11 +274,59 @@ class FilterRootListingTests(unittest.TestCase):
         resp.body = b"not json"
         resp.content_type = "application/json"
         resp.status_code = 200
+        resp.headers = {}
         xom = MagicMock()
         req = MagicMock()
         out = _filter_root_listing(req, resp, xom)
-        # On parse failure, response is returned untouched.
         self.assertIs(out, resp)
+
+
+class TrustedProxyTests(unittest.TestCase):
+
+    def setUp(self):
+        # Reset the module-level cache before each test.
+        main._trusted_proxies_cache = None
+
+    def tearDown(self):
+        main._trusted_proxies_cache = None
+        import os
+        os.environ.pop(main._TRUSTED_PROXIES_ENV, None)
+
+    def _request(self, client_addr, xff=None):
+        req = MagicMock()
+        req.client_addr = client_addr
+        req.headers = {}
+        if xff is not None:
+            req.headers["X-Forwarded-For"] = xff
+        return req
+
+    def test_xff_ignored_without_trusted_proxies(self):
+        import os
+        os.environ.pop(main._TRUSTED_PROXIES_ENV, None)
+        ip = main._client_ip(self._request("1.2.3.4", xff="9.9.9.9"))
+        self.assertEqual(ip, "1.2.3.4")
+
+    def test_xff_honoured_when_peer_is_trusted(self):
+        import os
+        os.environ[main._TRUSTED_PROXIES_ENV] = "10.0.0.0/8"
+        main._trusted_proxies_cache = None
+        ip = main._client_ip(self._request("10.1.2.3", xff="9.9.9.9"))
+        self.assertEqual(ip, "9.9.9.9")
+
+    def test_xff_ignored_when_peer_outside_trusted(self):
+        import os
+        os.environ[main._TRUSTED_PROXIES_ENV] = "10.0.0.0/8"
+        main._trusted_proxies_cache = None
+        ip = main._client_ip(self._request("8.8.8.8", xff="9.9.9.9"))
+        self.assertEqual(ip, "8.8.8.8")
+
+    def test_xff_takes_first_entry(self):
+        import os
+        os.environ[main._TRUSTED_PROXIES_ENV] = "10.0.0.0/8"
+        main._trusted_proxies_cache = None
+        ip = main._client_ip(
+            self._request("10.0.0.1", xff="1.1.1.1, 2.2.2.2, 10.0.0.1"))
+        self.assertEqual(ip, "1.1.1.1")
 
 
 if __name__ == "__main__":

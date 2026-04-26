@@ -415,7 +415,14 @@
             return res.text();
         }).then(function (content) {
             var token = extractTokenSecret(content);
-            _pipConfLastTokenId = token ? token.substring(4) : null;  // strip adm_
+            // Token format is `adm_<id>.<secret>`; the revoke endpoint
+            // expects just <id>, so strip the prefix and the secret tail.
+            _pipConfLastTokenId = null;
+            if (token) {
+                var rest = token.substring(4);  // strip "adm_"
+                var dot = rest.indexOf('.');
+                _pipConfLastTokenId = dot > 0 ? rest.substring(0, dot) : null;
+            }
             renderPipConfResult(content, indexPath, didRevoke);
             btn.textContent = 'Regenerate';
         }).catch(function (err) {

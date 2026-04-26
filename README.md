@@ -41,14 +41,25 @@ talks to the standard devpi JSON API directly.
   and rejects direct access to private indexes with 404
 
 ### Admin tokens (read-only, revocable)
-- `POST /+admin-api/token` issues an opaque `adm_<random>` token bound to a user
-- Tokens are stored in keyfs (stateful) and uniquely revocable — TTL configurable per-token
-  (60 s up to 1 year)
-- **Read-only enforcement**: even though the token carries the user's full identity for ACL
-  purposes, a tween blocks any non-`GET`/`HEAD` request on `/+login` or `/<user>` paths,
-  preventing escalation into a full devpi session token or password change
+- `POST /+admin-api/token` issues an opaque `adm_<id>.<secret>` token bound to a user
+- Tokens are persisted in keyfs as **SHA-256 hashes only** — the plaintext secret is shown
+  exactly once at issuance. A keyfs dump (replica disk, backup) does not yield usable
+  tokens. Lookup compares hashes via `hmac.compare_digest` (constant-time).
+- TTL configurable per-token (60 s up to 1 year), uniquely revocable
+- **Read-only, narrow scope**: a tween restricts admin-token requests to `GET`/`HEAD`
+  on `/+api` and `/<user>/<index>/...` paths only. Everything else returns 403:
+  uploads, `PATCH`/`DELETE` on indexes/users, `POST /+login`, the SPA itself,
+  the entire `/+admin-api/*` (so a token cannot mint another token), the root
+  listing `/`, and per-user listing `/<user>`.
+- **Issuance rules**: only regular users may issue tokens, and only for themselves.
+  Root cannot issue tokens at all (a leaked root token would have full server
+  privileges). A request authenticated via an admin token cannot issue further
+  tokens — no chained renewal past the original TTL.
+- **Management rules**: list / revoke is allowed for the token owner or root.
 - Per-user list, individual revoke, and "Reset all" available in the user card kebab menu
 - Auto-cleanup: when a user is deleted, all of their tokens are removed from keyfs
+- Audit log: failed lookups (unknown id, secret mismatch, expired, deleted user)
+  are logged at WARNING/INFO so an operator can spot bruteforce attempts.
 - CI/Ansible-friendly: `GET /+admin-api/pip-conf?index=user/index&ttl=3600` returns a
   ready-to-use `pip.conf` (text/plain) in one HTTP call
 
@@ -154,9 +165,26 @@ as a secret and let the pipeline mint a fresh short-lived `pip.conf` per run:
     pip install -r requirements.txt
 ```
 
-The token issued is read-only (cannot change passwords or be exchanged for a session token)
-and expires after `ttl` seconds. The service user must have `pkg_read` (be listed in the
-target index's `acl_read`).
+The token issued is strictly read-only — usable only for `GET`/`HEAD` on `/+api` and
+`/<user>/<index>/...` (index data and package archives). It cannot upload packages,
+change passwords, exchange itself for a session token, modify indexes, or issue another
+token. It expires after `ttl` seconds. The service user must have `pkg_read` (be listed
+in the target index's `acl_read`) and **must not be `root`** — root accounts cannot
+issue tokens at all.
+
+### Trusted proxy for client IP logging
+
+The `client_ip` field on issued tokens (visible in the token list) is taken from
+`request.client_addr` by default. When devpi-server runs behind a reverse proxy, set
+`DEVPI_ADMIN_TRUSTED_PROXIES` to a comma-separated list of CIDRs whose `X-Forwarded-For`
+header should be honoured:
+
+```
+DEVPI_ADMIN_TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1
+```
+
+Without this variable, `X-Forwarded-For` is ignored — preventing clients from forging
+their logged IP.
 
 ## How it works
 
@@ -168,8 +196,9 @@ target index's `acl_read`).
 - **`devpiserver_stage_get_principals_for_pkg_read`** — feeds `acl_read` into devpi's
   pyramid ACL, which applies the `pkg_read` permission natively on every download path
   (`+f/`, `+e/`, simple page).
-- **`devpiserver_get_identity`** — recognizes `adm_<random>` admin tokens by header prefix
-  and validates them against the keyfs storage.
+- **`devpiserver_get_identity`** — recognizes `adm_<id>.<secret>` admin tokens, validates
+  them against keyfs (constant-time hash compare), sets `adm.is_admin_token` in the
+  request environ for downstream tween checks.
 - **`devpiserver_pyramid_configure`** — registers the SPA, custom API views, the tween,
   the token keyfs keys, and a USER-key subscriber that cleans up tokens when a user is
   deleted (primary only — replicas are read-only).
@@ -177,12 +206,20 @@ target index's `acl_read`).
 The tween does several things:
 
 1. Redirects HTML browser requests on `/` to `/+admin/` while leaving JSON requests intact.
-2. Returns `404` for `GET /<user>/<index>[/+simple/]` when the requestor lacks `pkg_read` —
-   devpi's own listing endpoints have no permission check, so we add one.
-3. Filters the `GET /` JSON response to remove indexes the requestor can't read.
-4. Blocks privilege-escalation paths for admin-token requests: any non-`GET`/`HEAD` on
-   `/+login` or `/<user>` is rejected with `403`, preventing token-to-session-token
-   exchange or password changes from a leaked token.
+2. Restricts admin-token requests to read-only access on index/archive paths only.
+   Anything outside `GET /+api` or `GET /<user>/<index>/...` returns `403` — including
+   the SPA, `/+admin-api/*`, `/+login`, `/`, `/<user>`, and any non-`GET`/`HEAD` method
+   anywhere. A leaked token cannot upload, mint another token, change passwords, or
+   exchange itself for a session token.
+3. Returns `404` for `GET /<user>/<index>/...` (index, simple, project, version, file)
+   when the requestor lacks `pkg_read` — devpi's own listing endpoints have no
+   permission check, so we add one.
+4. Returns `403`/`404` for `GET /<user>` when the requestor is neither the user
+   themselves nor `root` — devpi otherwise leaks the full list of that user's
+   private indexes.
+5. Filters the `GET /` JSON response to remove indexes the requestor can't read,
+   and adds `Cache-Control: private, no-store` so a shared cache cannot serve one
+   user's filtered view to another.
 
 The plugin uses devpi-server internals (`xom.model.getstage`, `stage.list_versions`,
 `stage.get_versiondata`, `stage.get_releaselinks`, `xom.keyfs`) and direct filesystem

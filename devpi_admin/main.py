@@ -6,8 +6,10 @@ existing devpi REST API endpoints are left untouched — the JS app talks to
 the standard devpi JSON API (``/+login``, ``/<user>/<index>``, ...).
 """
 import base64
+import ipaddress
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -30,17 +32,19 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,49}$")
 _log = logging.getLogger(__name__)
 
 # Path patterns for read-ACL enforcement in the tween.
-# Matches "/user/index" and "/user/index/" but not "/+login", "/user/" alone,
-# or paths with a leading "+" segment.
-_INDEX_PATH_RE = re.compile(r"^/([^/+][^/]*)/([^/+][^/]*)/?$")
-_SIMPLE_PATH_RE = re.compile(r"^/([^/+][^/]*)/([^/+][^/]*)/\+simple/?$")
+# `_USER_PATH_RE` — single user resource (`/alice`, `/alice/`).
+# `_INDEX_ANY_RE` — anything under `/user/index/...` (project list, +simple,
+#   +simple/<project>, version, file download, …) where neither user nor
+#   index starts with `+`.
+_USER_PATH_RE = re.compile(r"^/([^/+][^/]*)/?$")
+_INDEX_ANY_RE = re.compile(r"^/([^/+][^/]*)/([^/+][^/]*)(/.*)?$")
 
-# Routes blocked when the request is authenticated via an admin token.
-# Prevents privilege escalation: a leaked token must not be usable to
-# change a user's password, delete the user, create users, or exchange
-# the token for a full devpi session token via /+login.
-_ADMIN_TOKEN_BLOCKED_PATHS = re.compile(
-    r"^/(\+login/?|[^/+][^/]*/?)$")
+# Paths that an admin-token request is permitted to GET. Anything else is
+# blocked: management pages (`/`, `/+admin*`, `/+admin-api/*`, `/+status`),
+# the user resource itself, and any non-GET method (no upload, no
+# password change, no `/+login` exchange, no nested token issuance).
+_TOKEN_ALLOWED_PATH_RE = re.compile(
+    r"^/(\+api/?|[^/+][^/]*/[^/+][^/]*(/.*)?)$")
 
 
 @hookimpl
@@ -438,6 +442,9 @@ def devpi_admin_tween_factory(handler, registry):
         if request.method == "GET":
             if request.path == "/" and _wants_html(request):
                 return HTTPFound("/+admin/")
+            denied = _user_listing_check(request)
+            if denied is not None:
+                return denied
             denied = _read_acl_pre_check(request, xom)
             if denied is not None:
                 return denied
@@ -473,33 +480,68 @@ def _request_carries_admin_token(request):
 
 
 def _admin_token_check(request):
-    """Block escalation/credential-mgmt routes for admin-token requests.
+    """Restrict admin-token requests to read-only access on index/archive paths.
 
-    Allowed: GET / HEAD anywhere; any method on routes that are not
-    user-management or login. Blocked: any non-GET/HEAD on /+login or
-    /<user> (the user resource itself), which prevents password change,
-    user delete, and exchange of the token for a full devpi session.
+    Admin tokens exist for one purpose: machine reads of indexes and package
+    archives (pip install, devpi download). They MUST NOT be usable for:
+    user/index management, package upload, ``/+login`` exchange, SPA pages,
+    nested admin-api calls (incl. issuing further tokens), or status/admin
+    introspection.
+
+    Rules:
+    * Only ``GET`` / ``HEAD`` is allowed.
+    * The path must be ``/+api`` (devpi client discovery) or fall under
+      ``/<user>/<index>/...``. Single-segment paths (``/``, ``/<user>``),
+      everything under ``/+admin*`` and ``/+admin-api/*``, ``/+login``,
+      ``/+status`` etc. are denied.
     """
-    if request.method in ("GET", "HEAD"):
-        return None
-    if _ADMIN_TOKEN_BLOCKED_PATHS.match(request.path):
+    if request.method not in ("GET", "HEAD"):
         return HTTPForbidden(json_body={
-            "error": "admin token cannot manage users or login",
+            "error": "admin token is read-only — use password auth for "
+                     "writes and management",
+        })
+    if not _TOKEN_ALLOWED_PATH_RE.match(request.path):
+        return HTTPForbidden(json_body={
+            "error": "admin token may only access /+api or "
+                     "/<user>/<index>/... (index data and archives)",
         })
     return None
 
 
-def _read_acl_pre_check(request, xom):
-    """Block GET on /user/index[/] and /user/index/+simple/ without pkg_read.
+def _user_listing_check(request):
+    """Restrict ``GET /<user>/`` to that user or root.
 
-    devpi-server has no permission check on these list endpoints, so an
-    anonymous client can otherwise enumerate project names of a private
-    index. Returning HTTPNotFound hides the index existence from
-    unauthorised principals.
+    devpi-server otherwise leaks the full ``indexes`` dict (incl. private
+    index names + ixconfig) to anyone — a one-segment GET is enough to
+    enumerate a user's private indexes. Hide the resource from everyone
+    except the owner and root; non-existent vs. private should both look
+    like 404 / 403 to outsiders.
     """
-    match = _INDEX_PATH_RE.match(request.path)
+    match = _USER_PATH_RE.match(request.path)
     if match is None:
-        match = _SIMPLE_PATH_RE.match(request.path)
+        return None
+    target_user = match.group(1)
+    auth_user = request.authenticated_userid
+    if auth_user == target_user or auth_user == "root":
+        return None
+    if auth_user is None:
+        return HTTPForbidden(json_body={"error": "authentication required"})
+    return HTTPNotFound(json_body={"error": "not found"})
+
+
+def _read_acl_pre_check(request, xom):
+    """Block GET on ``/<user>/<index>/...`` without ``pkg_read``.
+
+    devpi-server has no permission check on these list/metadata endpoints,
+    so without this guard an anonymous or unauthorised client can enumerate
+    project names, fetch versiondata, or browse +simple of a private index.
+    Returning HTTPNotFound hides the index existence from unauthorised
+    principals; anonymous gets 403 so devpi/pip retry with credentials.
+
+    Files (``/<user>/<index>/+f/...``) are NOT pre-checked here — the
+    download view in devpi-server enforces its own ACL on those URLs.
+    """
+    match = _INDEX_ANY_RE.match(request.path)
     if match is None:
         return None
     user, index = match.group(1), match.group(2)
@@ -561,6 +603,9 @@ def _filter_root_listing(request, response, xom):
     new_body = json.dumps(body).encode("utf-8")
     response.body = new_body
     response.content_length = len(new_body)
+    # Filtered output is per-principal — never let a shared cache hand
+    # one user's view to another.
+    response.headers["Cache-Control"] = "private, no-store"
     return response
 
 
@@ -626,24 +671,107 @@ def _validate_name(value, kind):
             json_body={"error": f"invalid {kind} name: {value!r}"})
 
 
-def _check_issuer_can_target(request, target_user):
-    """Permission rule for token issuance and listing.
+def _check_can_issue(request, target_user):
+    """Permission rule for token *issuance*.
 
-    User can act on own tokens; root can act on anyone's. Issuance/list
-    for other users is rejected with 403.
+    Only regular users may issue tokens, and only for themselves. Root is
+    forbidden from issuing tokens entirely — a leaked root token would have
+    full server-wide privileges. Requests already authenticated via an admin
+    token are also rejected, so a leaked token cannot mint successor tokens
+    and outlive its TTL.
     """
     auth_user = _require_authenticated(request)
-    if auth_user == target_user:
-        return auth_user
+    if request.environ.get("adm.is_admin_token"):
+        raise HTTPForbidden(json_body={
+            "error": "admin tokens cannot issue further tokens — "
+                     "authenticate with a password",
+        })
     if auth_user == "root":
+        raise HTTPForbidden(json_body={
+            "error": "root may not issue admin tokens; "
+                     "create a regular user account for automation",
+        })
+    if auth_user != target_user:
+        raise HTTPForbidden(json_body={
+            "error": "users can only issue tokens for themselves",
+        })
+    return auth_user
+
+
+def _check_can_manage(request, target_user):
+    """Permission rule for *listing* / *revoking* tokens.
+
+    The user themselves may manage their own tokens; root may manage any
+    user's tokens (incident response, offboarding). Admin-token requests
+    are rejected — tween already blocks ``/+admin-api/*`` for those, this
+    is a defence-in-depth check.
+    """
+    auth_user = _require_authenticated(request)
+    if request.environ.get("adm.is_admin_token"):
+        raise HTTPForbidden(json_body={
+            "error": "admin tokens cannot manage tokens",
+        })
+    if auth_user == target_user or auth_user == "root":
         return auth_user
-    raise HTTPForbidden(
-        json_body={"error": "only root can manage tokens of other users"})
+    raise HTTPForbidden(json_body={
+        "error": "only the token owner or root may manage these tokens",
+    })
+
+
+_TRUSTED_PROXIES_ENV = "DEVPI_ADMIN_TRUSTED_PROXIES"
+_trusted_proxies_cache = None
+
+
+def _trusted_proxies():
+    """Parse and cache trusted-proxy CIDR list from environment.
+
+    Format: comma-separated CIDRs or single IPs in
+    ``DEVPI_ADMIN_TRUSTED_PROXIES``, e.g. ``10.0.0.0/8,127.0.0.1``.
+    Empty → no proxies trusted (X-Forwarded-For ignored).
+    """
+    global _trusted_proxies_cache
+    if _trusted_proxies_cache is not None:
+        return _trusted_proxies_cache
+    raw = os.environ.get(_TRUSTED_PROXIES_ENV, "")
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            _log.warning(
+                "ignoring invalid CIDR in %s: %r", _TRUSTED_PROXIES_ENV, part)
+    _trusted_proxies_cache = nets
+    return nets
 
 
 def _client_ip(request):
-    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.client_addr or "")
+    """Return the client IP, honouring X-Forwarded-For only via trusted proxy.
+
+    Without a configured trusted-proxy list, the raw ``X-Forwarded-For``
+    header is forgeable, so we fall back to ``request.client_addr``. With a
+    list set, the header is honoured iff the immediate peer is one of the
+    trusted networks — same model as nginx ``set_real_ip_from``.
+    """
+    direct = request.client_addr or ""
+    nets = _trusted_proxies()
+    if not nets or not direct:
+        return direct
+    try:
+        peer = ipaddress.ip_address(direct)
+    except ValueError:
+        return direct
+    if not any(peer in net for net in nets):
+        return direct
+    xff = request.headers.get("X-Forwarded-For", "")
+    if not xff:
+        return direct
+    # First entry in XFF is the original client; subsequent entries are
+    # intermediate proxies. We do not verify the chain — that's the job of
+    # the configured trusted proxy list at the network layer.
+    return xff.split(",")[0].strip() or direct
 
 
 def _issue_token_view(request):
@@ -665,7 +793,7 @@ def _issue_token_view(request):
     auth_user = _require_authenticated(request)
     target = body.get("user") or auth_user
     _validate_name(target, "user")
-    _check_issuer_can_target(request, target)
+    _check_can_issue(request, target)
 
     if xom.model.get_user(target) is None:
         raise HTTPNotFound(
@@ -735,7 +863,7 @@ def _pip_conf_view(request):
     auth_user = _require_authenticated(request)
     target = request.params.get("user") or auth_user
     _validate_name(target, "user")
-    _check_issuer_can_target(request, target)
+    _check_can_issue(request, target)
     if xom.model.get_user(target) is None:
         raise HTTPNotFound(
             json_body={"error": f"user {target!r} does not exist"})
@@ -783,7 +911,7 @@ def _list_tokens_view(request):
     xom = request.registry["xom"]
     target = request.matchdict["user"]
     _validate_name(target, "user")
-    _check_issuer_can_target(request, target)
+    _check_can_manage(request, target)
     items = tokens.list_for_user(xom, target)
     result = []
     now = int(time.time())
@@ -807,7 +935,7 @@ def _revoke_token_view(request):
     xom = request.registry["xom"]
     _refuse_on_replica(xom)
     tid = request.matchdict["token_id"]
-    if not re.match(r"^[A-Za-z0-9_-]{32,}$", tid):
+    if not tokens.looks_like_token_id(tid):
         raise HTTPBadRequest(json_body={"error": "invalid token id"})
     keyfs = xom.keyfs
     with keyfs.read_transaction(allow_reuse=True):
@@ -815,7 +943,7 @@ def _revoke_token_view(request):
         if not meta_key.exists():
             raise HTTPNotFound(json_body={"error": "token not found"})
         meta = dict(meta_key.get())
-    _check_issuer_can_target(request, meta.get("user", ""))
+    _check_can_manage(request, meta.get("user", ""))
     tokens.revoke(xom, tid)
     return _json_response({"revoked": True, "id": tid})
 
@@ -826,6 +954,6 @@ def _reset_tokens_view(request):
     _refuse_on_replica(xom)
     target = request.matchdict["user"]
     _validate_name(target, "user")
-    _check_issuer_can_target(request, target)
+    _check_can_manage(request, target)
     count = tokens.reset_for_user(xom, target)
     return _json_response({"revoked": count, "user": target})

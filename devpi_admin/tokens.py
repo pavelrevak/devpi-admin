@@ -1,12 +1,24 @@
 """Stateful opaque tokens for devpi-admin.
 
-Tokens are random unguessable strings (``adm_<base64url>``) stored in keyfs
-with their metadata. They carry only identity (a username); authorization
-is delegated to devpi's own ACL system. The tween additionally blocks
-user-management endpoints when the request is authenticated via such a
-token, so a leaked token cannot be escalated into a password change or
-``/+login`` exchange for a full devpi session token.
+Token format: ``adm_<token_id>.<secret>``
+
+* ``token_id`` — random 16 raw bytes encoded url-safe base64 (~22 chars).
+  Used as the lookup key in keyfs.
+* ``secret`` — random 32 raw bytes encoded url-safe base64 (~43 chars).
+  Only its SHA-256 is persisted; the plaintext is shown to the issuer
+  exactly once (at creation time).
+
+Authentication compares the secret hash via constant-time ``hmac.compare_digest``.
+Storage compromise (keyfs dump, replica disk, backup) does NOT reveal usable
+tokens — the attacker would still need to find a SHA-256 preimage.
+
+Authorization is delegated to devpi's own ACL system. The tween restricts
+admin-token requests to read-only access on index/archive paths so a leaked
+token cannot be escalated into password change, ``/+login`` exchange, package
+upload, or further token issuance.
 """
+import hashlib
+import hmac
 import logging
 import re
 import secrets
@@ -16,9 +28,16 @@ import time
 log = logging.getLogger(__name__)
 
 TOKEN_PREFIX = "adm_"
-_TOKEN_RE = re.compile(r"^adm_[A-Za-z0-9_-]{32,}$")
+# token_id and secret are both base64url with strict length bounds. The
+# length floors come from the byte counts in `_generate`; the ceilings
+# guard against pathological lookups via crafted long ids.
+_ID_RE = r"[A-Za-z0-9_-]{20,32}"
+_SECRET_RE = r"[A-Za-z0-9_-]{40,64}"
+_TOKEN_RE = re.compile(r"^adm_(" + _ID_RE + r")\.(" + _SECRET_RE + r")$")
+_TOKEN_ID_RE = re.compile(r"^" + _ID_RE + r"$")
+
 DEFAULT_TTL = 3600                 # 1 hour
-DEFAULT_MAX_TTL = 31_536_000       # 1 year
+DEFAULT_MAX_TTL = 31_536_000       # 1 year — final cap configurable per deployment
 KEY_TOKEN = "ADMIN_TOKEN"
 KEY_USER_TOKENS = "ADMIN_USER_TOKENS"
 
@@ -38,26 +57,42 @@ def looks_like_token(s):
     return bool(_TOKEN_RE.match(s or ""))
 
 
+def looks_like_token_id(s):
+    return bool(_TOKEN_ID_RE.match(s or ""))
+
+
 def _split(token):
-    """Return token_id (random part after the prefix), or None."""
-    if not looks_like_token(token):
+    """Return ``(token_id, secret)`` or ``None`` if format is invalid."""
+    m = _TOKEN_RE.match(token or "")
+    if m is None:
         return None
-    return token[len(TOKEN_PREFIX):]
+    return m.group(1), m.group(2)
+
+
+def _hash_secret(secret):
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
 def _generate():
-    return TOKEN_PREFIX + secrets.token_urlsafe(32)
+    """Return a new (token_string, token_id, secret_hash) triple."""
+    token_id = secrets.token_urlsafe(16)
+    secret = secrets.token_urlsafe(32)
+    token = f"{TOKEN_PREFIX}{token_id}.{secret}"
+    return token, token_id, _hash_secret(secret)
 
 
 def issue(xom, *, target_user, issuer, ttl_seconds, label="", client_ip=""):
     """Create and persist a new token.
 
     Returns ``(token_string, metadata_dict)``. Caller is responsible for
-    permission checks (issuer must be the target user, or root).
+    permission checks (issuer must be the target user; root must be rejected
+    upstream — see view layer).
+
+    The plaintext secret is returned to the caller and never re-readable;
+    keyfs only stores the SHA-256 hash.
     """
     now = int(time.time())
-    token = _generate()
-    token_id = token[len(TOKEN_PREFIX):]
+    token, token_id, secret_hash = _generate()
     meta = {
         "user": target_user,
         "issuer": issuer,
@@ -65,6 +100,7 @@ def issue(xom, *, target_user, issuer, ttl_seconds, label="", client_ip=""):
         "expires_at": now + int(ttl_seconds),
         "label": label or "",
         "client_ip": client_ip or "",
+        "secret_hash": secret_hash,
     }
     keyfs = xom.keyfs
     with keyfs.write_transaction(allow_restart=True):
@@ -82,24 +118,44 @@ def issue(xom, *, target_user, issuer, ttl_seconds, label="", client_ip=""):
 def lookup(xom, token):
     """Verify a token. Return its metadata dict if valid, else None.
 
-    Validates: format, presence in keyfs, expiry, target user existence.
+    Validates: format, presence in keyfs, secret hash (constant-time),
+    expiry, target user existence. All failure paths are logged so an
+    operator can spot misuse (wrong secret = potential bruteforce).
     """
-    token_id = _split(token)
-    if token_id is None:
+    parts = _split(token)
+    if parts is None:
         return None
+    token_id, secret = parts
     keyfs = xom.keyfs
     try:
         with keyfs.read_transaction(allow_reuse=True):
             key = keyfs.get_key(KEY_TOKEN)(token_id=token_id)
             if not key.exists():
+                log.warning(
+                    "admin token lookup: unknown id=%s", token_id[:8])
                 return None
             meta = dict(key.get())
     except Exception:
         log.warning("admin token lookup failed", exc_info=True)
         return None
+    expected_hash = meta.get("secret_hash") or ""
+    actual_hash = _hash_secret(secret)
+    if not hmac.compare_digest(expected_hash, actual_hash):
+        # Real authentication failure: the id matched a token but the
+        # secret did not. Worth logging at WARNING for bruteforce visibility.
+        log.warning(
+            "admin token lookup: secret mismatch for id=%s user=%s",
+            token_id[:8], meta.get("user"))
+        return None
     if meta.get("expires_at", 0) < time.time():
+        log.info(
+            "admin token lookup: expired id=%s user=%s",
+            token_id[:8], meta.get("user"))
         return None
     if xom.model.get_user(meta.get("user", "")) is None:
+        log.warning(
+            "admin token lookup: user %r no longer exists, id=%s",
+            meta.get("user"), token_id[:8])
         return None
     return meta
 
@@ -132,6 +188,8 @@ def list_for_user(xom, user, *, include_expired=False):
 
     Lazily prunes records of tokens whose target user no longer exists or
     whose entry is missing — orphan cleanup happens during read.
+    Metadata returned to the caller does NOT contain ``secret_hash`` —
+    the view layer only needs identity/expiry info.
     """
     keyfs = xom.keyfs
     user_key_pattern = keyfs.get_key(KEY_USER_TOKENS)
@@ -151,6 +209,7 @@ def list_for_user(xom, user, *, include_expired=False):
                 orphan_ids.append(tid)
                 continue
             meta = dict(meta_key.get())
+            meta.pop("secret_hash", None)
             if not include_expired and meta.get("expires_at", 0) < now:
                 continue
             out.append((tid, meta))
