@@ -104,6 +104,14 @@ def devpiserver_pyramid_configure(config, pyramid_config):
         role = getattr(xom.config, "role", "primary")
         if role != "replica":
             xom.keyfs.USER.on_key_change(_make_user_deleted_handler(xom))
+            # One-shot wipe of legacy (pre-hash) admin tokens. Idempotent;
+            # safe to run on every startup.
+            try:
+                tokens.cleanup_pre_hash_tokens(xom)
+            except Exception:
+                _log.warning(
+                    "cleanup_pre_hash_tokens at startup failed",
+                    exc_info=True)
     # Serve bundled static assets (index.html, css/, js/) under /+admin/.
     pyramid_config.add_static_view(
         name="+admin", path="devpi_admin:static")
@@ -774,6 +782,91 @@ def _client_ip(request):
     return xff.split(",")[0].strip() or direct
 
 
+_REPLICA_WAIT_MAX = 30           # hard upper bound, seconds
+_REPLICA_WAIT_INTERVAL = 0.25    # poll cadence
+_REPLICA_STALE_AFTER = 120       # ignore replicas silent for >2 min
+
+
+def _wait_for_replicas(xom, timeout):
+    """Block until all currently polling replicas catch up to the latest serial.
+
+    Solves the Ansible-style race: a playbook calls ``POST /+admin-api/token``
+    and immediately uses the token against the load balancer, which may route
+    to a replica that hasn't yet replicated the new token record (default
+    poll interval ~37 s). Without this wait the next request returns 401.
+
+    Reads ``xom.polling_replicas`` (populated by replicas as they poll the
+    primary) and waits until each replica's reported serial reaches the
+    primary's current serial. Replicas that haven't been heard from for
+    over ``_REPLICA_STALE_AFTER`` seconds are skipped — we don't block the
+    caller because of an offline replica.
+
+    Returns dict with ``synced``/``waited``/``timed_out`` so the response
+    can include diagnostics. Bounded by ``_REPLICA_WAIT_MAX``.
+    """
+    timeout = max(0, min(int(timeout or 0), _REPLICA_WAIT_MAX))
+    target_serial = xom.keyfs.get_current_serial()
+    started = time.monotonic()
+    deadline = started + timeout
+
+    def _live_replicas():
+        polling = getattr(xom, "polling_replicas", None) or {}
+        now = time.time()
+        return {
+            uuid: info for uuid, info in polling.items()
+            if now - info.get("last-request", 0) < _REPLICA_STALE_AFTER
+        }
+
+    while True:
+        live = _live_replicas()
+        if not live:
+            return {
+                "synced": True, "waited": 0.0, "timed_out": False,
+                "target_serial": target_serial, "replicas": 0,
+            }
+        lagging = [
+            uuid for uuid, info in live.items()
+            if int(info.get("serial", -1)) < target_serial
+        ]
+        if not lagging:
+            return {
+                "synced": True,
+                "waited": round(time.monotonic() - started, 3),
+                "timed_out": False,
+                "target_serial": target_serial,
+                "replicas": len(live),
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "synced": False,
+                "waited": round(time.monotonic() - started, 3),
+                "timed_out": True,
+                "target_serial": target_serial,
+                "replicas": len(live),
+                "lagging": len(lagging),
+            }
+        time.sleep(_REPLICA_WAIT_INTERVAL)
+
+
+def _parse_wait_replicas(value):
+    """Parse a wait_replicas parameter (bool-ish or seconds) into a timeout.
+
+    Accepts: ``""``/``0``/``false`` → 0 (no wait), ``true``/``1`` → default
+    timeout, integer string → seconds (capped at ``_REPLICA_WAIT_MAX``).
+    """
+    if value is None or value == "":
+        return 0
+    s = str(value).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return 0
+    if s in ("true", "yes", "on"):
+        return _REPLICA_WAIT_MAX
+    try:
+        return max(0, min(int(s), _REPLICA_WAIT_MAX))
+    except ValueError:
+        return 0
+
+
 def _issue_token_view(request):
     """POST /+admin-api/token
 
@@ -816,17 +909,22 @@ def _issue_token_view(request):
         raise HTTPBadRequest(
             json_body={"error": "label must be a string up to 200 chars"})
 
+    wait_seconds = _parse_wait_replicas(body.get("wait_replicas"))
+
     token, meta = tokens.issue(
         xom,
         target_user=target, issuer=auth_user, ttl_seconds=ttl,
         label=label, client_ip=_client_ip(request))
-    return _json_response({
+    response = {
         "token": token,
         "user": meta["user"],
         "issued_at": meta["issued_at"],
         "expires_at": meta["expires_at"],
         "label": meta["label"],
-    })
+    }
+    if wait_seconds > 0:
+        response["replication"] = _wait_for_replicas(xom, wait_seconds)
+    return _json_response(response)
 
 
 def _build_pip_conf(public_url, target_user, token, index_path):
@@ -889,10 +987,14 @@ def _pip_conf_view(request):
 
     label = request.params.get("label", f"pip-conf {index}")[:200]
 
+    wait_seconds = _parse_wait_replicas(request.params.get("wait_replicas"))
+
     token, _meta = tokens.issue(
         xom,
         target_user=target, issuer=auth_user, ttl_seconds=ttl,
         label=label, client_ip=_client_ip(request))
+    if wait_seconds > 0:
+        _wait_for_replicas(xom, wait_seconds)
 
     public_url = request.application_url.rstrip("/")
     body = _build_pip_conf(public_url, target, token, index)

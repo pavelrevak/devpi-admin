@@ -329,5 +329,63 @@ class TrustedProxyTests(unittest.TestCase):
         self.assertEqual(ip, "1.1.1.1")
 
 
+class WaitReplicasTests(unittest.TestCase):
+
+    def test_parse_disabled_values(self):
+        for v in (None, "", "0", "false", "no", "off"):
+            self.assertEqual(main._parse_wait_replicas(v), 0)
+
+    def test_parse_bool_truthy_uses_default(self):
+        self.assertEqual(
+            main._parse_wait_replicas("true"), main._REPLICA_WAIT_MAX)
+
+    def test_parse_int_capped(self):
+        self.assertEqual(main._parse_wait_replicas("5"), 5)
+        self.assertEqual(
+            main._parse_wait_replicas("999"), main._REPLICA_WAIT_MAX)
+        self.assertEqual(main._parse_wait_replicas("-3"), 0)
+
+    def _make_xom(self, current_serial, polling):
+        xom = MagicMock()
+        xom.keyfs.get_current_serial.return_value = current_serial
+        xom.polling_replicas = polling
+        return xom
+
+    def test_no_replicas_returns_immediately(self):
+        xom = self._make_xom(42, {})
+        result = main._wait_for_replicas(xom, 5)
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["replicas"], 0)
+
+    def test_synced_replicas_pass(self):
+        import time as _t
+        xom = self._make_xom(42, {
+            "r1": {"serial": 42, "last-request": _t.time()},
+            "r2": {"serial": 43, "last-request": _t.time()},
+        })
+        result = main._wait_for_replicas(xom, 5)
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["replicas"], 2)
+
+    def test_lagging_replica_times_out(self):
+        import time as _t
+        xom = self._make_xom(42, {
+            "r1": {"serial": 40, "last-request": _t.time()},
+        })
+        result = main._wait_for_replicas(xom, 1)
+        self.assertFalse(result["synced"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["lagging"], 1)
+
+    def test_stale_replica_ignored(self):
+        import time as _t
+        xom = self._make_xom(42, {
+            "r1": {"serial": 0, "last-request": _t.time() - 1000},
+        })
+        result = main._wait_for_replicas(xom, 1)
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["replicas"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

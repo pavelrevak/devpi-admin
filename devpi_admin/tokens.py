@@ -213,8 +213,9 @@ def list_for_user(xom, user, *, include_expired=False):
             if not include_expired and meta.get("expires_at", 0) < now:
                 continue
             out.append((tid, meta))
-    if orphan_ids:
-        # cleanup outside the read transaction
+    if orphan_ids and getattr(xom.config, "role", "primary") != "replica":
+        # cleanup outside the read transaction; skip on replicas (keyfs
+        # is read-only there — the next list on the primary will prune)
         try:
             with keyfs.write_transaction(allow_restart=True):
                 user_key = user_key_pattern(user=user)
@@ -228,6 +229,69 @@ def list_for_user(xom, user, *, include_expired=False):
             log.warning("orphan cleanup failed for user %s", user, exc_info=True)
     out.sort(key=lambda kv: kv[1].get("expires_at", 0))
     return out
+
+
+def cleanup_pre_hash_tokens(xom):
+    """One-shot migration: wipe admin token records issued before hash storage.
+
+    Pre-hash tokens stored the plaintext secret as the lookup key and had
+    no ``secret_hash`` field in metadata. After the hash-storage refactor
+    they can no longer authenticate (token format requires ``adm_<id>.<secret>``)
+    and just sit in keyfs as zombies — visible in the listing endpoint but
+    unusable. Called once at primary startup; idempotent.
+    """
+    keyfs = xom.keyfs
+    user_pattern = keyfs.get_key(KEY_USER_TOKENS)
+    token_pattern = keyfs.get_key(KEY_TOKEN)
+    if user_pattern is None or token_pattern is None:
+        return 0
+    wiped = 0
+    try:
+        users = [u.name for u in xom.model.get_userlist()]
+    except Exception:
+        log.warning("cleanup_pre_hash_tokens: cannot list users", exc_info=True)
+        return 0
+    for username in users:
+        try:
+            with keyfs.read_transaction(allow_reuse=True):
+                user_key = user_pattern(user=username)
+                if not user_key.exists():
+                    continue
+                ids = list(user_key.get())
+                stale = []
+                for tid in ids:
+                    meta_key = token_pattern(token_id=tid)
+                    if not meta_key.exists():
+                        stale.append(tid)
+                        continue
+                    meta = dict(meta_key.get())
+                    if not meta.get("secret_hash"):
+                        stale.append(tid)
+            if not stale:
+                continue
+            with keyfs.write_transaction(allow_restart=True):
+                for tid in stale:
+                    meta_key = token_pattern(token_id=tid)
+                    if meta_key.exists():
+                        meta_key.delete()
+                user_key = user_pattern(user=username)
+                if user_key.exists():
+                    cleaned = set(user_key.get()) - set(stale)
+                    if cleaned:
+                        user_key.set(cleaned)
+                    else:
+                        user_key.delete()
+            wiped += len(stale)
+            log.info(
+                "cleanup_pre_hash_tokens: wiped %d legacy token(s) for user=%s",
+                len(stale), username)
+        except Exception:
+            log.warning(
+                "cleanup_pre_hash_tokens: failure for user=%s",
+                username, exc_info=True)
+    if wiped:
+        log.info("cleanup_pre_hash_tokens: wiped %d legacy token(s) total", wiped)
+    return wiped
 
 
 def reset_for_user(xom, user):

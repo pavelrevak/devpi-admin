@@ -160,10 +160,33 @@ as a secret and let the pipeline mint a fresh short-lived `pip.conf` per run:
     mkdir -p ~/.pip
     AUTH=$(printf '%s:%s' "$DEVPI_USER" "$DEVPI_PASSWORD" | base64)
     curl -sf -H "X-Devpi-Auth: $AUTH" \
-      "https://devpi.example.com/+admin-api/pip-conf?index=company/private&ttl=3600" \
+      "https://devpi.example.com/+admin-api/pip-conf?index=company/private&ttl=3600&wait_replicas=10" \
       > ~/.pip/pip.conf
     pip install -r requirements.txt
 ```
+
+### Replication race: `wait_replicas`
+
+When devpi runs as primary + replicas behind a load balancer, a freshly issued token
+exists on the primary instantly but takes one polling cycle (~37 s by default) to reach
+replicas. An Ansible-style playbook that issues a token and immediately uses it through
+the LB may hit a replica that doesn't know the token yet — and get `401`.
+
+Both `POST /+admin-api/token` and `GET /+admin-api/pip-conf` accept a `wait_replicas`
+parameter. The primary blocks until every currently-polling replica has caught up to
+the commit serial, bounded by 30 s. Stale replicas (silent for >2 min) are skipped so an
+offline replica never blocks the caller.
+
+```bash
+# Wait up to 10 s for replicas; default cap is 30 s if you pass `true`/`1`.
+curl -sf -H "X-Devpi-Auth: $AUTH" \
+  "https://devpi.example.com/+admin-api/pip-conf?index=company/private&ttl=3600&wait_replicas=10" \
+  > ~/.pip/pip.conf
+```
+
+For `POST /+admin-api/token`, send `{"wait_replicas": 10}` in the JSON body. The response
+includes a `replication` block (`synced`, `waited`, `timed_out`, `replicas`, …) so the
+client can decide whether to retry.
 
 The token issued is strictly read-only — usable only for `GET`/`HEAD` on `/+api` and
 `/<user>/<index>/...` (index data and package archives). It cannot upload packages,
