@@ -133,6 +133,16 @@ class AdminTokenHeaderDetectionTests(unittest.TestCase):
         req.headers = {"Authorization": "Basic " + raw}
         self.assertTrue(_request_carries_admin_token(req))
 
+    def test_basic_auth_header_case_insensitive(self):
+        # RFC 7617: auth-scheme is case-insensitive.
+        raw = base64.b64encode(("alice:" + self._valid_token()).encode()).decode()
+        for scheme in ("basic ", "BASIC ", "BaSiC "):
+            req = MagicMock()
+            req.headers = {"Authorization": scheme + raw}
+            self.assertTrue(
+                _request_carries_admin_token(req),
+                "scheme %r should be detected" % scheme)
+
     def test_malformed_base64_does_not_throw(self):
         req = MagicMock()
         req.headers = {"X-Devpi-Auth": "!!!!!!!"}
@@ -279,6 +289,42 @@ class FilterRootListingTests(unittest.TestCase):
         req = MagicMock()
         out = _filter_root_listing(req, resp, xom)
         self.assertIs(out, resp)
+
+    def test_passthrough_when_result_missing(self):
+        resp = self._make_response({"other": "data"})
+        out = _filter_root_listing(MagicMock(), resp, MagicMock())
+        self.assertIs(out, resp)
+
+    def test_passthrough_when_result_not_dict(self):
+        resp = self._make_response({"result": ["a", "b"]})
+        out = _filter_root_listing(MagicMock(), resp, MagicMock())
+        self.assertIs(out, resp)
+
+    def test_userdata_not_dict_kept_as_is(self):
+        body = {"result": {"alice": "raw-string", "bob": {"indexes": {}}}}
+        xom = self._make_xom({})
+        req = self._make_request(xom)
+        out = _filter_root_listing(req, self._make_response(body), xom)
+        filtered = json.loads(out.body)
+        self.assertEqual(filtered["result"]["alice"], "raw-string")
+
+    def test_indexes_not_dict_kept_as_is(self):
+        body = {"result": {"alice": {"indexes": "weird-value"}}}
+        xom = self._make_xom({})
+        req = self._make_request(xom)
+        out = _filter_root_listing(req, self._make_response(body), xom)
+        filtered = json.loads(out.body)
+        self.assertEqual(filtered["result"]["alice"]["indexes"], "weird-value")
+
+    def test_getstage_exception_drops_index(self):
+        body = {"result": {"alice": {"indexes": {"broken": {}}}}}
+        xom = MagicMock()
+        xom.model.getstage.side_effect = RuntimeError("boom")
+        resp = self._make_response(body)
+        req = self._make_request(xom)
+        out = _filter_root_listing(req, resp, xom)
+        filtered = json.loads(out.body)
+        self.assertEqual(filtered["result"]["alice"]["indexes"], {})
 
 
 class TrustedProxyTests(unittest.TestCase):

@@ -85,6 +85,11 @@ talks to the standard devpi JSON API directly.
 - **Anonymous browsing** — visitors can explore public indexes without logging in; admin
   actions (create/edit/delete) appear only after authentication. Private indexes
   (`acl_read` without `:ANONYMOUS:`) are hidden from anonymous root listing.
+- **Hardened SPA delivery** — strict `Content-Security-Policy` (no inline scripts,
+  `connect-src` limited to same-origin + `pypi.org`, `frame-ancestors 'none'`),
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`. Markdown READMEs
+  are sanitised before rendering (script/iframe/event handlers stripped, dangerous
+  URL schemes blocked).
 - **Dark / light / auto theme** with half-circle icon for auto mode
 - **Responsive mobile menu** with hamburger toggle
 - **ESC + outside-click** dismissal for modals, dropdown menus, mobile menu
@@ -97,12 +102,13 @@ In addition to serving the SPA, `devpi-admin` registers custom API endpoints und
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/+admin-api/cached/{user}/{index}` | GET | List cached package names for a mirror index (filesystem scan) |
+| `/+admin-api/session` | GET | Cheap auth check — frontend pings on tab focus |
+| `/+admin-api/cached/{user}/{index}` | GET | List cached package names for a mirror index (filesystem scan, serial-cached) |
 | `/+admin-api/versions/{user}/{index}/{project}` | GET | Version list with cached/uncached distinction |
 | `/+admin-api/versions/{user}/{index}/{project}?all=1` | GET | Include all upstream versions (mirrors) |
 | `/+admin-api/versiondata/{user}/{index}/{project}/{version}` | GET | Metadata + file links for a single version |
-| `/+admin-api/token` | POST | Issue an admin token (`{user, ttl_seconds, label}`) — user can issue for self, root for anyone |
-| `/+admin-api/pip-conf?index=u/i&ttl=&user=&label=` | GET | Issue token + return `text/plain` pip.conf with embedded creds |
+| `/+admin-api/token` | POST | Issue an admin token (`{user, ttl_seconds, label, wait_replicas}`) — user can issue for self, root for anyone |
+| `/+admin-api/pip-conf?index=u/i&ttl=&user=&label=&wait_replicas=` | GET | Issue token + return `text/plain` pip.conf with embedded creds |
 | `/+admin-api/users/{user}/tokens` | GET | List active tokens for a user |
 | `/+admin-api/users/{user}/tokens` | DELETE | Revoke ALL tokens for a user |
 | `/+admin-api/tokens/{token_id}` | DELETE | Revoke a single token |
@@ -130,6 +136,28 @@ pip uninstall devpi-web
 Both plugins can technically coexist but it is not recommended. `devpi-admin` intercepts `/`
 for HTML requests while `devpi-web` would still serve its own HTML on other routes like
 `/<user>/<index>/<package>`, leading to a confusing mixed experience.
+
+### Recommended for production: `--restrict-modify root`
+
+devpi-server starts in an **open** mode by default — anyone (including unauthenticated
+clients) can `PUT /<newuser>` to create an account, and any logged-in user can
+`PUT /<user>/<index>` to spin up indexes under their own account. The devpi-admin UI
+hides those buttons from non-root users, but a direct API call (`curl`, `devpi user -c`)
+will still succeed.
+
+Pass `--restrict-modify root` to `devpi-server` to lock structural operations
+(create/modify/delete of users and indexes) down to `root` only. Per-index
+`acl_upload`/`acl_read` are unaffected, so day-to-day uploads and downloads keep working
+under the existing per-index permissions.
+
+```ini
+ExecStart=/opt/pypi/venv/bin/devpi-server \
+    --serverdir /var/lib/pypi/data \
+    --restrict-modify root \
+    ...
+```
+
+See `INSTALL.md` for a full systemd unit example.
 
 ## Usage
 
@@ -244,9 +272,16 @@ The tween does several things:
    and adds `Cache-Control: private, no-store` so a shared cache cannot serve one
    user's filtered view to another.
 
+The SPA HTML (`/+admin/`) is served with security headers — strict
+`Content-Security-Policy` (no inline scripts, restricted `connect-src` to
+`'self'` + `https://pypi.org` for the README fallback, `frame-ancestors 'none'`),
+plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+
 The plugin uses devpi-server internals (`xom.model.getstage`, `stage.list_versions`,
 `stage.get_versiondata`, `stage.get_releaselinks`, `xom.keyfs`) and direct filesystem
-access (`serverdir/+files/`) for the cached-packages API.
+access (`serverdir/+files/`) for the cached-packages API. The filesystem scan is
+memoised per `(user, index)` and invalidated via `xom.keyfs.get_current_serial()`,
+so repeated requests don't re-walk the directory unless a file was added or removed.
 
 ## Requirements
 
@@ -276,10 +311,11 @@ devpi-admin/
 ├── README.md
 ├── LICENSE
 ├── .github/workflows/
-│   ├── tests.yml            — CI on push/PR (Python 3.10 + 3.14)
+│   ├── tests.yml            — CI on push/PR (Python 3.10 – 3.14)
 │   └── publish.yml          — publish to PyPI on release
+├── dev/                     — untracked dev-only prototypes (e.g. demo-graph.html)
 ├── devpi_admin/
-│   ├── __init__.py          — version (from git tag via hatch-vcs)
+│   ├── __init__.py          — version (from git tag via setuptools-scm)
 │   ├── main.py              — Pyramid hooks, tween, API views
 │   ├── tokens.py            — admin token gen / lookup / revoke / list (keyfs storage)
 │   └── static/
@@ -292,13 +328,15 @@ devpi-admin/
 │           └── app.js       — routing, views, rendering
 └── tests/
     ├── test_acl_read.py        — acl_read hooks, tween guards, header parsing
-    ├── test_cached_versions.py — filesystem scan (tmpdir)
+    ├── test_cached_versions.py — filesystem scan + cache invalidation
     ├── test_helpers.py         — filename parsing, normalization
     ├── test_hooks.py           — pluggy hook registration
     ├── test_json_safe.py       — readonly view conversion
     ├── test_package.py         — entry point, static files
+    ├── test_pipconf.py         — pip.conf credential helpers
     ├── test_tokens.py          — admin token format, generation, splitting
     ├── test_tween.py           — redirect behavior
+    ├── test_view_helpers.py    — _get_stage_or_404, _check_read_access, CSP headers
     └── test_wants_html.py      — Accept header heuristic
 ```
 
@@ -308,16 +346,24 @@ devpi-admin/
 git clone <repo>
 cd devpi-admin
 python -m venv .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install -e ".[dev]"
 ```
 
-The static files live at `src/devpi_admin/static/` and can be edited in place — changes
-show up on the next browser reload, no restart of devpi-server required (static views
-read from disk on each request). Python changes (`main.py`) require a devpi-server restart.
+The `dev` extra pulls in `pytest`. A bare `pip install -e .` works too — the test suite
+is also runnable with the stdlib `unittest` runner.
+
+The static files live at `devpi_admin/static/` and can be edited in place — changes show
+up on the next browser reload, no restart of devpi-server required (static views read
+from disk on each request). Python changes (`main.py`, `tokens.py`) require a
+devpi-server restart.
 
 Run the unit tests:
 
 ```bash
+# pytest (recommended for local development)
+pytest tests/ -q
+
+# unittest (matches the CI invocation)
 PYTHONWARNINGS="ignore::UserWarning" python -m unittest discover -v tests/
 ```
 
@@ -326,7 +372,7 @@ when it imports `pkg_resources`.)
 
 ## Releasing
 
-Version is derived from the git tag via `hatch-vcs`. To release:
+Version is derived from the git tag via `setuptools-scm`. To release:
 
 1. `git tag v0.1.0 && git push --tags`
 2. On GitHub: Releases → Draft new release → select tag → Publish

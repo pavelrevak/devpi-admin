@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # needed for hatch-vcs to derive version from tag
+          fetch-depth: 0  # needed for setuptools-scm to derive version from tag
 
       - name: Set up Python
         uses: actions/setup-python@v5

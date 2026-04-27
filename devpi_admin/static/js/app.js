@@ -806,17 +806,20 @@
 
     document.addEventListener('click', closeAllKebabs);
 
-    var _activeTimers = [];
+    var _activeTimers = new Set();
 
-    function registerTimer(id) {
-        _activeTimers.push(id);
+    function trackedTimeout(callback, delay) {
+        var id = setTimeout(function () {
+            _activeTimers.delete(id);
+            callback();
+        }, delay);
+        _activeTimers.add(id);
+        return id;
     }
 
     function clearActiveTimers() {
-        for (var i = 0; i < _activeTimers.length; i++) {
-            clearTimeout(_activeTimers[i]);
-        }
-        _activeTimers = [];
+        _activeTimers.forEach(clearTimeout);
+        _activeTimers.clear();
     }
 
     function showLoading() {
@@ -1881,8 +1884,8 @@
         var debounceTimer;
         searchInput.addEventListener('input', function () {
             clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(render, 150);
-            registerTimer(debounceTimer);
+            _activeTimers.delete(debounceTimer);
+            debounceTimer = trackedTimeout(render, 150);
         });
         searchInput.focus();
         render();
@@ -2269,8 +2272,13 @@
                 var name = attrs[k].name.toLowerCase();
                 if (name.indexOf('on') === 0) {
                     all[j].removeAttribute(attrs[k].name);
-                } else if ((name === 'href' || name === 'src' || name === 'action') &&
-                        /^\s*javascript\s*:/i.test(attrs[k].value)) {
+                } else if ((name === 'href' || name === 'action') &&
+                        /^\s*(?:javascript|data|vbscript)\s*:/i.test(attrs[k].value)) {
+                    // data: in href is the text/html XSS vector; block it on links.
+                    all[j].removeAttribute(attrs[k].name);
+                } else if (name === 'src' &&
+                        /^\s*(?:javascript|vbscript)\s*:/i.test(attrs[k].value)) {
+                    // data: kept on src — data:image/... is the common safe case.
                     all[j].removeAttribute(attrs[k].name);
                 }
             }
@@ -2307,7 +2315,7 @@
                 return;
             }
             var url = 'https://pypi.org/pypi/' + pkg + '/' + version + '/json';
-            fetch(url).then(function (res) {
+            fetch(url, {signal: AbortSignal.timeout(5000)}).then(function (res) {
                 if (!res.ok) throw new Error('not found');
                 return res.json();
             }).then(function (data) {

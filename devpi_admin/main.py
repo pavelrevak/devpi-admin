@@ -199,11 +199,34 @@ def devpiserver_pyramid_configure(config, pyramid_config):
         "devpi_admin.main.devpi_admin_tween_factory")
 
 
+_CSP_HEADER = "; ".join((
+    "default-src 'self'",
+    # No inline <script>; theme.js builds SVGs via innerHTML but those are
+    # static literals from same-origin script, not user input.
+    "script-src 'self'",
+    # 'unsafe-inline' covers programmatic style writes (style.cssText,
+    # element.style.width = …) which several views rely on.
+    "style-src 'self' 'unsafe-inline'",
+    # README images can come from anywhere; data: lets inline icons render.
+    "img-src 'self' data: https: http:",
+    # PyPI fallback for README on mirror packages.
+    "connect-src 'self' https://pypi.org",
+    "font-src 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+))
+
+
 def _serve_index(request):
-    return FileResponse(
+    response = FileResponse(
         str(STATIC_DIR / "index.html"),
         request=request,
         content_type="text/html")
+    response.headers["Content-Security-Policy"] = _CSP_HEADER
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 def _session_view(request):
@@ -257,12 +280,50 @@ def _files_dir(xom, user, index):
     return Path(xom.config.serverdir) / "+files" / user / index / "+f"
 
 
+# Cache for the +files filesystem scan. Keyed by (user, index); value is
+# (serial, {project_name: {version, ...}}). devpi increments keyfs serial
+# on every file add/remove, so a serial match means the directory state
+# we cached is still authoritative — no need to re-walk.
+_files_scan_cache = {}
+_FILES_SCAN_CACHE_MAX = 32
+
+
+def _scan_files(xom, user, index):
+    """Return ``{normalized_name: {version, ...}}`` of cached files.
+
+    Result is memoised per ``(user, index)`` and re-scanned only when the
+    keyfs serial changes. On filesystem error the partial result is still
+    returned (and cached) — the next scan will retry.
+    """
+    serial = xom.keyfs.get_current_serial()
+    cached = _files_scan_cache.get((user, index))
+    if cached is not None and cached[0] == serial:
+        return cached[1]
+
+    files_dir = _files_dir(xom, user, index)
+    result = {}
+    try:
+        for f in files_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            name, ver = _parse_filename(f.name)
+            if name:
+                result.setdefault(name, set()).add(ver)
+    except OSError:
+        _log.warning("Cannot scan %s", files_dir, exc_info=True)
+
+    if len(_files_scan_cache) >= _FILES_SCAN_CACHE_MAX:
+        # FIFO eviction; insertion order is preserved by dict in Python 3.7+.
+        _files_scan_cache.pop(next(iter(_files_scan_cache)))
+    _files_scan_cache[(user, index)] = (serial, result)
+    return result
+
+
 def _cached_packages_view(request):
     """Return list of project names that have cached files on disk.
 
-    Scans the ``+files/{user}/{index}/`` directory for downloaded wheels
-    and sdists, extracts project names from filenames via
-    ``packaging.utils``, and returns deduplicated sorted list.
+    Backed by ``_scan_files`` — first call walks ``+files/{user}/{index}/``,
+    subsequent calls reuse the cached result until the keyfs serial changes.
     """
     user = request.matchdict["user"]
     index = request.matchdict["index"]
@@ -274,19 +335,8 @@ def _cached_packages_view(request):
         return HTTPNotFound(
             json_body={"error": "not a mirror index"})
 
-    files_dir = _files_dir(xom, user, index)
-    projects = set()
-    try:
-        for whl in files_dir.rglob("*"):
-            if not whl.is_file():
-                continue
-            name, _ver = _parse_filename(whl.name)
-            if name:
-                projects.add(name)
-    except OSError:
-        _log.warning("Cannot scan %s", files_dir, exc_info=True)
-
-    cached = sorted(projects)
+    scan = _scan_files(xom, user, index)
+    cached = sorted(scan.keys())
     return _json_response({"result": cached, "total": len(cached)})
 
 
@@ -354,18 +404,8 @@ def _versions_view(request):
 
 def _cached_versions_for_project(xom, user, index, project):
     """Return sorted list of versions that have files on disk."""
-    files_dir = _files_dir(xom, user, index)
-    versions = set()
-    norm_project = _normalize(project)
-    try:
-        for f in files_dir.rglob("*"):
-            if not f.is_file():
-                continue
-            name, ver = _parse_filename(f.name)
-            if name == norm_project and ver:
-                versions.add(ver)
-    except OSError:
-        _log.warning("Cannot scan %s", files_dir, exc_info=True)
+    scan = _scan_files(xom, user, index)
+    versions = scan.get(_normalize(project), set())
     return sorted(versions, reverse=True)
 
 
@@ -473,7 +513,8 @@ def _request_carries_admin_token(request):
     raw = request.headers.get("X-Devpi-Auth") or ""
     if not raw:
         auth = request.headers.get("Authorization") or ""
-        if auth.startswith("Basic "):
+        # RFC 7617: auth-scheme is case-insensitive ("Basic", "basic", …).
+        if auth[:6].lower() == "basic ":
             raw = auth[6:]
     if not raw:
         return False
@@ -546,8 +587,10 @@ def _read_acl_pre_check(request, xom):
     Returning HTTPNotFound hides the index existence from unauthorised
     principals; anonymous gets 403 so devpi/pip retry with credentials.
 
-    Files (``/<user>/<index>/+f/...``) are NOT pre-checked here — the
-    download view in devpi-server enforces its own ACL on those URLs.
+    File downloads (``/<user>/<index>/+f/...``) are also matched here —
+    defense in depth on top of devpi's own ACL on the download view.
+    Both checks evaluate ``pkg_read``, so the result is the same; this
+    one just returns earlier.
     """
     match = _INDEX_ANY_RE.match(request.path)
     if match is None:

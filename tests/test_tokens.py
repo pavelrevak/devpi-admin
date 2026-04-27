@@ -1,5 +1,6 @@
 """Unit tests for the admin token utilities."""
 import unittest
+from unittest.mock import MagicMock
 
 from devpi_admin import tokens
 
@@ -54,6 +55,44 @@ class TokenFormatTests(unittest.TestCase):
         h2 = tokens._hash_secret("hello")
         self.assertEqual(h1, h2)
         self.assertNotEqual(h1, tokens._hash_secret("hellp"))
+
+
+class CleanupPreHashTokensTests(unittest.TestCase):
+    """Sanity checks for the startup migration helper.
+
+    Plugin-configure time has no active keyfs transaction — the helper must
+    open one itself or get_userlist() raises AttributeError on tx.
+    """
+
+    def _mock_xom(self, usernames):
+        xom = MagicMock()
+        # read_transaction / write_transaction are context managers.
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=None)
+        cm.__exit__ = MagicMock(return_value=False)
+        xom.keyfs.read_transaction.return_value = cm
+        xom.keyfs.write_transaction.return_value = cm
+        # Both keyfs keys must be registered for the cleanup to even try.
+        xom.keyfs.get_key.side_effect = lambda name: MagicMock()
+        users = [MagicMock(name=u) for u in usernames]
+        for mock, u in zip(users, usernames):
+            mock.name = u
+        xom.model.get_userlist.return_value = users
+        return xom
+
+    def test_opens_transaction_for_userlist(self):
+        xom = self._mock_xom([])
+        result = tokens.cleanup_pre_hash_tokens(xom)
+        self.assertEqual(result, 0)
+        # Must have opened a read transaction before calling get_userlist.
+        xom.keyfs.read_transaction.assert_called()
+
+    def test_returns_zero_on_userlist_failure(self):
+        # Simulates the original bug: get_userlist raises AttributeError(tx).
+        xom = self._mock_xom([])
+        xom.model.get_userlist.side_effect = AttributeError("tx")
+        # Must swallow the exception cleanly so server startup continues.
+        self.assertEqual(tokens.cleanup_pre_hash_tokens(xom), 0)
 
 
 if __name__ == "__main__":

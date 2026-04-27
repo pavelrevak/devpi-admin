@@ -28,6 +28,11 @@ dependencies = [
     "devpi-server>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
 [project.entry-points.devpi_server]
 devpi-admin = "devpi_admin.main"
 

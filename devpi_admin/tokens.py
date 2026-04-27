@@ -247,7 +247,10 @@ def cleanup_pre_hash_tokens(xom):
         return 0
     wiped = 0
     try:
-        users = [u.name for u in xom.model.get_userlist()]
+        # get_userlist() reads xom.keyfs.tx, which is only attached inside
+        # a transaction. At plugin-configure time we are not in one yet.
+        with keyfs.read_transaction(allow_reuse=True):
+            users = [u.name for u in xom.model.get_userlist()]
     except Exception:
         log.warning("cleanup_pre_hash_tokens: cannot list users", exc_info=True)
         return 0
