@@ -13,3 +13,5 @@ build
 devpi_admin/_version.py
 *.md
 !README*.md
+*.textile
+dev/
