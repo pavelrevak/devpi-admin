@@ -57,9 +57,18 @@
     }
 
     function statusRow(label, value) {
+        // value may be a string OR a DOM node (e.g. a styled <span> for
+        // the replica sync state). textContent on a Node would coerce
+        // it to "[object HTMLSpanElement]", so wrap nodes via children.
+        var valueEl;
+        if (value && typeof value === 'object' && value.nodeType) {
+            valueEl = el('span', null, [value]);
+        } else {
+            valueEl = el('span', {textContent: String(value)});
+        }
         return el('div', {className: 'status-row'}, [
             el('span', {className: 'status-label', textContent: label}),
-            el('span', {textContent: value}),
+            valueEl,
         ]);
     }
 
@@ -107,11 +116,16 @@
 
     // --- Modal ---
 
-    function openModal(title, bodyFn, buttons) {
+    var modalCard = document.querySelector('#modal-overlay .modal');
+
+    function openModal(title, bodyFn, buttons, opts) {
         modalTitle.textContent = title;
         clear(modalBody);
         clear(modalFooter);
         modalError.hidden = true;
+        // Optional wide layout for content that needs more horizontal
+        // room (e.g. the user-tokens table, with ~8 columns).
+        modalCard.classList.toggle('modal-wide', !!(opts && opts.width === 'wide'));
         bodyFn(modalBody);
         for (var i = 0; i < buttons.length; i++) {
             modalFooter.appendChild(buttons[i]);
@@ -121,6 +135,7 @@
 
     function closeModal() {
         modalOverlay.hidden = true;
+        modalCard.classList.remove('modal-wide');
     }
 
     function showModalError(msgOrErr) {
@@ -131,8 +146,19 @@
     }
 
     modalCloseBtn.addEventListener('click', closeModal);
-    modalOverlay.addEventListener('click', function (e) {
-        if (e.target === modalOverlay) closeModal();
+    // Close on click *outside* the modal — but only if BOTH mousedown
+    // and mouseup landed on the overlay. Otherwise a text selection
+    // that starts inside the modal and drags out would dismiss it,
+    // losing whatever the user was typing.
+    var _overlayMousedownOutside = false;
+    modalOverlay.addEventListener('mousedown', function (e) {
+        _overlayMousedownOutside = (e.target === modalOverlay);
+    });
+    modalOverlay.addEventListener('mouseup', function (e) {
+        var bothOutside = _overlayMousedownOutside
+            && e.target === modalOverlay;
+        _overlayMousedownOutside = false;
+        if (bothOutside) closeModal();
     });
     document.addEventListener('keydown', function (e) {
         if (e.key === 'Escape') {
@@ -266,11 +292,76 @@
 
     var _pipConfLastTokenId = null;
     var _pipConfLastTokenKept = false;
+    var _uploadLastTokenId = null;
+    var _uploadLastTokenKept = false;
+
+    function shellQuote(s) {
+        // POSIX-safe single quoting; escapes any embedded single quotes.
+        return "'" + String(s).replace(/'/g, "'\\''") + "'";
+    }
+
+    // Canonical public URL — fetched once, cached for the session. Single
+    // source of truth shared with the backend so static pip.conf / .pypirc
+    // fallbacks match what _pip_conf_view would emit when behind a proxy
+    // with --outside-url set. Falls back to location.origin if the call
+    // ever fails (extremely conservative — anonymous endpoint, no auth).
+    var _publicUrlCache = null;
+    function getPublicUrl() {
+        if (_publicUrlCache) return Promise.resolve(_publicUrlCache);
+        return Api.get('/+admin-api/public-url')
+            .then(function (data) {
+                _publicUrlCache = (data && data.url) || location.origin;
+                return _publicUrlCache;
+            })
+            .catch(function () {
+                _publicUrlCache = location.origin.replace(/\/+$/, '');
+                return _publicUrlCache;
+            });
+    }
+
+    function hostFromUrl(url) {
+        try { return new URL(url).hostname; }
+        catch (e) { return location.hostname; }
+    }
+
+    function isUploadFrozen(aclUpload) {
+        // Empty acl_upload — devpi grants 'upload' to nobody (not even
+        // root or the index owner). The index is effectively frozen
+        // for new publishes.
+        return !aclUpload || aclUpload.length === 0;
+    }
+
+    function canIssueUploadToken(loggedIn, aclUpload) {
+        var u = aclUpload || [];
+        // Frozen index: no Allow ACEs in __acl__ → backend would reject
+        // any token we issue. Don't offer the menu item at all.
+        if (isUploadFrozen(u)) return false;
+        // Anonymous-upload index lets anyone publish — no auth, no
+        // token. The .pypirc modal still has something useful to show
+        // (repository URL), so allow even unauthenticated visitors.
+        if (u.indexOf(':ANONYMOUS:') >= 0) return true;
+        if (!loggedIn) return false;
+        if (loggedIn === 'root') return true;
+        if (u.indexOf(':AUTHENTICATED:') >= 0) return true;
+        return u.indexOf(loggedIn) >= 0;
+    }
 
     function isPublicAclRead(aclRead) {
         if (!aclRead || !aclRead.length) return true;
         for (var i = 0; i < aclRead.length; i++) {
             if (aclRead[i] === ':ANONYMOUS:') return true;
+        }
+        return false;
+    }
+
+    function isAnonymousAclUpload(aclUpload) {
+        // ":ANONYMOUS:" in acl_upload makes the index world-writable —
+        // any caller, even unauthenticated, can publish packages.
+        // Devpi accepts this configuration; we surface it as a hard
+        // warning rather than silently allowing it.
+        if (!aclUpload || !aclUpload.length) return false;
+        for (var i = 0; i < aclUpload.length; i++) {
+            if (aclUpload[i] === ':ANONYMOUS:') return true;
         }
         return false;
     }
@@ -289,12 +380,20 @@
         var isRoot = currentUser === 'root';
         var candidateUsers = [];
         if (isRoot) {
-            candidateUsers.push('root');
+            // Root cannot issue tokens for itself (backend rejects with
+            // 403). Offer only other principals from acl_read.
             for (var i = 0; i < (aclRead || []).length; i++) {
                 var u = aclRead[i];
-                if (!u || u.indexOf(':') === 0) continue;
+                if (!u || u.indexOf(':') === 0 || u === 'root') continue;
                 if (candidateUsers.indexOf(u) < 0) candidateUsers.push(u);
             }
+            // ACL might list only special principals (e.g. :AUTHENTICATED:)
+            // — fall back to the index owner so root can still issue.
+            if (!candidateUsers.length) {
+                var owner = indexPath.split('/')[0];
+                if (owner && owner !== 'root') candidateUsers.push(owner);
+            }
+            if (!candidateUsers.length) return;
         } else {
             candidateUsers.push(currentUser);
         }
@@ -426,7 +525,11 @@
             renderPipConfResult(content, indexPath, didRevoke);
             btn.textContent = 'Regenerate';
         }).catch(function (err) {
-            showModalError(err);
+            // Route through the same auto-fading slot as the "Previous
+            // token was revoked." notice so successive clicks don't pile
+            // up modal-level errors.
+            var msg = (err && err.message) || 'Operation failed';
+            showPipConfNotice(msg, 'error');
             btn.textContent = orig;
         }).finally(function () {
             btn.disabled = false;
@@ -458,7 +561,10 @@
                     textContent: 'Close',
                     onclick: closeModal,
                 }),
-            ]);
+            ],
+            // Tokens table has many columns — request the wide layout
+            // so it doesn't overflow the default 520px modal.
+            {width: 'wide'});
         renderTokensList(username);
     }
 
@@ -480,6 +586,8 @@
                 var thead = el('thead');
                 thead.appendChild(el('tr', null, [
                     el('th', {textContent: 'Label'}),
+                    el('th', {textContent: 'Index'}),
+                    el('th', {textContent: 'Scope'}),
                     el('th', {textContent: 'Expires'}),
                     el('th', {textContent: 'Issuer'}),
                     el('th', {textContent: 'IP'}),
@@ -492,7 +600,11 @@
                     tbody.appendChild(buildTokenRow(tokens[i], username));
                 }
                 table.appendChild(tbody);
-                container.appendChild(table);
+                // Wrap so the table can scroll horizontally inside the
+                // modal on narrow viewports instead of stretching it.
+                var wrap = el('div', {className: 'tokens-table-wrap'});
+                wrap.appendChild(table);
+                container.appendChild(wrap);
             })
             .catch(function (err) {
                 clear(container);
@@ -506,6 +618,13 @@
     function buildTokenRow(t, username) {
         return el('tr', null, [
             el('td', {textContent: t.label || '(no label)'}),
+            el('td', {className: 'mono', textContent: t.index || '—'}),
+            el('td', null, [
+                el('span', {
+                    className: 'token-scope token-scope-' + (t.scope || 'unknown'),
+                    textContent: t.scope || '—',
+                }),
+            ]),
             el('td', {textContent: formatExpiry(t.expires_in)}),
             el('td', {textContent: t.issuer}),
             el('td', {textContent: t.client_ip || '—'}),
@@ -535,13 +654,20 @@
 
     function showPipConfStaticModal(indexPath) {
         // Public index — no auth needed. Show plain pip.conf without
-        // generating a token.
-        var content = '[global]\n'
-            + 'index-url = ' + location.origin + '/' + indexPath + '/+simple/\n'
-            + 'trusted-host = ' + location.hostname + '\n';
-        var oneOffCmd = 'pip install --index-url ' + location.origin + '/'
-            + indexPath + '/+simple/ --trusted-host ' + location.hostname + ' <package>';
+        // generating a token. URL is fetched from the backend so it
+        // matches whatever request.application_url would produce there.
+        getPublicUrl().then(function (publicUrl) {
+            var host = hostFromUrl(publicUrl);
+            var content = '[global]\n'
+                + 'index-url = ' + publicUrl + '/' + indexPath + '/+simple/\n'
+                + 'trusted-host = ' + host + '\n';
+            var oneOffCmd = 'pip install --index-url ' + publicUrl + '/'
+                + indexPath + '/+simple/ --trusted-host ' + host + ' <package>';
+            _renderPipConfStaticModal(indexPath, content, oneOffCmd);
+        });
+    }
 
+    function _renderPipConfStaticModal(indexPath, content, oneOffCmd) {
         openModal(
             'pip.conf for ' + indexPath,
             function (body) {
@@ -603,22 +729,49 @@
             ]);
     }
 
-    function showRevokedNotice() {
+    function showPipConfNotice(text, kind) {
+        // Single notice slot in the pip.conf modal footer. Both info
+        // ("Previous token was revoked.") and error ("root may not issue
+        // tokens for itself") land here; the latest message replaces
+        // any prior one and auto-fades after a few seconds.
         var notice = document.getElementById('pipconf-notice');
         if (!notice) return;
-        notice.textContent = 'Previous token was revoked.';
+        notice.textContent = text;
         notice.classList.remove('pipconf-notice-fade');
+        notice.classList.toggle('pipconf-notice-error', kind === 'error');
         notice.hidden = false;
         clearTimeout(notice._fadeTimer);
         clearTimeout(notice._hideTimer);
+        // Errors stick around longer than info messages so the user has
+        // time to read the failure reason.
+        var holdMs = kind === 'error' ? 6000 : 3000;
         notice._fadeTimer = setTimeout(function () {
             notice.classList.add('pipconf-notice-fade');
-        }, 3000);
+        }, holdMs);
         notice._hideTimer = setTimeout(function () {
             notice.hidden = true;
             notice.textContent = '';
             notice.classList.remove('pipconf-notice-fade');
-        }, 3700);
+            notice.classList.remove('pipconf-notice-error');
+        }, holdMs + 700);
+    }
+
+    function showRevokedNotice() {
+        showPipConfNotice('Previous token was revoked.', 'info');
+    }
+
+    function clearPipConfNotice() {
+        // Drop any pending notice immediately — used after a successful
+        // generate so a stale error from the previous attempt doesn't
+        // linger over fresh credentials.
+        var notice = document.getElementById('pipconf-notice');
+        if (!notice) return;
+        clearTimeout(notice._fadeTimer);
+        clearTimeout(notice._hideTimer);
+        notice.hidden = true;
+        notice.textContent = '';
+        notice.classList.remove('pipconf-notice-fade');
+        notice.classList.remove('pipconf-notice-error');
     }
 
     function renderPipConfResult(content, indexPath, didRevoke) {
@@ -626,6 +779,9 @@
         clear(result);
         result.hidden = false;
 
+        // Wipe any prior error/info notice first; the revoke message
+        // (if any) is re-shown immediately below so it survives.
+        clearPipConfNotice();
         if (didRevoke) {
             showRevokedNotice();
         }
@@ -661,8 +817,11 @@
         // Block 2: one-off install command (most ready-to-use)
         var indexUrl = extractIndexUrl(content);
         if (indexUrl) {
+            // Derive trusted-host from the backend-provided URL so it
+            // matches index-url even if the deployment lives behind a
+            // proxy with a different hostname than the browser's tab.
             var oneOffCmd = 'pip install --index-url ' + indexUrl
-                + ' --trusted-host ' + location.hostname + ' <package>';
+                + ' --trusted-host ' + hostFromUrl(indexUrl) + ' <package>';
             result.appendChild(el('label', {
                 className: 'pipconf-section-label',
                 textContent: 'One-off install command',
@@ -719,6 +878,373 @@
             tokRow.appendChild(tokCopyBtn);
             result.appendChild(tokRow);
         }
+    }
+
+    // --- .pypirc modal (upload-scope token for twine / devpi upload) ---
+
+    function showPypircStaticModal(indexPath) {
+        // Anonymous-upload index: no credentials needed. Twine still
+        // wants a [section] in .pypirc, so we emit one without password.
+        // URL fetched from backend so it matches whatever a tokened
+        // .pypirc would produce on the same deployment.
+        getPublicUrl().then(function (publicUrl) {
+            var repoUrl = publicUrl + '/' + indexPath + '/';
+            var content = '[distutils]\n'
+                + 'index-servers = devpi\n\n'
+                + '[devpi]\n'
+                + 'repository = ' + repoUrl + '\n';
+            var oneOffCmd = 'twine upload --repository-url ' + repoUrl + ' dist/*';
+            _renderPypircStaticModal(indexPath, content, oneOffCmd);
+        });
+    }
+
+    function _renderPypircStaticModal(indexPath, content, oneOffCmd) {
+        openModal(
+            '.pypirc for ' + indexPath,
+            function (body) {
+                body.appendChild(el('div', {
+                    className: 'form-hint form-hint-warn',
+                    textContent: 'This index allows anonymous upload — '
+                        + 'no token is needed. Make sure this is what you '
+                        + 'want; world-writable indexes are a supply-chain '
+                        + 'attack vector.',
+                }));
+
+                body.appendChild(el('label', {
+                    className: 'pipconf-section-label',
+                    textContent: '.pypirc (twine)',
+                }));
+                var actions = el('div', {className: 'pip-conf-actions'});
+                var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+                copyBtn.addEventListener('click', function () {
+                    copyText(content).then(function () { flashCopied(copyBtn); });
+                });
+                actions.appendChild(copyBtn);
+                actions.appendChild(el('button', {
+                    className: 'btn',
+                    textContent: 'Download',
+                    onclick: function () { downloadFile(content, '.pypirc'); },
+                }));
+                body.appendChild(actions);
+                body.appendChild(el('pre', {
+                    className: 'pip-conf-preview',
+                    textContent: content,
+                }));
+
+                body.appendChild(el('label', {
+                    className: 'pipconf-section-label',
+                    textContent: 'One-shot twine command',
+                }));
+                var cmdRow = el('div', {className: 'pip-oneoff-row'});
+                var cmdInput = el('input', {
+                    type: 'text',
+                    className: 'pip-oneoff-input',
+                    value: oneOffCmd,
+                    readOnly: true,
+                    spellcheck: false,
+                });
+                cmdInput.addEventListener('focus', function () { this.select(); });
+                cmdRow.appendChild(cmdInput);
+                var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+                cmdCopyBtn.addEventListener('click', function () {
+                    copyText(oneOffCmd).then(function () { flashCopied(cmdCopyBtn); });
+                });
+                cmdRow.appendChild(cmdCopyBtn);
+                body.appendChild(cmdRow);
+            },
+            [
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ]);
+    }
+
+
+    function showUploadTokenModal(indexPath, aclUpload) {
+        _uploadLastTokenId = null;
+        _uploadLastTokenKept = false;
+        // World-writable index: anonymous upload — render a static
+        // .pypirc with no credentials (mirror of pip.conf public flow).
+        if (isAnonymousAclUpload(aclUpload)) {
+            return showPypircStaticModal(indexPath);
+        }
+        var currentUser = Api.getUser();
+        if (!currentUser) return;
+        var isRoot = currentUser === 'root';
+
+        var candidateUsers = [];
+        if (isRoot) {
+            // Root may issue for any non-root principal in acl_upload.
+            for (var i = 0; i < (aclUpload || []).length; i++) {
+                var u = aclUpload[i];
+                if (!u || u.indexOf(':') === 0 || u === 'root') continue;
+                if (candidateUsers.indexOf(u) < 0) candidateUsers.push(u);
+            }
+            // If acl_upload contains only special principals (e.g. just
+            // :AUTHENTICATED:), fall back to the index owner so root can
+            // still hand out a token without editing the ACL first.
+            if (!candidateUsers.length) {
+                var owner = indexPath.split('/')[0];
+                if (owner && owner !== 'root') candidateUsers.push(owner);
+            }
+        } else {
+            candidateUsers.push(currentUser);
+        }
+        if (!candidateUsers.length) return;
+
+        openModal(
+            '.pypirc for ' + indexPath,
+            function (body) {
+                body.appendChild(formGroup('User', (function () {
+                    var sel = el('select', {id: 'upload-token-user'});
+                    for (var i = 0; i < candidateUsers.length; i++) {
+                        sel.appendChild(el('option', {
+                            value: candidateUsers[i],
+                            textContent: candidateUsers[i],
+                        }));
+                    }
+                    sel.disabled = candidateUsers.length === 1;
+                    return sel;
+                })()));
+
+                body.appendChild(formGroup('Token TTL', (function () {
+                    var sel = el('select', {id: 'upload-token-ttl'});
+                    for (var i = 0; i < TTL_OPTIONS.length; i++) {
+                        var opt = TTL_OPTIONS[i];
+                        var optEl = el('option', {
+                            value: String(opt.value),
+                            textContent: opt.label,
+                        });
+                        if (opt.value === 86400) optEl.selected = true;
+                        sel.appendChild(optEl);
+                    }
+                    return sel;
+                })()));
+
+                body.appendChild(formGroup('Label (optional)', el('input', {
+                    type: 'text',
+                    id: 'upload-token-label',
+                    value: 'twine ' + indexPath,
+                    maxLength: 200,
+                })));
+
+                body.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'Upload token acts as a temporary password '
+                        + 'for twine / devpi upload. It cannot delete '
+                        + 'packages, change passwords, or issue further '
+                        + 'tokens — but treat it like a password anyway.',
+                }));
+
+                body.appendChild(el('div', {
+                    id: 'upload-token-result',
+                    className: 'pip-conf-result',
+                    hidden: true,
+                }));
+            },
+            [
+                // Reuse the pip-conf flash slot id — only one modal is
+                // open at a time, and the helpers (showPipConfNotice /
+                // clearPipConfNotice) work uniformly for both.
+                el('span', {
+                    id: 'pipconf-notice',
+                    className: 'pipconf-notice',
+                    hidden: true,
+                }),
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Generate',
+                    id: 'upload-token-generate',
+                    onclick: function () { generateUploadToken(indexPath); },
+                }),
+                el('button', {
+                    className: 'btn',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ]);
+    }
+
+    function generateUploadToken(indexPath) {
+        var user = document.getElementById('upload-token-user').value;
+        var ttl = parseInt(document.getElementById('upload-token-ttl').value, 10);
+        var label = document.getElementById('upload-token-label').value;
+        var btn = document.getElementById('upload-token-generate');
+        btn.disabled = true;
+        var orig = btn.textContent;
+        btn.textContent = 'Generating…';
+
+        // Same revoke-on-regen policy as pip.conf: drop the previous
+        // token unless the user already copied/downloaded it.
+        var prevId = _uploadLastTokenId;
+        var prevKept = _uploadLastTokenKept;
+        var didRevoke = false;
+        _uploadLastTokenId = null;
+        _uploadLastTokenKept = false;
+        var revokePromise;
+        if (prevId && !prevKept) {
+            didRevoke = true;
+            revokePromise = Api.del('/+admin-api/tokens/'
+                + encodeURIComponent(prevId)).catch(function () {});
+        } else {
+            revokePromise = Promise.resolve();
+        }
+
+        revokePromise.then(function () {
+            return Promise.all([
+                Api.post('/+admin-api/token', {
+                    user: user,
+                    index: indexPath,
+                    scope: 'upload',
+                    ttl_seconds: ttl,
+                    label: label,
+                    wait_replicas: true,
+                }),
+                getPublicUrl(),
+            ]);
+        }).then(function (results) {
+            var data = results[0];
+            var publicUrl = results[1];
+            var token = data.token || '';
+            if (token.indexOf('adm_') === 0) {
+                var rest = token.substring(4);
+                var dot = rest.indexOf('.');
+                _uploadLastTokenId = dot > 0 ? rest.substring(0, dot) : null;
+            }
+            renderUploadTokenResult(data, indexPath, didRevoke, publicUrl);
+            btn.textContent = 'Regenerate';
+        }).catch(function (err) {
+            var msg = (err && err.message) || 'Operation failed';
+            showPipConfNotice(msg, 'error');
+            btn.textContent = orig;
+        }).finally(function () {
+            btn.disabled = false;
+        });
+    }
+
+    function renderUploadTokenResult(data, indexPath, didRevoke, publicUrl) {
+        var result = document.getElementById('upload-token-result');
+        clear(result);
+        result.hidden = false;
+        clearPipConfNotice();
+        if (didRevoke) showRevokedNotice();
+
+        var user = data.user;
+        var token = data.token;
+        var base = publicUrl || location.origin.replace(/\/+$/, '');
+        var repoUrl = base + '/' + indexPath + '/';
+
+        // Block 1: .pypirc — config file consumed by twine
+        var pypircContent = '[distutils]\n'
+            + 'index-servers = devpi\n\n'
+            + '[devpi]\n'
+            + 'repository = ' + repoUrl + '\n'
+            + 'username = ' + user + '\n'
+            + 'password = ' + token + '\n';
+        result.appendChild(el('label', {
+            className: 'pipconf-section-label',
+            textContent: '.pypirc (twine)',
+        }));
+        var actions = el('div', {className: 'pip-conf-actions'});
+        var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+        copyBtn.addEventListener('click', function () {
+            copyText(pypircContent).then(function () {
+                _uploadLastTokenKept = true;
+                flashCopied(copyBtn);
+            });
+        });
+        actions.appendChild(copyBtn);
+        actions.appendChild(el('button', {
+            className: 'btn',
+            textContent: 'Download',
+            onclick: function () {
+                _uploadLastTokenKept = true;
+                downloadFile(pypircContent, '.pypirc');
+            },
+        }));
+        result.appendChild(actions);
+        result.appendChild(el('pre', {
+            className: 'pip-conf-preview',
+            textContent: pypircContent,
+        }));
+
+        // Block 2: TWINE_* environment variables — for CI runners
+        var envBlock = 'export TWINE_REPOSITORY_URL=' + repoUrl + '\n'
+            + 'export TWINE_USERNAME=' + user + '\n'
+            + 'export TWINE_PASSWORD=' + shellQuote(token);
+        result.appendChild(el('label', {
+            className: 'pipconf-section-label',
+            textContent: 'Environment variables (twine)',
+        }));
+        var envActions = el('div', {className: 'pip-conf-actions'});
+        var envCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+        envCopyBtn.addEventListener('click', function () {
+            copyText(envBlock).then(function () {
+                _uploadLastTokenKept = true;
+                flashCopied(envCopyBtn);
+            });
+        });
+        envActions.appendChild(envCopyBtn);
+        result.appendChild(envActions);
+        result.appendChild(el('pre', {
+            className: 'pip-conf-preview',
+            textContent: envBlock,
+        }));
+
+        // Block 3: one-shot twine upload command
+        var twineCmd = 'twine upload --repository-url ' + repoUrl
+            + ' -u ' + user + ' -p ' + shellQuote(token) + ' dist/*';
+        result.appendChild(el('label', {
+            className: 'pipconf-section-label',
+            textContent: 'One-shot twine command',
+        }));
+        var cmdRow = el('div', {className: 'pip-oneoff-row'});
+        var cmdInput = el('input', {
+            type: 'text',
+            className: 'pip-oneoff-input',
+            value: twineCmd,
+            readOnly: true,
+            spellcheck: false,
+        });
+        cmdInput.addEventListener('focus', function () { this.select(); });
+        cmdRow.appendChild(cmdInput);
+        var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+        cmdCopyBtn.addEventListener('click', function () {
+            copyText(twineCmd).then(function () {
+                _uploadLastTokenKept = true;
+                flashCopied(cmdCopyBtn);
+            });
+        });
+        cmdRow.appendChild(cmdCopyBtn);
+        result.appendChild(cmdRow);
+
+        // Block 4: raw user:token credential pair (for curl, devpi login)
+        var creds = user + ':' + token;
+        result.appendChild(el('label', {
+            className: 'pipconf-section-label',
+            textContent: 'User : token (for curl -u, devpi login, custom tools)',
+        }));
+        var tokRow = el('div', {className: 'pip-oneoff-row'});
+        var tokInput = el('input', {
+            type: 'text',
+            className: 'pip-oneoff-input',
+            value: creds,
+            readOnly: true,
+            spellcheck: false,
+        });
+        tokInput.addEventListener('focus', function () { this.select(); });
+        tokRow.appendChild(tokInput);
+        var tokCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+        tokCopyBtn.addEventListener('click', function () {
+            copyText(creds).then(function () {
+                _uploadLastTokenKept = true;
+                flashCopied(tokCopyBtn);
+            });
+        });
+        tokRow.appendChild(tokCopyBtn);
+        result.appendChild(tokRow);
     }
 
     function flashCopied(btn) {
@@ -1015,6 +1541,9 @@
     });
 
     function navigate() {
+        // Any navigation cancels the periodic /+status refresh. The
+        // status loader re-arms the timer if it ends up running again.
+        _stopStatusRefresh();
         var hash = (window.location.hash || '#').substring(1);
         var m;
         // Split hash and query
@@ -1089,6 +1618,15 @@
                     var menuItems = [];
                     if (canEdit) {
                         menuItems.push({label: 'Edit', onclick: function () { closeAllKebabs(); showUserModal(name, info); }});
+                        (function (uname) {
+                            menuItems.push({
+                                label: 'Tokens',
+                                onclick: function () {
+                                    closeAllKebabs();
+                                    showUserTokensModal(uname);
+                                },
+                            });
+                        })(name);
                     }
                     if (currentUser === 'root' && name !== 'root') {
                         menuItems.push({label: 'Delete', danger: true, onclick: function () { closeAllKebabs(); deleteUser(name); }});
@@ -1125,22 +1663,6 @@
                         }
                         tagsWrap.appendChild(tagsGroup);
                         details.appendChild(tagsWrap);
-                    }
-                    if (canEdit) {
-                        var tokensRow = el('div', {className: 'index-card-row'});
-                        tokensRow.appendChild(el('span', {className: 'index-card-label', textContent: 'Tokens'}));
-                        tokensRow.appendChild((function (uname) {
-                            return el('a', {
-                                href: '#',
-                                className: 'tokens-link',
-                                textContent: 'manage…',
-                                onclick: function (e) {
-                                    e.preventDefault();
-                                    showUserTokensModal(uname);
-                                },
-                            });
-                        })(name));
-                        details.appendChild(tokensRow);
                     }
                     card.appendChild(details);
 
@@ -1370,6 +1892,24 @@
                         textContent: 'volatile',
                     }));
                 }
+                if (!isMirror && isAnonymousAclUpload(idx.acl_upload)) {
+                    tagGroup.appendChild(el('span', {
+                        className: 'tag tag-world-writable',
+                        textContent: 'world-writable',
+                        title: 'acl_upload contains :ANONYMOUS: — anyone, '
+                            + 'including unauthenticated callers, can '
+                            + 'publish packages to this index.',
+                    }));
+                } else if (!isMirror && isUploadFrozen(idx.acl_upload)) {
+                    tagGroup.appendChild(el('span', {
+                        className: 'tag tag-no-upload',
+                        textContent: 'no upload',
+                        title: 'acl_upload is empty — nobody can publish '
+                            + 'to this index, not even the owner or root. '
+                            + 'Add a principal to acl_upload to enable '
+                            + 'uploads.',
+                    }));
+                }
                 cardHead.appendChild(tagGroup);
                 card.appendChild(cardHead);
 
@@ -1414,18 +1954,33 @@
 
                 card.appendChild(details);
 
-                // Kebab menu items: pip.conf for everyone, edit/delete for owners
+                // Kebab menu items: pip.conf for everyone, upload token
+                // for principals with acl_upload (stage indexes only),
+                // edit/delete for owners.
                 var loggedIn = Api.getUser();
                 var menuItems = [];
                 (function (path, aclRead) {
+                    var needsToken = !isPublicAclRead(aclRead);
                     menuItems.push({
-                        label: 'pip.conf',
+                        label: 'pip.conf' + (needsToken ? ' + token' : ''),
                         onclick: function () {
                             closeAllKebabs();
                             showPipConfModal(path, aclRead);
                         },
                     });
                 })(idx._full, idx.acl_read);
+                if (!isMirror && canIssueUploadToken(loggedIn, idx.acl_upload)) {
+                    (function (path, aclUpload) {
+                        var needsToken = !isAnonymousAclUpload(aclUpload);
+                        menuItems.push({
+                            label: '.pypirc' + (needsToken ? ' + token' : ''),
+                            onclick: function () {
+                                closeAllKebabs();
+                                showUploadTokenModal(path, aclUpload);
+                            },
+                        });
+                    })(idx._full, idx.acl_upload);
+                }
                 if (loggedIn === 'root' || loggedIn === idx._user) {
                     (function (idxRef) {
                         menuItems.push({
@@ -1770,15 +2325,32 @@
                     },
                 }));
             }
-            actions.push(el('button', {
-                className: 'btn',
-                textContent: 'pip.conf',
-                onclick: function () {
-                    showPipConfModal(
-                        indexPath,
-                        (indexInfo && indexInfo.acl_read) || []);
-                },
-            }));
+            (function () {
+                var aclRead = (indexInfo && indexInfo.acl_read) || [];
+                var needsToken = !isPublicAclRead(aclRead);
+                actions.push(el('button', {
+                    className: 'btn',
+                    textContent: 'pip.conf' + (needsToken ? ' + token' : ''),
+                    onclick: function () {
+                        showPipConfModal(indexPath, aclRead);
+                    },
+                }));
+            })();
+            if (!isMirror && canIssueUploadToken(
+                    Api.getUser(),
+                    (indexInfo && indexInfo.acl_upload) || [])) {
+                (function () {
+                    var aclUpload = (indexInfo && indexInfo.acl_upload) || [];
+                    var needsToken = !isAnonymousAclUpload(aclUpload);
+                    actions.push(el('button', {
+                        className: 'btn',
+                        textContent: '.pypirc' + (needsToken ? ' + token' : ''),
+                        onclick: function () {
+                            showUploadTokenModal(indexPath, aclUpload);
+                        },
+                    }));
+                })();
+            }
             actions.push(el('button', {
                 className: 'btn auth-only',
                 textContent: 'Edit',
@@ -2383,17 +2955,56 @@
 
     // ========== STATUS ==========
 
-    function loadStatus() {
-        showLoading();
+    var _statusRefreshTimer = null;
+    var STATUS_REFRESH_MS = 30000;
+
+    function _stopStatusRefresh() {
+        if (_statusRefreshTimer) {
+            clearInterval(_statusRefreshTimer);
+            _statusRefreshTimer = null;
+        }
+    }
+
+    function _onStatusView() {
+        var h = location.hash || '';
+        return !h || h === '#' || h.charAt(1) === '?';
+    }
+
+    function loadStatus(silent) {
+        if (!silent) showLoading();
+        // Replica poll info is auth-gated and only used in the replicas
+        // section, which itself is hidden from anonymous visitors. Skip
+        // the request entirely when nobody's logged in — avoids a 403
+        // in the network tab on every status refresh.
+        var replicasRequest = Api.getUser()
+            ? Api.get('/+admin-api/replicas').catch(function () {
+                return {result: {}};
+            })
+            : Promise.resolve({result: {}});
         Promise.all([
             Api.get('/+api'),
             Api.get('/+status'),
+            replicasRequest,
         ]).then(function (results) {
+            // User may have navigated away during the fetch; drop the
+            // result rather than overwriting the new view.
+            if (!_onStatusView()) {
+                _stopStatusRefresh();
+                return;
+            }
             var api = results[0].result;
             var status = results[1].result;
+            var replicaPolls = (results[2] && results[2].result) || {};
             clear(content);
 
             content.appendChild(el('h2', {className: 'page-heading'}, ['Status']));
+            // Periodic silent refresh so the displayed serials follow
+            // reality without manual reload.
+            _stopStatusRefresh();
+            _statusRefreshTimer = setInterval(function () {
+                if (!_onStatusView()) { _stopStatusRefresh(); return; }
+                loadStatus(true);
+            }, STATUS_REFRESH_MS);
 
             var grid = el('div', {className: 'status-grid'});
 
@@ -2478,10 +3089,14 @@
                 grid.appendChild(whooshCard);
             }
 
-            // Replicas — only shown on master with connected replicas
+            // Replicas — only shown on master, with connected replicas,
+            // and only to authenticated users. Replica UUIDs / internal
+            // IPs are operational metadata; anonymous visitors don't
+            // need network topology info.
             var pollingReplicas = status.polling_replicas || {};
             var replicaUuids = Object.keys(pollingReplicas);
-            if (status.role === 'MASTER' && replicaUuids.length > 0) {
+            if (status.role === 'MASTER' && replicaUuids.length > 0
+                    && Api.getUser()) {
                 var masterSerial = status.serial || 0;
                 var now = Date.now() / 1000;
                 // Replica is considered offline if it hasn't polled in >90s
@@ -2491,11 +3106,25 @@
                 for (var ri = 0; ri < replicaUuids.length; ri++) {
                     var uuid = replicaUuids[ri];
                     var rep = pollingReplicas[uuid];
+                    var poll = replicaPolls[uuid];
                     var lastRequest = rep['last-request'] || 0;
                     var age = now - lastRequest;
                     var isOnline = rep['in-request'] || age < OFFLINE_THRESHOLD;
-                    var lag = masterSerial - (rep['serial'] || 0);
+                    // Authoritative replica serial: applied_serial from
+                    // our /+admin-api/replicas tween record. Do NOT fall
+                    // back to polling_replicas[uuid].serial — that's
+                    // master's optimistic post-stream value and falsely
+                    // claims "in sync" while the replica is stuck.
+                    var hasPollData = poll
+                        && typeof poll.applied_serial === 'number';
+                    var replicaSerial = hasPollData
+                        ? poll.applied_serial : null;
+                    var lag = (replicaSerial !== null)
+                        ? (masterSerial - replicaSerial) : 0;
                     var label = rep['remote-ip'] || uuid.substring(0, 8);
+                    var stuckSec = (poll && poll.stuck_seconds) || 0;
+                    var sync = _replicaSyncState(
+                        lag, replicaSerial, masterSerial, stuckSec);
 
                     var repCard = el('div', {className: 'status-card'});
                     var titleRow = el('div', {className: 'status-card-title replica-title'}, [
@@ -2506,11 +3135,29 @@
                         }),
                     ]);
                     repCard.appendChild(titleRow);
-                    repCard.appendChild(statusRow('Serial lag', lag === 0 ? 'in sync' : '+' + lag));
+                    repCard.appendChild(statusRow(
+                        'Serial',
+                        el('span', {
+                            className: 'replica-sync replica-sync-' + sync.kind,
+                            textContent: sync.label,
+                        })));
                     repCard.appendChild(statusRow('Last seen', _formatAge(age)));
-                    repCard.appendChild(statusRow('Polling', rep['in-request'] ? 'active' : 'idle'));
                     if (rep['outside-url']) {
                         repCard.appendChild(statusRow('URL', rep['outside-url']));
+                    }
+                    if (sync.kind === 'stuck' && poll) {
+                        repCard.appendChild(el('div', {
+                            className: 'replica-stuck-hint',
+                            textContent: 'Replica has been polling the '
+                                + 'same serial (#' + poll.start_serial
+                                + ') for ' + stuckSec + 's — replication '
+                                + 'is stuck. Common cause: a server-side '
+                                + 'plugin (devpi-admin, devpi-web with '
+                                + 'whoosh, devpi-postgresql, …) is missing '
+                                + 'or out of date on the replica. Check '
+                                + 'replica logs for AssertionError on '
+                                + 'import_changes.',
+                        }));
                     }
                     grid.appendChild(repCard);
                 }
@@ -2526,6 +3173,40 @@
         if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
         return Math.floor(seconds / 3600) + 'h ago';
     }
+
+    var REPLICA_STUCK_THRESHOLD_S = 30;
+
+    function _replicaSyncState(lag, replicaSerial, masterSerial, stuckSeconds) {
+        // Authoritative reading from /+admin-api/replicas:
+        //   green  — replica == master (in sync)
+        //   orange — replica < master, but advancing
+        //   red    — replica < master AND has been polling the same
+        //            serial for >= REPLICA_STUCK_THRESHOLD_S (stuck)
+        //   red    — no poll data (tween hasn't captured this replica)
+        //
+        // ``replicaSerial = null`` means we have no /+admin-api/replicas
+        // record. NEVER fall back to master's optimistic
+        // polling_replicas.serial value — that's what was hiding the
+        // broken state in the first place.
+        if (replicaSerial === null) {
+            // Distinct kind so the stuck-hint block (which dereferences
+            // poll.start_serial) doesn't fire here.
+            return {
+                kind: 'no-data',
+                label: 'no poll data (login session expired?)',
+            };
+        }
+        if (lag === 0) {
+            return {kind: 'in-sync', label: '#' + masterSerial + ' (in sync)'};
+        }
+        var label = '#' + replicaSerial + ' / #' + masterSerial
+            + ' (+' + lag + ')';
+        if (stuckSeconds >= REPLICA_STUCK_THRESHOLD_S) {
+            return {kind: 'stuck', label: label};
+        }
+        return {kind: 'lagging', label: label};
+    }
+
 
     function formatNum(n) {
         if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -2545,6 +3226,71 @@
     updateAuthUI();
     updateNav();
     navigate();
+
+    // Lightweight global health poll: independent of which view is
+    // shown. Fetches /+status (and /+admin-api/replicas if authenticated)
+    // every HEALTH_POLL_MS to colour the topbar logo. The Status page
+    // does its own deeper refresh; this one is just for the indicator.
+    var HEALTH_POLL_MS = 30000;
+    var _logoEl = document.querySelector('.logo');
+
+    function _pollHealth() {
+        var replicasReq = Api.getUser()
+            ? Api.get('/+admin-api/replicas').catch(function () {
+                return {result: {}};
+            })
+            : Promise.resolve({result: {}});
+        Promise.all([
+            Api.get('/+status').catch(function () { return null; }),
+            replicasReq,
+        ]).then(function (results) {
+            var statusEnv = results[0];
+            var status = statusEnv && statusEnv.result;
+            var replicaPolls = (results[1] && results[1].result) || {};
+            _setTopbarHealth(status, replicaPolls);
+        });
+    }
+
+    function _setTopbarHealth(status, replicaPolls) {
+        if (!_logoEl) return;
+        var kind, tip;
+        if (!status) {
+            kind = 'red';
+            tip = 'devpi server is not responding';
+        } else if (Api.getUser() && status.role === 'MASTER') {
+            // Authenticated on master: detect lagging/stuck replicas via
+            // applied_serial vs current keyfs serial.
+            var pollingReplicas = status.polling_replicas || {};
+            var uuids = Object.keys(pollingReplicas);
+            var masterSerial = status.serial || 0;
+            var lagging = [];
+            for (var i = 0; i < uuids.length; i++) {
+                var poll = replicaPolls[uuids[i]];
+                if (poll && typeof poll.applied_serial === 'number'
+                        && poll.applied_serial < masterSerial) {
+                    lagging.push(uuids[i]);
+                }
+            }
+            if (lagging.length) {
+                kind = 'orange';
+                tip = lagging.length + ' replica(s) lagging — '
+                    + 'check the Status page';
+            } else {
+                kind = 'green';
+                tip = 'all replicas in sync';
+            }
+        } else {
+            kind = 'green';
+            tip = 'devpi server is reachable';
+        }
+        _logoEl.classList.remove(
+            'logo-health-green', 'logo-health-orange', 'logo-health-red');
+        _logoEl.classList.add('logo-health-' + kind);
+        _logoEl.title = tip;
+    }
+
+    _pollHealth();
+    setInterval(_pollHealth, HEALTH_POLL_MS);
 
     var _sessionCheckReady = false;
     setTimeout(function () { _sessionCheckReady = true; }, 2000);

@@ -1,11 +1,11 @@
 # devpi-admin
 
-A modern web UI plugin for [devpi-server](https://devpi.net/) — a drop-in replacement for
+A modern web UI plugin for [devpi-server](https://devpi.net/) - a drop-in replacement for
 `devpi-web`. Ships as a Python package that registers itself as a devpi-server plugin via the
 standard entry point mechanism, so a single `pip install devpi-admin` is enough.
 
 The UI itself is a bundled single-page application (pure HTML + CSS + vanilla JavaScript, no
-build step) served under `/+admin/`. All devpi REST API endpoints remain untouched — the SPA
+build step) served under `/+admin/`. All devpi REST API endpoints remain untouched - the SPA
 talks to the standard devpi JSON API directly.
 
 ## Features
@@ -14,17 +14,36 @@ talks to the standard devpi JSON API directly.
 - Server info with version of devpi-server and all installed plugins (auto-detected)
 - Cache metrics with hit-rate bars (storage, changelog, relpath caches)
 - Whoosh search index queue status
-- **Replica status** (master only) — per-replica cards with online/offline badge, serial lag,
-  and last-seen timestamp; visible only when replicas are connected
+- **Replica status** (master only, authenticated users only) - per-replica cards with
+  authoritative `applied_serial` vs. master serial. Three states:
+  - **in sync** - replica matches master serial
+  - **lagging** - replica is behind but advancing
+  - **stuck** - replica has been polling the same serial for >=30 s; usually means a
+    server-side plugin (`devpi-admin`, `devpi-web`, ...) is missing or out of date on the replica
+- **Topbar health indicator** - the `devpi admin` logo is coloured green / orange / red
+  on every page, refreshed every 30 s in the background:
+  - server reachable, all replicas in sync
+  - at least one replica lagging (visible to authenticated master operators)
+  - server not responding
 
 ### Indexes
 - Visual cards color-coded by type: green (stage), amber (volatile stage), blue (mirror)
-- `pip install` command with copy-to-clipboard (click to copy, green flash feedback)
-- **`pip.conf` modal** — issues a short-lived read-only token and returns three forms:
-  the full `pip.conf` file (Copy / Download), a one-off `pip install --index-url ...` command,
-  and the raw `user:token` pair for `curl -u`, `devpi login`, and custom tooling.
-  Public indexes (`acl_read = [:ANONYMOUS:]`) skip token issuance — they show a static
-  pip.conf without credentials.
+- Warning tags for ACL edge cases:
+  - **`world-writable`** - `acl_upload` contains `:ANONYMOUS:`; supply-chain risk
+  - **`no upload`** - `acl_upload` is empty; nobody (not even owner / root) can publish
+- Adaptive kebab menu - items hint whether a token will be issued:
+  - **`pip.conf`** (public read index, no auth needed) vs. **`pip.conf + token`** (private read)
+  - **`.pypirc`** (public upload, no auth needed) vs. **`.pypirc + token`** (private upload).
+    Hidden when nobody can upload (`acl_upload` empty).
+- **`pip.conf` modal** - issues a short-lived `read`-scope token bound to the index. Returns
+  the full `pip.conf` (Copy / Download), a one-off `pip install --index-url ...` command, and
+  the raw `user:token` pair for `curl`, `devpi login`, etc. Anonymous-readable indexes show
+  a static pip.conf without credentials.
+- **`.pypirc` modal** - issues an `upload`-scope token bound to the index. Returns the full
+  `.pypirc` (Copy / Download), `TWINE_*` environment variable block, a one-shot
+  `twine upload --repository-url ... -u ... -p ... dist/*` command, and the raw `user:token`
+  pair. Anonymous-upload indexes (rare; world-writable) show a static `.pypirc` without
+  credentials and a security warning.
 - Create / edit / delete indexes via modal dialogs
 - `bases` editor with drag & drop priority ordering and transitive inheritance display
 - `acl_upload` and `acl_read` tag pickers with user selection dropdown
@@ -32,7 +51,7 @@ talks to the standard devpi JSON API directly.
 
 ### Read access control (`acl_read`)
 - Per-index list of principals allowed to read the index (download packages, browse simple)
-- Default `[:ANONYMOUS:]` — public, behaves like devpi-web
+- Default `[:ANONYMOUS:]` - public, behaves like devpi-web
 - Set to specific users (`alice`, `bob`) to make the index private
 - Special principals: `:ANONYMOUS:` (everyone, including unauthenticated) and `:AUTHENTICATED:`
   (any logged-in user)
@@ -40,32 +59,46 @@ talks to the standard devpi JSON API directly.
   plus a tween that filters out invisible indexes from the root listing (`GET /`)
   and rejects direct access to private indexes with 404
 
-### Admin tokens (read-only, revocable)
-- `POST /+admin-api/token` issues an opaque `adm_<id>.<secret>` token bound to a user
-- Tokens are persisted in keyfs as **SHA-256 hashes only** — the plaintext secret is shown
+### Admin tokens (scoped, revocable)
+- Opaque `adm_<id>.<secret>` tokens bound to a `(user, index, scope)` triple. Scope is
+  `read` (pip install) or `upload` (twine / `devpi upload`). A leaked token is contained
+  to **one index** and **one operation class** - no cross-index or upgrade path.
+- Tokens are persisted in keyfs as **SHA-256 hashes only** - the plaintext secret is shown
   exactly once at issuance. A keyfs dump (replica disk, backup) does not yield usable
   tokens. Lookup compares hashes via `hmac.compare_digest` (constant-time).
 - TTL configurable per-token (60 s up to 1 year), uniquely revocable
-- **Read-only, narrow scope**: a tween restricts admin-token requests to `GET`/`HEAD`
-  on `/+api` and `/<user>/<index>/...` paths only. Everything else returns 403:
-  uploads, `PATCH`/`DELETE` on indexes/users, `POST /+login`, the SPA itself,
-  the entire `/+admin-api/*` (so a token cannot mint another token), the root
-  listing `/`, and per-user listing `/<user>`.
-- **Issuance rules**: only regular users may issue tokens, and only for themselves.
-  Root cannot issue tokens at all (a leaked root token would have full server
-  privileges). A request authenticated via an admin token cannot issue further
-  tokens — no chained renewal past the original TTL.
-- **Management rules**: list / revoke is allowed for the token owner or root.
-- Per-user list, individual revoke, and "Reset all" available in the user card kebab menu
-- Auto-cleanup: when a user is deleted, all of their tokens are removed from keyfs
-- Audit log: failed lookups (unknown id, secret mismatch, expired, deleted user)
-  are logged at WARNING/INFO so an operator can spot bruteforce attempts.
+- **Tween enforcement matrix**:
+
+  | scope | allowed methods | allowed paths |
+  |---|---|---|
+  | `read` | GET, HEAD | `/+api`, `/<token.user>/<token.index>/...` |
+  | `upload` | GET, HEAD, POST, PUT | `/+api`, `/<token.user>/<token.index>/...` |
+
+  `DELETE` is **never** granted, even with `upload` scope - package removal must use
+  password auth. Anything outside the bound index path returns 403, including the SPA,
+  `/+admin-api/*` (so a token cannot mint further tokens), `/+login`, `/`, and `/<user>`.
+- **Issuance rules**: regular users may issue for themselves; root may issue for *other*
+  users (admin delegation) but not for itself. Admin-token-authenticated requests cannot
+  issue further tokens. Issuance verifies the target user is in `acl_read` /
+  `acl_upload` of the target index.
+- **Management rules**: list / revoke is allowed for the token owner or root. Per-index
+  token list endpoint shows only the caller's own tokens (root sees all).
+- **Auto-cleanup**:
+  - User delete -> all tokens for that user removed from keyfs
+  - Index delete -> all tokens bound to that index removed (USER subscriber diffs the
+    `indexes` dict)
+  - Legacy tokens (pre-hash storage, or pre-`index/scope`) wiped at startup
+- Audit log: failed lookups (unknown id, secret mismatch, expired, deleted user, legacy
+  token) are logged at WARNING/INFO so an operator can spot bruteforce attempts.
 - CI/Ansible-friendly: `GET /+admin-api/pip-conf?index=user/index&ttl=3600` returns a
-  ready-to-use `pip.conf` (text/plain) in one HTTP call
+  ready-to-use `pip.conf` (text/plain) in one HTTP call. For upload, use
+  `POST /+admin-api/token` with `{"scope": "upload"}`.
 
 ### Users
 - Create, edit (email, password), delete users (admin only)
-- **Tokens manager** — per-user list with label, expiry, issuer, IP; revoke individual or all
+- **Tokens manager** (kebab -> Tokens) - per-user list with label, **index, scope**,
+  expiry, issuer, IP; revoke individual or "Reset all". Wide modal layout so the table
+  doesn't overflow on stage indexes with long names.
 
 ### Packages
 - Client-side search with PEP 503 name normalization
@@ -76,16 +109,16 @@ talks to the standard devpi JSON API directly.
 ### Package detail (PyPI-like layout)
 - **Sidebar**: metadata (author, license, Python version, keywords, platform, maintainer,
   extras, project URLs, dependencies), `pip install` command, file downloads with upload dates
-- **Version list**: cached versions shown normally, uncached versions link to pypi.org (↗);
+- **Version list**: cached versions shown normally, uncached versions link to pypi.org (external);
   "Load all versions" button for mirrors
 - **README**: rendered markdown (via `marked.js`); fetched from PyPI.org for mirror packages
   where devpi doesn't cache the description
 
 ### General
-- **Anonymous browsing** — visitors can explore public indexes without logging in; admin
+- **Anonymous browsing** - visitors can explore public indexes without logging in; admin
   actions (create/edit/delete) appear only after authentication. Private indexes
   (`acl_read` without `:ANONYMOUS:`) are hidden from anonymous root listing.
-- **Hardened SPA delivery** — strict `Content-Security-Policy` (no inline scripts,
+- **Hardened SPA delivery** - strict `Content-Security-Policy` (no inline scripts,
   `connect-src` limited to same-origin + `pypi.org`, `frame-ancestors 'none'`),
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`. Markdown READMEs
   are sanitised before rendering (script/iframe/event handlers stripped, dangerous
@@ -93,25 +126,7 @@ talks to the standard devpi JSON API directly.
 - **Dark / light / auto theme** with half-circle icon for auto mode
 - **Responsive mobile menu** with hamburger toggle
 - **ESC + outside-click** dismissal for modals, dropdown menus, mobile menu
-- **Login via modal** — no separate login page
-
-## Plugin API endpoints
-
-In addition to serving the SPA, `devpi-admin` registers custom API endpoints under
-`/+admin-api/` for features that the standard devpi REST API doesn't provide efficiently:
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/+admin-api/session` | GET | Cheap auth check — frontend pings on tab focus |
-| `/+admin-api/cached/{user}/{index}` | GET | List cached package names for a mirror index (filesystem scan, serial-cached) |
-| `/+admin-api/versions/{user}/{index}/{project}` | GET | Version list with cached/uncached distinction |
-| `/+admin-api/versions/{user}/{index}/{project}?all=1` | GET | Include all upstream versions (mirrors) |
-| `/+admin-api/versiondata/{user}/{index}/{project}/{version}` | GET | Metadata + file links for a single version |
-| `/+admin-api/token` | POST | Issue an admin token (`{user, ttl_seconds, label, wait_replicas}`) — user can issue for self, root for anyone |
-| `/+admin-api/pip-conf?index=u/i&ttl=&user=&label=&wait_replicas=` | GET | Issue token + return `text/plain` pip.conf with embedded creds |
-| `/+admin-api/users/{user}/tokens` | GET | List active tokens for a user |
-| `/+admin-api/users/{user}/tokens` | DELETE | Revoke ALL tokens for a user |
-| `/+admin-api/tokens/{token_id}` | DELETE | Revoke a single token |
+- **Login via modal** - no separate login page
 
 ## Installation
 
@@ -127,7 +142,7 @@ This pulls in `devpi-server` as a dependency. If you are using devpi in a dedica
 systemctl --user restart devpi      # or however you run devpi-server
 ```
 
-You should uninstall `devpi-web` — `devpi-admin` replaces it entirely:
+You should uninstall `devpi-web` - `devpi-admin` replaces it entirely:
 
 ```bash
 pip uninstall devpi-web
@@ -137,9 +152,35 @@ Both plugins can technically coexist but it is not recommended. `devpi-admin` in
 for HTML requests while `devpi-web` would still serve its own HTML on other routes like
 `/<user>/<index>/<package>`, leading to a confusing mixed experience.
 
+### Replicas: install on every node
+
+`devpi-admin` registers custom keyfs keys (`+admin/tokens/...`,
+`+admin/user-tokens/...`, `+admin/index-tokens/...`). Master writes to these on every
+token issue / revoke. **Replicas without `devpi-admin` installed cannot apply those
+changelog entries** - `import_changes` fails with `AssertionError` on the missing
+keyfs key, the replica rolls back to the prior serial, and replication stalls.
+
+The dashboard's stuck-replica detection is designed exactly for this: a `stuck`
+state on a replica card almost always means a plugin (typically `devpi-admin` itself,
+also `devpi-web`, `devpi-postgresql`) is missing or out of date on the replica. Recovery
+is straightforward:
+
+```bash
+# on the replica
+~/.venv/bin/pip install --upgrade devpi-admin   # match master version
+systemctl restart devpi
+```
+
+Replication resumes from the failed serial automatically - no manual keyfs surgery.
+
+**Upgrade order:** replicas first, then master. If you upgrade master first and that
+release introduces a new keyfs key, replicas would crash on the very next poll.
+
+See `INSTALL.md` section 11 for full step-by-step replica setup and dashboard interpretation.
+
 ### Recommended for production: `--restrict-modify root`
 
-devpi-server starts in an **open** mode by default — anyone (including unauthenticated
+devpi-server starts in an **open** mode by default - anyone (including unauthenticated
 clients) can `PUT /<newuser>` to create an account, and any logged-in user can
 `PUT /<user>/<index>` to spin up indexes under their own account. The devpi-admin UI
 hides those buttons from non-root users, but a direct API call (`curl`, `devpi user -c`)
@@ -170,7 +211,7 @@ http://<your-devpi-host>:3141/
 Browser visits to `/` are redirected to `/+admin/`, which serves the SPA. Direct links like
 `http://<host>:3141/+admin/#packages/ci/testing` work and can be bookmarked.
 
-devpi CLI tools and other JSON clients are unaffected — they send `Accept: application/json`
+devpi CLI tools and other JSON clients are unaffected - they send `Accept: application/json`
 and bypass the redirect.
 
 ## CI/Ansible: short-lived pip.conf via the API
@@ -198,7 +239,7 @@ as a secret and let the pipeline mint a fresh short-lived `pip.conf` per run:
 When devpi runs as primary + replicas behind a load balancer, a freshly issued token
 exists on the primary instantly but takes one polling cycle (~37 s by default) to reach
 replicas. An Ansible-style playbook that issues a token and immediately uses it through
-the LB may hit a replica that doesn't know the token yet — and get `401`.
+the LB may hit a replica that doesn't know the token yet - and get `401`.
 
 Both `POST /+admin-api/token` and `GET /+admin-api/pip-conf` accept a `wait_replicas`
 parameter. The primary blocks until every currently-polling replica has caught up to
@@ -213,15 +254,31 @@ curl -sf -H "X-Devpi-Auth: $AUTH" \
 ```
 
 For `POST /+admin-api/token`, send `{"wait_replicas": 10}` in the JSON body. The response
-includes a `replication` block (`synced`, `waited`, `timed_out`, `replicas`, …) so the
+includes a `replication` block (`synced`, `waited`, `timed_out`, `replicas`, ...) so the
 client can decide whether to retry.
 
-The token issued is strictly read-only — usable only for `GET`/`HEAD` on `/+api` and
-`/<user>/<index>/...` (index data and package archives). It cannot upload packages,
-change passwords, exchange itself for a session token, modify indexes, or issue another
-token. It expires after `ttl` seconds. The service user must have `pkg_read` (be listed
-in the target index's `acl_read`) and **must not be `root`** — root accounts cannot
-issue tokens at all.
+The token issued is `read`-scoped - usable only for `GET`/`HEAD` on `/+api` and the
+bound `/<user>/<index>/...`. It cannot upload, modify indexes, change passwords,
+exchange itself for a session token, or issue another token. It expires after `ttl`
+seconds. The service user must have `pkg_read` on the target index. Root may issue
+for *other* users (admin delegation) but never for itself.
+
+For uploads, `POST /+admin-api/token` with `{"scope": "upload"}` returns a token that
+adds POST/PUT to the bound index - usable from `twine` or `devpi upload`:
+
+```yaml
+# CI publish step
+- name: Publish wheel
+  run: |
+    AUTH=$(printf '%s:%s' "$DEVPI_USER" "$DEVPI_PASSWORD" | base64)
+    TOKEN=$(curl -sf -H "X-Devpi-Auth: $AUTH" -H 'Content-Type: application/json' \
+      -d '{"index":"company/release","scope":"upload","ttl_seconds":900}' \
+      "https://devpi.example.com/+admin-api/token" | jq -r .token)
+    twine upload --repository-url https://devpi.example.com/company/release/ \
+      -u "$DEVPI_USER" -p "$TOKEN" dist/*
+```
+
+Upload tokens still cannot DELETE - package removal must use password auth.
 
 ### Trusted proxy for client IP logging
 
@@ -234,45 +291,52 @@ header should be honoured:
 DEVPI_ADMIN_TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1
 ```
 
-Without this variable, `X-Forwarded-For` is ignored — preventing clients from forging
+Without this variable, `X-Forwarded-For` is ignored - preventing clients from forging
 their logged IP.
 
 ## How it works
 
 `devpi-admin` registers a `devpi_server` entry point with several `@hookimpl`s:
 
-- **`devpiserver_get_features`** — advertises the plugin in `/+api`.
-- **`devpiserver_indexconfig_defaults`** — registers `acl_read` as an indexconfig field
+- **`devpiserver_get_features`** - advertises the plugin in `/+api`.
+- **`devpiserver_indexconfig_defaults`** - registers `acl_read` as an indexconfig field
   with an `ACLList` marker so devpi normalizes its values on every `PUT`/`PATCH`.
-- **`devpiserver_stage_get_principals_for_pkg_read`** — feeds `acl_read` into devpi's
+- **`devpiserver_stage_get_principals_for_pkg_read`** - feeds `acl_read` into devpi's
   pyramid ACL, which applies the `pkg_read` permission natively on every download path
   (`+f/`, `+e/`, simple page).
-- **`devpiserver_get_identity`** — recognizes `adm_<id>.<secret>` admin tokens, validates
+- **`devpiserver_get_identity`** - recognizes `adm_<id>.<secret>` admin tokens, validates
   them against keyfs (constant-time hash compare), sets `adm.is_admin_token` in the
   request environ for downstream tween checks.
-- **`devpiserver_pyramid_configure`** — registers the SPA, custom API views, the tween,
-  the token keyfs keys, and a USER-key subscriber that cleans up tokens when a user is
-  deleted (primary only — replicas are read-only).
+- **`devpiserver_pyramid_configure`** - registers the SPA, custom API views, the tween,
+  the token keyfs keys, and a USER-key subscriber that cleans up tokens on user delete
+  AND on per-user-index removal (diffs old vs. new `indexes` dict via `tx.get_value_at`).
+  Primary only - replicas are read-only.
 
-The tween does several things:
+The tween does several things on every request:
 
-1. Redirects HTML browser requests on `/` to `/+admin/` while leaving JSON requests intact.
-2. Restricts admin-token requests to read-only access on index/archive paths only.
-   Anything outside `GET /+api` or `GET /<user>/<index>/...` returns `403` — including
-   the SPA, `/+admin-api/*`, `/+login`, `/`, `/<user>`, and any non-`GET`/`HEAD` method
-   anywhere. A leaked token cannot upload, mint another token, change passwords, or
-   exchange itself for a session token.
-3. Returns `404` for `GET /<user>/<index>/...` (index, simple, project, version, file)
-   when the requestor lacks `pkg_read` — devpi's own listing endpoints have no
+1. **Captures replica poll info.** Matches `GET /+changelog/{N}-?` and records
+   `start_serial` + `last_seen` keyed by the `X-DEVPI-REPLICA-UUID` header. This is the
+   data source for `/+admin-api/replicas` and the dashboard's stuck-replica detection.
+2. **Validates admin tokens** by direct `tokens.lookup()` (not via pyramid identity, which
+   would pin a stale identity through `/+login`'s mid-request header swap). On valid
+   token, sets `adm.token_meta` in the request environ for the identity hook to reuse.
+3. **Enforces token scope and index binding**:
+   - `read` scope -> only GET/HEAD allowed
+   - `upload` scope -> adds POST/PUT (DELETE is *never* granted)
+   - URL must be `/+api` or under `/<token.user>/<token.index>/...`. Anything else
+     (other indexes, SPA, `/+admin-api/*`, `/+login`, root listing, `/<user>`) returns 403.
+4. **Redirects** HTML browser requests on `/` to `/+admin/` while leaving JSON requests intact.
+5. **Returns 404** for `GET /<user>/<index>/...` (index, simple, project, version, file)
+   when the requestor lacks `pkg_read` - devpi's own listing endpoints have no
    permission check, so we add one.
-4. Returns `403`/`404` for `GET /<user>` when the requestor is neither the user
-   themselves nor `root` — devpi otherwise leaks the full list of that user's
+6. **Returns 403/404** for `GET /<user>` when the requestor is neither the user
+   themselves nor `root` - devpi otherwise leaks the full list of that user's
    private indexes.
-5. Filters the `GET /` JSON response to remove indexes the requestor can't read,
+7. **Filters the `GET /` JSON response** to remove indexes the requestor can't read,
    and adds `Cache-Control: private, no-store` so a shared cache cannot serve one
    user's filtered view to another.
 
-The SPA HTML (`/+admin/`) is served with security headers — strict
+The SPA HTML (`/+admin/`) is served with security headers - strict
 `Content-Security-Policy` (no inline scripts, restricted `connect-src` to
 `'self'` + `https://pypi.org` for the README fallback, `frame-ancestors 'none'`),
 plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
@@ -286,7 +350,9 @@ so repeated requests don't re-walk the directory unless a file was added or remo
 ## Requirements
 
 - Python 3.9+
-- devpi-server 6.0+
+- **devpi-server 6.19 <= version < 7.0** - we rely on `tx.get_value_at`, the
+  `X-DEVPI-REPLICA-UUID` header and the `polling_replicas` dict shape introduced in
+  6.19; the upper bound is held until 7.x compatibility is verified.
 - A browser with ES6 support (`Promise`, `fetch`, `sessionStorage`)
 
 ## Routes (UI)
@@ -303,6 +369,143 @@ Routing is hash-based, so any of these URLs can be bookmarked or shared:
 | `#package/<user>/<index>/<name>?version=<ver>` | Specific version |
 | `#users` | User management (requires login) |
 
+## API
+
+In addition to serving the SPA, `devpi-admin` exposes its own JSON API under
+`/+admin-api/`. Authentication uses the standard devpi-server header
+`X-Devpi-Auth: base64(user:token)`. Responses are `application/json` unless noted
+(`/+admin-api/pip-conf` returns `text/plain`).
+
+### Session and discovery
+
+#### `GET /+admin-api/session`
+Cheap auth check; the frontend pings this on tab focus to detect expired sessions.
+- **Auth:** required
+- **200:** `{"valid": true, "user": "alice"}`
+- **403:** not authenticated
+
+#### `GET /+admin-api/public-url`
+Canonical "outside" URL of this deployment, derived from
+`request.application_url` (respects `--outside-url` and `X-Forwarded-*` headers).
+The SPA uses this for static `pip.conf` / `.pypirc` previews so they match what the
+backend would emit when behind a reverse proxy.
+- **Auth:** none (URL is not a secret; even anonymous viewers of public indexes need it)
+- **200:** `{"url": "https://devpi.example.com"}`
+
+### Mirror cache and metadata
+
+#### `GET /+admin-api/cached/{user}/{index}`
+List package names with files cached on disk for a mirror index. Scans
+`+files/{user}/{index}/+f/` and memoises the result per `(user, index)`, invalidated
+by keyfs serial bumps. Avoids the 17 MB index download for global mirrors like PyPI.
+- **Auth:** `pkg_read` on the index
+- **200:** `{"result": ["foo", "bar", ...], "total": 42}`
+- **404:** index doesn't exist or is not a mirror
+
+#### `GET /+admin-api/versions/{user}/{index}/{project}[?all=1]`
+Version list with cached / uncached distinction. For mirror indexes `all` is null
+unless `?all=1` is passed, to avoid expensive upstream queries.
+- **Auth:** `pkg_read` on the index
+- **200:** `{"cached": ["1.0", "0.9"], "all": ["1.0", "0.9", "0.8"] | null}`
+
+#### `GET /+admin-api/versiondata/{user}/{index}/{project}/{version}`
+Metadata + file links for a single version (PEP 426 / PEP 621 fields plus `+links`
+with `href`, `basename`, `hash_spec`, upload `log`).
+- **Auth:** `pkg_read` on the index
+- **200:** `{"result": {...}}`
+- **404:** version doesn't exist
+
+### Tokens
+
+Tokens are opaque `adm_<id>.<secret>` strings bound to a `(user, index, scope)` triple.
+Only the SHA-256 of the secret is persisted in keyfs.
+
+#### `POST /+admin-api/token`
+Issue a new token.
+- **Auth:** required (regular user for self; root may issue for *other* users; admin-token
+  requests cannot issue further tokens)
+- **Body (JSON):**
+  ```json
+  {
+    "user": "alice",                  // optional, default = authenticated; root may set freely (not "root")
+    "index": "alice/dev",             // required
+    "scope": "read" | "upload",       // required
+    "ttl_seconds": 3600,              // optional; 60 <= ttl <= 1 year, default 1h
+    "label": "ci-build",              // optional, <= 200 chars
+    "wait_replicas": 10               // optional; block up to N seconds for replicas to catch up
+  }
+  ```
+- **200:** `{token, user, index, scope, issued_at, expires_at, label, replication?}` -
+  `token` is the plaintext, returned **once**.
+- **403:** target user lacks scope perm on index, root issuing for itself, admin-token call, etc.
+- **404:** index doesn't exist
+
+#### `GET /+admin-api/pip-conf?index=u/i&user=&ttl=&label=&wait_replicas=`
+Issue a `read` token + return a ready-to-use pip.conf in one call (CI/Ansible-friendly).
+- **Auth:** required (same rules as `POST /token`)
+- **200:** `text/plain`
+  ```ini
+  [global]
+  index-url = https://alice:adm_xxx.yyy@devpi.example.com/alice/dev/+simple/
+  trusted-host = devpi.example.com
+  ```
+
+#### `GET /+admin-api/users/{user}/tokens`
+List active tokens for a user.
+- **Auth:** the user themselves, or root
+- **200:** `{"result": [{id, id_short, user, index, scope, issuer, issued_at, expires_at, expires_in, label, client_ip}, ...], "count": N}`
+
+#### `DELETE /+admin-api/users/{user}/tokens`
+Revoke ALL tokens for a user.
+- **Auth:** the user themselves, or root
+- **200:** `{"revoked": N, "user": "alice"}`
+
+#### `GET /+admin-api/indexes/{user}/{index}/tokens`
+List tokens bound to an index. Non-root callers see only tokens they own; root sees
+every token for the index. Returns 404 (not 403) when the caller has no `pkg_read` so
+private index existence is not leaked.
+- **Auth:** `pkg_read` on the index (404 otherwise)
+- **200:** `{"result": [...], "count": N}` - same record shape as `/users/{user}/tokens`
+
+#### `DELETE /+admin-api/tokens/{token_id}`
+Revoke a single token.
+- **Auth:** owner of the token, or root
+- **200:** `{"revoked": true, "id": "abc..."}`
+- **404:** token id not found
+
+### Replication observability (master only)
+
+#### `GET /+admin-api/replicas`
+Last-known poll info per replica, captured from each `GET /+changelog/{N}-` request via
+a tween. The `applied_serial` field is the highest serial the replica has actually
+applied (`start_serial - 1` from its most recent poll). Compare against `/+status`
+`serial` for true lag.
+
+Why this isn't `polling_replicas` from `/+status`: devpi-server overwrites
+`xom.polling_replicas[uuid].serial` during streaming and gives a misleading "caught up"
+reading once the response generator drains. Capturing `start_serial` at the request
+boundary is the only stable signal master alone can produce.
+
+- **Auth:** required
+- **200:**
+  ```json
+  {
+    "result": {
+      "<replica-uuid>": {
+        "start_serial": 103,
+        "applied_serial": 102,
+        "last_seen": 1712345678.9,
+        "age_seconds": 3,
+        "stuck_seconds": 47,
+        "remote_ip": "10.0.0.5",
+        "outside_url": "https://replica.example.com"
+      }
+    }
+  }
+  ```
+- Entries auto-expire after 10 min of silence. Dict size capped at 256 entries
+  (least-recently-seen evicted first) so an attacker spamming UUIDs cannot exhaust master memory.
+
 ## Project layout
 
 ```
@@ -311,33 +514,36 @@ devpi-admin/
 ├── README.md
 ├── LICENSE
 ├── .github/workflows/
-│   ├── tests.yml            — CI on push/PR (Python 3.10 – 3.14)
-│   └── publish.yml          — publish to PyPI on release
-├── dev/                     — untracked dev-only prototypes (e.g. demo-graph.html)
+│   ├── tests.yml            - CI on push/PR (Python 3.10 - 3.14)
+│   └── publish.yml          - publish to PyPI on release
+├── dev/                     - untracked dev-only prototypes (e.g. demo-graph.html)
 ├── devpi_admin/
-│   ├── __init__.py          — version (from git tag via setuptools-scm)
-│   ├── main.py              — Pyramid hooks, tween, API views
-│   ├── tokens.py            — admin token gen / lookup / revoke / list (keyfs storage)
+│   ├── __init__.py          - version (from git tag via setuptools-scm)
+│   ├── main.py              - Pyramid hooks, tween, API views
+│   ├── tokens.py            - admin token gen / lookup / revoke / list (keyfs storage)
 │   └── static/
-│       ├── index.html       — SPA entry point
+│       ├── index.html       - SPA entry point
 │       ├── css/style.css
 │       └── js/
-│           ├── api.js       — devpi REST wrapper + auth
-│           ├── theme.js     — theme toggle (light/dark/auto)
-│           ├── marked.min.js  — vendored markdown renderer
-│           └── app.js       — routing, views, rendering
+│           ├── api.js       - devpi REST wrapper + auth
+│           ├── theme.js     - theme toggle (light/dark/auto)
+│           ├── marked.min.js  - vendored markdown renderer
+│           └── app.js       - routing, views, rendering
 └── tests/
-    ├── test_acl_read.py        — acl_read hooks, tween guards, header parsing
-    ├── test_cached_versions.py — filesystem scan + cache invalidation
-    ├── test_helpers.py         — filename parsing, normalization
-    ├── test_hooks.py           — pluggy hook registration
-    ├── test_json_safe.py       — readonly view conversion
-    ├── test_package.py         — entry point, static files
-    ├── test_pipconf.py         — pip.conf credential helpers
-    ├── test_tokens.py          — admin token format, generation, splitting
-    ├── test_tween.py           — redirect behavior
-    ├── test_view_helpers.py    — _get_stage_or_404, _check_read_access, CSP headers
-    └── test_wants_html.py      — Accept header heuristic
+    ├── test_acl_read.py        - acl_read hooks, tween guards (scope/index), token issuance
+    │                             rules, _check_index_perm, USER-changed handler, replica poll
+    │                             tween + endpoint, public-url
+    ├── test_cached_versions.py - filesystem scan + cache invalidation
+    ├── test_helpers.py         - filename parsing, normalization
+    ├── test_hooks.py           - pluggy hook registration
+    ├── test_json_safe.py       - readonly view conversion
+    ├── test_package.py         - entry point, static files
+    ├── test_pipconf.py         - pip.conf credential helpers
+    ├── test_tokens.py          - token format, issue/lookup/revoke, reset_for_index,
+    │                             list_for_index, end-to-end cleanup chain
+    ├── test_tween.py           - redirect behavior
+    ├── test_view_helpers.py    - _get_stage_or_404, _check_read_access, CSP headers
+    └── test_wants_html.py      - Accept header heuristic
 ```
 
 ## Development
@@ -349,10 +555,10 @@ python -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
-The `dev` extra pulls in `pytest`. A bare `pip install -e .` works too — the test suite
+The `dev` extra pulls in `pytest`. A bare `pip install -e .` works too - the test suite
 is also runnable with the stdlib `unittest` runner.
 
-The static files live at `devpi_admin/static/` and can be edited in place — changes show
+The static files live at `devpi_admin/static/` and can be edited in place - changes show
 up on the next browser reload, no restart of devpi-server required (static views read
 from disk on each request). Python changes (`main.py`, `tokens.py`) require a
 devpi-server restart.
@@ -375,9 +581,9 @@ when it imports `pkg_resources`.)
 Version is derived from the git tag via `setuptools-scm`. To release:
 
 1. `git tag v0.1.0 && git push --tags`
-2. On GitHub: Releases → Draft new release → select tag → Publish
+2. On GitHub: Releases -> Draft new release -> select tag -> Publish
 3. The `publish.yml` workflow runs tests, builds wheel+sdist, and uploads to PyPI via trusted
-   publishing (no API tokens needed — configure the GitHub environment `pypi` in PyPI settings).
+   publishing (no API tokens needed - configure the GitHub environment `pypi` in PyPI settings).
 
 ## Author
 
@@ -385,4 +591,4 @@ Pavel Revak <pavelrevak@gmail.com>
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

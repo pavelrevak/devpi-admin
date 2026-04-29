@@ -25,7 +25,11 @@ classifiers = [
     "Topic :: System :: Software Distribution",
 ]
 dependencies = [
-    "devpi-server>=6.0",
+    # Pin to the 6.19.x line: we rely on tx.get_value_at, the
+    # X-DEVPI-REPLICA-UUID header and the polling_replicas dict shape
+    # introduced in 6.19. devpi-server 7.x is expected to ship breaking
+    # changes (keyfs API, hookspecs); pin upper-bound until tested.
+    "devpi-server>=6.19,<7",
 ]
 
 [project.optional-dependencies]

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 from devpi_admin import main
 from devpi_admin.main import (
-    _INDEX_ANY_RE, _NAME_RE, _TOKEN_ALLOWED_PATH_RE, _USER_PATH_RE,
+    _INDEX_ANY_RE, _NAME_RE, _USER_PATH_RE,
     _admin_token_check, _filter_root_listing, _request_carries_admin_token,
     _user_listing_check,
     devpiserver_indexconfig_defaults, devpiserver_stage_get_principals_for_pkg_read)
@@ -64,23 +64,6 @@ class PathRegexTests(unittest.TestCase):
         self.assertFalse(_INDEX_ANY_RE.match("/+login"))
         self.assertFalse(_INDEX_ANY_RE.match("/+api"))
         self.assertFalse(_INDEX_ANY_RE.match("/alice/+api"))
-
-    def test_token_allowed_path_re(self):
-        # /+api allowed (devpi client discovery).
-        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/+api"))
-        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/+api/"))
-        # Index/archive paths allowed.
-        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev"))
-        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev/+simple/"))
-        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev/+f/foo.whl"))
-        self.assertTrue(_TOKEN_ALLOWED_PATH_RE.match("/alice/dev/foo/1.0"))
-        # Management / login / single-segment / SPA paths denied.
-        for bad in ("/", "/+login", "/+admin/", "/+admin-api/token",
-                    "/+admin-api/users/alice/tokens", "/+status", "/alice",
-                    "/alice/"):
-            self.assertFalse(
-                _TOKEN_ALLOWED_PATH_RE.match(bad),
-                "expected token path %r to be denied" % bad)
 
     def test_name_regex_accepts_typical_names(self):
         for name in ("alice", "ci-runner", "team_a", "user.bot", "u1"):
@@ -157,32 +140,93 @@ class AdminTokenCheckTests(unittest.TestCase):
         req.path = path
         return req
 
-    def test_get_index_paths_allowed(self):
-        for path in ("/+api", "/alice/dev", "/alice/dev/+simple/",
-                     "/alice/dev/+f/foo.whl", "/alice/dev/foo/1.0"):
+    def _meta(self, *, index="alice/dev", scope="read"):
+        return {"user": index.split("/")[0], "index": index, "scope": scope}
+
+    # --- read-scope token bound to alice/dev ---
+
+    def test_read_scope_allows_get_on_bound_index(self):
+        for path in ("/+api", "/alice/dev", "/alice/dev/",
+                     "/alice/dev/+simple/", "/alice/dev/+f/foo.whl",
+                     "/alice/dev/foo/1.0"):
             self.assertIsNone(
-                _admin_token_check(self._make("GET", path)),
+                _admin_token_check(self._make("GET", path), self._meta()),
                 "GET %s should be allowed" % path)
 
-    def test_get_management_paths_blocked(self):
+    def test_read_scope_blocks_management_paths(self):
         for path in ("/", "/+login", "/+admin/", "/+admin-api/token",
                      "/+admin-api/users/alice/tokens", "/+status",
                      "/alice", "/alice/"):
             self.assertIsNotNone(
-                _admin_token_check(self._make("GET", path)),
+                _admin_token_check(self._make("GET", path), self._meta()),
                 "GET %s should be blocked" % path)
 
-    def test_head_treated_like_get(self):
-        self.assertIsNone(_admin_token_check(self._make("HEAD", "/alice/dev")))
-        self.assertIsNotNone(_admin_token_check(self._make("HEAD", "/+login")))
+    def test_read_scope_blocks_other_index(self):
+        # Token bound to alice/dev cannot reach bob/prod.
+        self.assertIsNotNone(_admin_token_check(
+            self._make("GET", "/bob/prod"), self._meta()))
+        self.assertIsNotNone(_admin_token_check(
+            self._make("GET", "/bob/prod/+simple/foo"), self._meta()))
+        # Even alice's *other* index is blocked.
+        self.assertIsNotNone(_admin_token_check(
+            self._make("GET", "/alice/staging"), self._meta()))
 
-    def test_any_write_method_blocked_everywhere(self):
+    def test_head_treated_like_get(self):
+        self.assertIsNone(_admin_token_check(
+            self._make("HEAD", "/alice/dev"), self._meta()))
+        self.assertIsNotNone(_admin_token_check(
+            self._make("HEAD", "/+login"), self._meta()))
+
+    def test_read_scope_blocks_writes_everywhere(self):
         for method in ("POST", "PUT", "PATCH", "DELETE"):
-            for path in ("/+login", "/alice", "/alice/dev",
-                         "/alice/dev/foo", "/+admin-api/token"):
+            for path in ("/alice/dev", "/alice/dev/foo", "/+login"):
                 self.assertIsNotNone(
-                    _admin_token_check(self._make(method, path)),
-                    "%s %s must be blocked for admin tokens" % (method, path))
+                    _admin_token_check(self._make(method, path), self._meta()),
+                    "%s %s must be blocked for read-scope token"
+                    % (method, path))
+
+    # --- upload-scope token ---
+
+    def test_upload_scope_allows_post_put_on_bound_index(self):
+        meta = self._meta(scope="upload")
+        for method in ("POST", "PUT"):
+            self.assertIsNone(_admin_token_check(
+                self._make(method, "/alice/dev"), meta),
+                "%s should be allowed" % method)
+            self.assertIsNone(_admin_token_check(
+                self._make(method, "/alice/dev/foo/1.0"), meta))
+
+    def test_upload_scope_blocks_delete(self):
+        # Even with upload scope, DELETE is never allowed — package
+        # removal must use password auth.
+        meta = self._meta(scope="upload")
+        for path in ("/alice/dev", "/alice/dev/foo", "/alice/dev/foo/1.0"):
+            self.assertIsNotNone(
+                _admin_token_check(self._make("DELETE", path), meta),
+                "DELETE %s must be blocked even for upload scope" % path)
+
+    def test_upload_scope_blocks_other_index(self):
+        meta = self._meta(scope="upload")
+        self.assertIsNotNone(_admin_token_check(
+            self._make("POST", "/bob/prod"), meta))
+
+    def test_upload_scope_blocks_management_paths(self):
+        meta = self._meta(scope="upload")
+        for path in ("/+login", "/+admin-api/token", "/+admin/", "/"):
+            self.assertIsNotNone(
+                _admin_token_check(self._make("POST", path), meta))
+
+    # --- malformed meta (defensive) ---
+
+    def test_unknown_scope_blocked(self):
+        meta = {"user": "alice", "index": "alice/dev", "scope": "weird"}
+        self.assertIsNotNone(_admin_token_check(
+            self._make("GET", "/alice/dev"), meta))
+
+    def test_missing_index_blocked(self):
+        meta = {"user": "alice", "scope": "read"}
+        self.assertIsNotNone(_admin_token_check(
+            self._make("GET", "/alice/dev"), meta))
 
 
 class UserListingCheckTests(unittest.TestCase):
@@ -431,6 +475,499 @@ class WaitReplicasTests(unittest.TestCase):
         result = main._wait_for_replicas(xom, 1)
         self.assertTrue(result["synced"])
         self.assertEqual(result["replicas"], 0)
+
+
+class RecordReplicaPollTests(unittest.TestCase):
+    """Verify the tween captures /+changelog/{N}- requests correctly."""
+
+    def setUp(self):
+        main._replica_polls.clear()
+
+    def tearDown(self):
+        main._replica_polls.clear()
+
+    def _req(self, *, method="GET", path="/+changelog/103-",
+              uuid="r1-uuid", outside_url=None, client_addr="10.0.0.5"):
+        req = MagicMock()
+        req.method = method
+        req.path = path
+        req.client_addr = client_addr
+        headers = {}
+        if uuid is not None:
+            headers["X-DEVPI-REPLICA-UUID"] = uuid
+        if outside_url is not None:
+            headers["X-DEVPI-REPLICA-OUTSIDE-URL"] = outside_url
+        req.headers = headers
+        return req
+
+    def test_records_start_serial_for_replica_poll(self):
+        main._record_replica_poll(self._req(path="/+changelog/103-"))
+        self.assertIn("r1-uuid", main._replica_polls)
+        rec = main._replica_polls["r1-uuid"]
+        self.assertEqual(rec["start_serial"], 103)
+        self.assertEqual(rec["remote_ip"], "10.0.0.5")
+
+    def test_records_outside_url_when_present(self):
+        main._record_replica_poll(self._req(outside_url="https://r1.local"))
+        self.assertEqual(
+            main._replica_polls["r1-uuid"]["outside_url"], "https://r1.local")
+
+    def test_overwrites_previous_record_with_latest(self):
+        main._record_replica_poll(self._req(path="/+changelog/103-"))
+        main._record_replica_poll(self._req(path="/+changelog/186-"))
+        self.assertEqual(
+            main._replica_polls["r1-uuid"]["start_serial"], 186)
+
+    def test_first_seen_at_serial_preserved_when_serial_unchanged(self):
+        # Two polls for the same start_serial — the first_seen timestamp
+        # must NOT advance, so the dashboard can detect stuck replicas.
+        import time as _time
+        main._record_replica_poll(self._req(path="/+changelog/103-"))
+        rec1 = dict(main._replica_polls["r1-uuid"])
+        _time.sleep(0.01)
+        main._record_replica_poll(self._req(path="/+changelog/103-"))
+        rec2 = main._replica_polls["r1-uuid"]
+        self.assertEqual(
+            rec1["first_seen_at_serial"], rec2["first_seen_at_serial"])
+        self.assertGreater(rec2["last_seen"], rec1["last_seen"])
+
+    def test_first_seen_at_serial_resets_on_serial_change(self):
+        import time as _time
+        main._record_replica_poll(self._req(path="/+changelog/103-"))
+        rec1 = dict(main._replica_polls["r1-uuid"])
+        _time.sleep(0.01)
+        main._record_replica_poll(self._req(path="/+changelog/186-"))
+        rec2 = main._replica_polls["r1-uuid"]
+        self.assertGreater(
+            rec2["first_seen_at_serial"], rec1["first_seen_at_serial"])
+
+    def test_dict_bounded_under_uuid_spam(self):
+        # /+changelog/ is anonymously reachable in devpi; an attacker
+        # could spam unique UUIDs to exhaust master memory. Verify the
+        # cap prevents runaway growth.
+        original = main._REPLICA_POLL_MAX
+        main._REPLICA_POLL_MAX = 8
+        try:
+            for i in range(100):
+                main._record_replica_poll(
+                    self._req(uuid="spam-" + str(i)))
+            self.assertLessEqual(
+                len(main._replica_polls), main._REPLICA_POLL_MAX)
+        finally:
+            main._REPLICA_POLL_MAX = original
+
+    def test_ignores_request_without_uuid(self):
+        main._record_replica_poll(self._req(uuid=None))
+        self.assertEqual(main._replica_polls, {})
+
+    def test_ignores_non_changelog_path(self):
+        main._record_replica_poll(self._req(path="/+api"))
+        self.assertEqual(main._replica_polls, {})
+
+    def test_ignores_non_get_method(self):
+        main._record_replica_poll(self._req(method="POST"))
+        self.assertEqual(main._replica_polls, {})
+
+    def test_accepts_changelog_without_trailing_dash(self):
+        # Single-changelog endpoint /+changelog/{N} (no dash) is also
+        # used during initial replica handshakes.
+        main._record_replica_poll(self._req(path="/+changelog/42"))
+        self.assertEqual(
+            main._replica_polls["r1-uuid"]["start_serial"], 42)
+
+
+class ReplicasViewTests(unittest.TestCase):
+    """Verify the /+admin-api/replicas endpoint."""
+
+    def setUp(self):
+        main._replica_polls.clear()
+
+    def tearDown(self):
+        main._replica_polls.clear()
+
+    def _authed_req(self):
+        req = MagicMock()
+        req.authenticated_userid = "alice"
+        req.environ = {}
+        return req
+
+    def test_returns_recorded_polls(self):
+        now = main.time.time()
+        main._replica_polls["r1"] = {
+            "start_serial": 103,
+            "first_seen_at_serial": now - 45,
+            "last_seen": now,
+            "remote_ip": "10.0.0.5",
+            "outside_url": "",
+        }
+        resp = main._replicas_view(self._authed_req())
+        body = json.loads(resp.body)
+        self.assertIn("r1", body["result"])
+        self.assertEqual(body["result"]["r1"]["start_serial"], 103)
+        self.assertEqual(body["result"]["r1"]["applied_serial"], 102)
+        # Stuck for ~45s — the duration the replica has been polling
+        # this same serial without progressing.
+        self.assertGreaterEqual(body["result"]["r1"]["stuck_seconds"], 44)
+
+    def test_drops_stale_entries(self):
+        # Older than TTL → removed at read time
+        now = main.time.time()
+        main._replica_polls["r1"] = {
+            "start_serial": 103,
+            "first_seen_at_serial": now - main._REPLICA_POLL_TTL - 10,
+            "last_seen": now - main._REPLICA_POLL_TTL - 5,
+            "remote_ip": "",
+            "outside_url": "",
+        }
+        resp = main._replicas_view(self._authed_req())
+        body = json.loads(resp.body)
+        self.assertEqual(body["result"], {})
+        self.assertNotIn("r1", main._replica_polls)
+
+    def test_anonymous_rejected(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        req = MagicMock()
+        req.authenticated_userid = None
+        req.environ = {}
+        with self.assertRaises(HTTPForbidden):
+            main._replicas_view(req)
+
+
+class PublicUrlViewTests(unittest.TestCase):
+    """Verify the anonymous /+admin-api/public-url endpoint."""
+
+    def test_returns_application_url_without_trailing_slash(self):
+        req = MagicMock()
+        req.application_url = "https://devpi.example.com/"
+        resp = main._public_url_view(req)
+        body = json.loads(resp.body)
+        self.assertEqual(body, {"url": "https://devpi.example.com"})
+
+    def test_handles_url_without_trailing_slash(self):
+        req = MagicMock()
+        req.application_url = "https://devpi.example.com"
+        resp = main._public_url_view(req)
+        body = json.loads(resp.body)
+        self.assertEqual(body, {"url": "https://devpi.example.com"})
+
+    def test_strips_multiple_trailing_slashes(self):
+        req = MagicMock()
+        req.application_url = "https://devpi.example.com///"
+        resp = main._public_url_view(req)
+        body = json.loads(resp.body)
+        self.assertEqual(body, {"url": "https://devpi.example.com"})
+
+
+class CheckCanIssueTests(unittest.TestCase):
+    """Variant B: root may issue for *others*, never for self.
+
+    Regular users only for themselves. Admin tokens never.
+    """
+
+    def _req(self, *, auth_user, is_admin_token=False):
+        req = MagicMock()
+        req.authenticated_userid = auth_user
+        req.environ = {"adm.is_admin_token": True} if is_admin_token else {}
+        return req
+
+    def test_user_issues_for_self(self):
+        req = self._req(auth_user="alice")
+        self.assertEqual(main._check_can_issue(req, "alice"), "alice")
+
+    def test_user_cannot_issue_for_others(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        req = self._req(auth_user="alice")
+        with self.assertRaises(HTTPForbidden):
+            main._check_can_issue(req, "bob")
+
+    def test_root_issues_for_others(self):
+        req = self._req(auth_user="root")
+        self.assertEqual(main._check_can_issue(req, "alice"), "root")
+
+    def test_root_cannot_issue_for_self(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        req = self._req(auth_user="root")
+        with self.assertRaises(HTTPForbidden):
+            main._check_can_issue(req, "root")
+
+    def test_admin_token_request_cannot_issue(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        req = self._req(auth_user="alice", is_admin_token=True)
+        with self.assertRaises(HTTPForbidden):
+            main._check_can_issue(req, "alice")
+
+    def test_anonymous_cannot_issue(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        req = self._req(auth_user=None)
+        with self.assertRaises(HTTPForbidden):
+            main._check_can_issue(req, "alice")
+
+
+class CheckIndexPermTests(unittest.TestCase):
+
+    def _stage(self, *, acl_read=None, acl_upload=None):
+        stage = MagicMock()
+        stage.ixconfig = {
+            "acl_read": list(acl_read or []),
+            "acl_upload": list(acl_upload or []),
+        }
+        return stage
+
+    def test_read_with_user_in_acl(self):
+        stage = self._stage(acl_read=["alice"])
+        # No exception = pass
+        main._check_index_perm(stage, "alice", "read")
+
+    def test_read_anonymous_in_acl_grants_anyone(self):
+        stage = self._stage(acl_read=[":ANONYMOUS:"])
+        main._check_index_perm(stage, "alice", "read")
+
+    def test_read_authenticated_in_acl_grants_real_users(self):
+        stage = self._stage(acl_read=[":AUTHENTICATED:"])
+        main._check_index_perm(stage, "alice", "read")
+
+    def test_read_user_not_in_acl(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        stage = self._stage(acl_read=["bob"])
+        with self.assertRaises(HTTPForbidden):
+            main._check_index_perm(stage, "alice", "read")
+
+    def test_upload_uses_acl_upload(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        stage = self._stage(acl_read=["alice"], acl_upload=["bob"])
+        with self.assertRaises(HTTPForbidden):
+            main._check_index_perm(stage, "alice", "upload")
+        main._check_index_perm(stage, "bob", "upload")
+
+    def test_invalid_scope(self):
+        from pyramid.httpexceptions import HTTPBadRequest
+        stage = self._stage(acl_read=["alice"])
+        with self.assertRaises(HTTPBadRequest):
+            main._check_index_perm(stage, "alice", "delete")
+
+    def test_specials_case_insensitive(self):
+        # Devpi normalises to upper case, but defend against a record
+        # that slipped in via a custom code path.
+        for spec in (":anonymous:", ":Anonymous:", ":AUTHENTICATED:",
+                      ":authenticated:"):
+            stage = self._stage(acl_read=[spec])
+            main._check_index_perm(stage, "alice", "read")
+
+    def test_unknown_special_does_not_grant(self):
+        from pyramid.httpexceptions import HTTPForbidden
+        # `:STAFF:` or anything else colon-wrapped is not a recognised
+        # principal — must NOT grant access just because it looks like
+        # a special.
+        stage = self._stage(acl_read=[":STAFF:"])
+        with self.assertRaises(HTTPForbidden):
+            main._check_index_perm(stage, "alice", "read")
+
+
+class UserChangedHandlerTests(unittest.TestCase):
+    """Verify INDEX cleanup via USER subscriber diff."""
+
+    def _make_event(self, *, value, back_serial=5, at_serial=6, user="alice"):
+        ev = MagicMock()
+        ev.value = value
+        ev.back_serial = back_serial
+        ev.at_serial = at_serial
+        ev.typedkey.params = {"user": user}
+        return ev
+
+    def test_user_deleted_wipes_all(self):
+        from devpi_admin import tokens as tokmod
+        called = {}
+        original = tokmod.reset_for_user
+        tokmod.reset_for_user = lambda xom, u: called.setdefault("u", u) or 7
+        try:
+            xom = MagicMock()
+            handler = main._make_user_changed_handler(xom)
+            handler(self._make_event(value=None))
+            self.assertEqual(called.get("u"), "alice")
+        finally:
+            tokmod.reset_for_user = original
+
+    def test_index_removed_triggers_index_reset(self):
+        from devpi_admin import tokens as tokmod
+        calls = []
+        original = tokmod.reset_for_index
+        tokmod.reset_for_index = (
+            lambda xom, u, i: calls.append((u, i)) or 2)
+        try:
+            xom = MagicMock()
+            # Stub the previous-value fetch via our helper rather than
+            # plumbing through the real keyfs API.
+            old_indexes_returned = {"dev", "stage", "old"}
+            new_indexes = {"dev"}
+            ev = self._make_event(
+                value={"indexes": {n: {} for n in new_indexes}})
+            # Patch _removed_indexes directly so we don't need to mock
+            # the keyfs read transaction machinery.
+            real_removed = main._removed_indexes
+            main._removed_indexes = (
+                lambda _xom, _ev: old_indexes_returned - new_indexes)
+            try:
+                handler = main._make_user_changed_handler(xom)
+                handler(ev)
+            finally:
+                main._removed_indexes = real_removed
+            self.assertEqual(
+                set(calls), {("alice", "stage"), ("alice", "old")})
+        finally:
+            tokmod.reset_for_index = original
+
+    def test_no_index_change_no_reset(self):
+        from devpi_admin import tokens as tokmod
+        calls = []
+        original = tokmod.reset_for_index
+        tokmod.reset_for_index = (
+            lambda xom, u, i: calls.append((u, i)) or 0)
+        try:
+            xom = MagicMock()
+            real_removed = main._removed_indexes
+            main._removed_indexes = lambda _xom, _ev: set()
+            try:
+                handler = main._make_user_changed_handler(xom)
+                handler(self._make_event(value={"indexes": {"dev": {}}}))
+            finally:
+                main._removed_indexes = real_removed
+            self.assertEqual(calls, [])
+        finally:
+            tokmod.reset_for_index = original
+
+    def test_handler_swallows_exceptions(self):
+        from devpi_admin import tokens as tokmod
+        original = tokmod.reset_for_user
+        tokmod.reset_for_user = MagicMock(side_effect=RuntimeError("boom"))
+        try:
+            xom = MagicMock()
+            handler = main._make_user_changed_handler(xom)
+            # Must not raise — keyfs notifier thread would die otherwise.
+            handler(self._make_event(value=None))
+        finally:
+            tokmod.reset_for_user = original
+
+    def test_back_serial_negative_returns_empty(self):
+        # Creation event for a brand-new user — no previous state to
+        # diff against. Must not call reset_for_index for any index.
+        from devpi_admin import tokens as tokmod
+        calls = []
+        original = tokmod.reset_for_index
+        tokmod.reset_for_index = lambda xom, u, i: calls.append((u, i))
+        try:
+            xom = MagicMock()
+            real_removed = main._removed_indexes
+            # back_serial < 0 short-circuit lives inside _removed_indexes
+            # — let the real implementation run; it should return ∅.
+            try:
+                handler = main._make_user_changed_handler(xom)
+                handler(self._make_event(
+                    value={"indexes": {"dev": {}}}, back_serial=-1))
+            finally:
+                main._removed_indexes = real_removed
+            self.assertEqual(calls, [])
+        finally:
+            tokmod.reset_for_index = original
+
+
+class IndexDeleteEndToEndTests(unittest.TestCase):
+    """Full chain: issue token → user-changed event → lookup must fail.
+
+    Exercises the same in-memory keyfs as test_tokens.py so the cleanup
+    path is verified across all three keyfs keys, not just the ones the
+    handler explicitly touches.
+    """
+
+    def setUp(self):
+        # Reuse the FakeXOM from test_tokens to avoid duplicating
+        # 80 lines of keyfs scaffolding.
+        from tests.test_tokens import _FakeXOM
+        self.xom = _FakeXOM()
+
+    def _issue(self, user, index, scope="read"):
+        from devpi_admin import tokens as tokmod
+        token, _ = tokmod.issue(
+            self.xom, target_user=user, target_index=index,
+            scope=scope, issuer=user, ttl_seconds=3600)
+        return token
+
+    def _user_change_event(self, user, *, new_indexes, back_serial=5,
+                            at_serial=6):
+        ev = MagicMock()
+        ev.value = {"indexes": {n: {} for n in new_indexes}}
+        ev.back_serial = back_serial
+        ev.at_serial = at_serial
+        ev.typedkey.params = {"user": user}
+        return ev
+
+    def test_index_delete_invalidates_token(self):
+        from devpi_admin import tokens as tokmod
+        token = self._issue("alice", "alice/dev")
+        # Sanity: token works before cleanup.
+        self.assertIsNotNone(tokmod.lookup(self.xom, token))
+
+        # Patch _removed_indexes to report 'dev' was the gone index.
+        real_removed = main._removed_indexes
+        main._removed_indexes = lambda _xom, _ev: {"dev"}
+        try:
+            handler = main._make_user_changed_handler(self.xom)
+            ev = self._user_change_event("alice", new_indexes=set())
+            handler(ev)
+        finally:
+            main._removed_indexes = real_removed
+
+        # After the handler, lookup must reject the token because the
+        # token meta itself has been deleted from keyfs.
+        self.assertIsNone(
+            tokmod.lookup(self.xom, token),
+            "token must not authenticate after its bound index was "
+            "removed from USER.indexes")
+
+    def test_index_delete_does_not_affect_other_index(self):
+        from devpi_admin import tokens as tokmod
+        dev_token = self._issue("alice", "alice/dev")
+        stage_token = self._issue("alice", "alice/staging")
+
+        real_removed = main._removed_indexes
+        main._removed_indexes = lambda _xom, _ev: {"dev"}
+        try:
+            handler = main._make_user_changed_handler(self.xom)
+            ev = self._user_change_event(
+                "alice", new_indexes={"staging"})
+            handler(ev)
+        finally:
+            main._removed_indexes = real_removed
+
+        self.assertIsNone(tokmod.lookup(self.xom, dev_token))
+        self.assertIsNotNone(
+            tokmod.lookup(self.xom, stage_token),
+            "tokens for alice/staging must survive deletion of alice/dev")
+
+    def test_user_delete_invalidates_all_user_tokens(self):
+        from devpi_admin import tokens as tokmod
+        t1 = self._issue("alice", "alice/dev")
+        t2 = self._issue("alice", "alice/staging", scope="upload")
+        # Sibling user's token must NOT be touched.
+        bob_token = self._issue("bob", "bob/own")
+
+        ev = MagicMock()
+        ev.value = None
+        ev.back_serial = 5
+        ev.at_serial = 6
+        ev.typedkey.params = {"user": "alice"}
+
+        handler = main._make_user_changed_handler(self.xom)
+        handler(ev)
+
+        # Drop alice from the model so lookup also fails the user-exists
+        # check (matches what would happen in real devpi after USER del).
+        self.xom._users.discard("alice")
+
+        self.assertIsNone(tokmod.lookup(self.xom, t1))
+        self.assertIsNone(tokmod.lookup(self.xom, t2))
+        self.assertIsNotNone(
+            tokmod.lookup(self.xom, bob_token),
+            "bob's tokens must survive alice's deletion")
 
 
 if __name__ == "__main__":

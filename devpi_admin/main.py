@@ -39,12 +39,28 @@ _log = logging.getLogger(__name__)
 _USER_PATH_RE = re.compile(r"^/([^/+][^/]*)/?$")
 _INDEX_ANY_RE = re.compile(r"^/([^/+][^/]*)/([^/+][^/]*)(/.*)?$")
 
-# Paths that an admin-token request is permitted to GET. Anything else is
-# blocked: management pages (`/`, `/+admin*`, `/+admin-api/*`, `/+status`),
-# the user resource itself, and any non-GET method (no upload, no
-# password change, no `/+login` exchange, no nested token issuance).
-_TOKEN_ALLOWED_PATH_RE = re.compile(
-    r"^/(\+api/?|[^/+][^/]*/[^/+][^/]*(/.*)?)$")
+# Method matrix per token scope. ``read`` is for pip / devpi download;
+# ``upload`` adds POST/PUT for package upload via ``twine`` / ``devpi upload``.
+# DELETE is never granted — package removal must use password auth so an
+# isolated upload token cannot wipe history.
+_SCOPE_METHODS = {
+    "read": frozenset({"GET", "HEAD"}),
+    "upload": frozenset({"GET", "HEAD", "POST", "PUT"}),
+}
+
+# In-memory record of every replica's most recent /+changelog/{N}- poll.
+# devpi-server's xom.polling_replicas[uuid].serial is overwritten during
+# streaming (it ramps from start_serial-1 up to current serial as the
+# response generator yields entries), so the original start_serial — the
+# only serial that reflects what the replica actually applied — is
+# visible only for microseconds. We capture it at the request boundary
+# from the tween before devpi's view runs.
+_CHANGELOG_PATH_RE = re.compile(r"^/\+changelog/(\d+)-?$")
+_H_REPLICA_UUID = "X-DEVPI-REPLICA-UUID"
+_H_REPLICA_OUTSIDE_URL = "X-DEVPI-REPLICA-OUTSIDE-URL"
+_REPLICA_POLL_TTL = 600  # drop entries unseen for 10 min
+_REPLICA_POLL_MAX = 256  # hard cap to bound memory under abuse
+_replica_polls = {}  # uuid -> {start_serial, last_seen, remote_ip, outside_url}
 
 
 @hookimpl
@@ -72,24 +88,32 @@ def devpiserver_get_identity(request, credentials):
     Returns CredentialsIdentity if the credentials carry a valid admin
     token. Returns None otherwise so devpi's default identity hook handles
     standard tokens/passwords. Sets request.environ["adm.is_admin_token"]
-    so the tween can apply read-only / no-escalation enforcement.
+    so the tween can apply scope / index enforcement.
+
+    The tween populates ``adm.token_meta`` from its own lookup before
+    invoking the handler; if it's already there we trust that record
+    instead of re-reading from keyfs. Falls back to a fresh lookup for
+    paths that bypass the tween (e.g. unit tests).
     """
     if credentials is None:
         return None
     user, secret = credentials
     if not tokens.looks_like_token(secret):
         return None
-    xom = request.registry.get("xom")
-    if xom is None:
-        return None
-    meta = tokens.lookup(xom, secret)
+    meta = request.environ.get("adm.token_meta")
     if meta is None:
-        return None
+        xom = request.registry.get("xom")
+        if xom is None:
+            return None
+        meta = tokens.lookup(xom, secret)
+        if meta is None:
+            return None
     if meta.get("user") != user:
         # token's bound user must match the authentication header user
         return None
     request.environ["adm.is_admin_token"] = True
     request.environ["adm.token_user"] = user
+    request.environ["adm.token_meta"] = meta
     return CredentialsIdentity(user, [])
 
 
@@ -99,18 +123,19 @@ def devpiserver_pyramid_configure(config, pyramid_config):
     xom = pyramid_config.registry.get("xom")
     if xom is not None:
         tokens.register_keyfs_keys(xom.keyfs)
-        # Clean up tokens when a user is deleted. Only on primary —
-        # replicas are read-only.
+        # Clean up tokens when a user is deleted, and when an index is
+        # removed from a user's config. Only on primary — replicas are
+        # read-only.
         role = getattr(xom.config, "role", "primary")
         if role != "replica":
-            xom.keyfs.USER.on_key_change(_make_user_deleted_handler(xom))
-            # One-shot wipe of legacy (pre-hash) admin tokens. Idempotent;
-            # safe to run on every startup.
+            xom.keyfs.USER.on_key_change(_make_user_changed_handler(xom))
+            # One-shot wipe of legacy admin tokens (pre-hash storage or
+            # missing index/scope). Idempotent; safe on every startup.
             try:
-                tokens.cleanup_pre_hash_tokens(xom)
+                tokens.cleanup_legacy_tokens(xom)
             except Exception:
                 _log.warning(
-                    "cleanup_pre_hash_tokens at startup failed",
+                    "cleanup_legacy_tokens at startup failed",
                     exc_info=True)
     # Serve bundled static assets (index.html, css/, js/) under /+admin/.
     pyramid_config.add_static_view(
@@ -133,6 +158,31 @@ def devpiserver_pyramid_configure(config, pyramid_config):
         "/+admin-api/session")
     pyramid_config.add_view(
         _session_view, route_name="devpi_admin_session",
+        request_method="GET")
+
+    # Public URL (anonymously accessible). Single source of truth for
+    # the canonical "outside" URL — both backend (token issuance views)
+    # and frontend (static pip.conf / .pypirc fallbacks) derive their
+    # URLs from request.application_url, which respects --outside-url
+    # and X-Forwarded-* headers from a configured reverse proxy. Without
+    # this, the frontend's location.origin can disagree with backend
+    # output if the deployment doesn't propagate X-Forwarded-Host etc.
+    pyramid_config.add_route(
+        "devpi_admin_public_url",
+        "/+admin-api/public-url")
+    pyramid_config.add_view(
+        _public_url_view, route_name="devpi_admin_public_url",
+        request_method="GET")
+
+    # Authoritative per-replica state. Captures the start_serial of each
+    # replica's most recent /+changelog/{N}- poll via the tween, so the
+    # dashboard can read where the replica really is — devpi-server's
+    # own polling_replicas overwrites this during streaming and gives a
+    # misleading "caught up" reading once the response generator drains.
+    pyramid_config.add_route(
+        "devpi_admin_replicas", "/+admin-api/replicas")
+    pyramid_config.add_view(
+        _replicas_view, route_name="devpi_admin_replicas",
         request_method="GET")
 
     # Cached packages API for mirror indexes.
@@ -183,6 +233,14 @@ def devpiserver_pyramid_configure(config, pyramid_config):
     pyramid_config.add_view(
         _reset_tokens_view, route_name="devpi_admin_user_tokens",
         request_method="DELETE")
+
+    # Token list per index — root sees all, non-root sees own only.
+    pyramid_config.add_route(
+        "devpi_admin_index_tokens",
+        "/+admin-api/indexes/{user}/{index}/tokens")
+    pyramid_config.add_view(
+        _list_index_tokens_view, route_name="devpi_admin_index_tokens",
+        request_method="GET")
 
     # Single token revoke.
     pyramid_config.add_route(
@@ -235,6 +293,17 @@ def _session_view(request):
     if user:
         return _json_response({"valid": True, "user": user})
     raise HTTPForbidden(json_body={"valid": False, "error": "not authenticated"})
+
+
+def _public_url_view(request):
+    """Return the canonical public URL of this devpi-admin deployment.
+
+    Anonymous-accessible — the URL itself is not a secret, and public
+    indexes need it for their static pip.conf / .pypirc preview shown
+    even to unauthenticated visitors. Trailing slash stripped so callers
+    can append paths without producing ``//``.
+    """
+    return _json_response({"url": request.application_url.rstrip("/")})
 
 
 def _get_stage_or_404(xom, user, index):
@@ -478,14 +547,29 @@ def devpi_admin_tween_factory(handler, registry):
     xom = registry["xom"]
 
     def tween(request):
+        # Capture replica /+changelog/{N}- polls. Cheap regex on path;
+        # no-op for non-replica traffic. Runs before any other tween
+        # logic so we record the request even if subsequent enforcement
+        # short-circuits (it shouldn't for replica polls, but defensive).
+        _record_replica_poll(request)
+
         # Detect admin token directly from header instead of forcing
         # request.identity to load. Pyramid caches identity per-request,
         # and POST /+login mutates X-Devpi-Auth mid-request — pre-loading
         # here would pin a stale (None) identity and break login.
-        if _request_carries_admin_token(request):
-            denied = _admin_token_check(request)
-            if denied is not None:
-                return denied
+        token_secret = _extract_admin_token_secret(request)
+        if token_secret is not None:
+            meta = tokens.lookup(xom, token_secret)
+            if meta is not None:
+                # Cache for the identity hook so it doesn't re-read keyfs.
+                request.environ["adm.token_meta"] = meta
+                request.environ["adm.is_admin_token"] = True
+                denied = _admin_token_check(request, meta)
+                if denied is not None:
+                    return denied
+            # Invalid/expired token: let the identity hook return None and
+            # devpi produce its own 401 — no scope enforcement needed for
+            # an unauthenticated request.
 
         if request.method == "GET":
             if request.path == "/" and _wants_html(request):
@@ -504,11 +588,14 @@ def devpi_admin_tween_factory(handler, registry):
     return tween
 
 
-def _request_carries_admin_token(request):
-    """Return True iff the X-Devpi-Auth or Basic auth header carries an adm_ token.
+def _extract_admin_token_secret(request):
+    """Return the admin token secret from the auth headers, or None.
 
-    This inspects the credential string by prefix without invoking pyramid's
-    identity loading (which caches per-request and breaks /+login flow).
+    Inspects ``X-Devpi-Auth`` first, then falls back to RFC 7617 ``Basic``
+    auth. Validates the prefix/format without invoking pyramid identity
+    loading — pyramid caches identity per-request, and ``/+login`` mutates
+    ``X-Devpi-Auth`` mid-request, so a premature load would pin a stale
+    identity.
     """
     raw = request.headers.get("X-Devpi-Auth") or ""
     if not raw:
@@ -517,44 +604,73 @@ def _request_carries_admin_token(request):
         if auth[:6].lower() == "basic ":
             raw = auth[6:]
     if not raw:
-        return False
+        return None
     try:
         decoded = base64.b64decode(raw, validate=False).decode("utf-8", "replace")
     except Exception:
-        return False
+        return None
     if ":" not in decoded:
-        return False
+        return None
     _, secret = decoded.split(":", 1)
-    return tokens.looks_like_token(secret)
+    if not tokens.looks_like_token(secret):
+        return None
+    return secret
 
 
-def _admin_token_check(request):
-    """Restrict admin-token requests to read-only access on index/archive paths.
+def _request_carries_admin_token(request):
+    """Return True iff the request auth headers carry an adm_ token.
 
-    Admin tokens exist for one purpose: machine reads of indexes and package
-    archives (pip install, devpi download). They MUST NOT be usable for:
-    user/index management, package upload, ``/+login`` exchange, SPA pages,
-    nested admin-api calls (incl. issuing further tokens), or status/admin
-    introspection.
-
-    Rules:
-    * Only ``GET`` / ``HEAD`` is allowed.
-    * The path must be ``/+api`` (devpi client discovery) or fall under
-      ``/<user>/<index>/...``. Single-segment paths (``/``, ``/<user>``),
-      everything under ``/+admin*`` and ``/+admin-api/*``, ``/+login``,
-      ``/+status`` etc. are denied.
+    Thin wrapper kept for tests / callers that only need a boolean.
     """
-    if request.method not in ("GET", "HEAD"):
+    return _extract_admin_token_secret(request) is not None
+
+
+def _admin_token_check(request, token_meta):
+    """Restrict admin-token requests by scope and bound index.
+
+    A token carries a ``scope`` (``read`` / ``upload``) and is bound to a
+    specific ``user/index``. The tween enforces:
+
+    * Method matrix per scope — see ``_SCOPE_METHODS``. ``DELETE`` is
+      never granted; package removal must use password auth so a stolen
+      upload token cannot wipe history.
+    * URL must be ``/+api`` (devpi client discovery) or under the bound
+      ``/<user>/<index>/...``. A token bound to ``alice/dev`` cannot
+      reach ``/bob/prod`` or any management endpoint (``/+admin*``,
+      ``/+admin-api/*``, ``/+login``, ``/+status``, ``/<user>``).
+
+    Returns ``None`` to allow, or an HTTPForbidden response to deny.
+    """
+    scope = token_meta.get("scope")
+    allowed = _SCOPE_METHODS.get(scope)
+    if allowed is None:
         return HTTPForbidden(json_body={
-            "error": "admin token is read-only — use password auth for "
-                     "writes and management",
+            "error": f"admin token has unknown scope {scope!r}",
         })
-    if not _TOKEN_ALLOWED_PATH_RE.match(request.path):
+    if request.method not in allowed:
         return HTTPForbidden(json_body={
-            "error": "admin token may only access /+api or "
-                     "/<user>/<index>/... (index data and archives)",
+            "error": f"admin token (scope={scope}) does not allow "
+                     f"method {request.method}",
         })
-    return None
+
+    path = request.path
+    # /+api is always allowed — devpi client discovery, leaks no data.
+    if path == "/+api" or path == "/+api/":
+        return None
+
+    bound = token_meta.get("index", "")
+    if "/" not in bound:
+        # Defensive: lookup() should already reject metas without `index`.
+        return HTTPForbidden(json_body={
+            "error": "admin token has no bound index",
+        })
+    # Match exactly /<user>/<index> or /<user>/<index>/...
+    prefix = "/" + bound
+    if path == prefix or path.startswith(prefix + "/"):
+        return None
+    return HTTPForbidden(json_body={
+        "error": f"admin token bound to {bound} cannot access {path}",
+    })
 
 
 def _user_listing_check(request):
@@ -660,6 +776,95 @@ def _filter_root_listing(request, response, xom):
     return response
 
 
+def _record_replica_poll(request):
+    """Record a replica's most recent /+changelog/{N}- poll.
+
+    Stores ``start_serial`` (the value the replica is asking the master
+    for) keyed by replica UUID. The replica polls ``/+changelog/N-`` to
+    fetch from serial N onwards, which means it has already applied
+    serials 0..N-1. The displayed *applied* serial is therefore N-1.
+
+    Also tracks ``first_seen_at_serial`` — when we first observed this
+    exact ``start_serial`` for this replica. If the replica keeps polling
+    the same serial for many seconds, replication is stuck (typically a
+    plugin mismatch making import_changes fail).
+    """
+    if request.method != "GET":
+        return
+    m = _CHANGELOG_PATH_RE.match(request.path)
+    if m is None:
+        return
+    uuid = request.headers.get(_H_REPLICA_UUID)
+    if not uuid:
+        return
+    serial = int(m.group(1))
+    now = time.time()
+    prev = _replica_polls.get(uuid)
+    if prev and prev.get("start_serial") == serial:
+        first_seen = prev.get("first_seen_at_serial", now)
+    else:
+        first_seen = now
+    _replica_polls[uuid] = {
+        "start_serial": serial,
+        "first_seen_at_serial": first_seen,
+        "last_seen": now,
+        "remote_ip": request.client_addr or "",
+        "outside_url": request.headers.get(_H_REPLICA_OUTSIDE_URL) or "",
+    }
+    # Bound dict size — /+changelog/ is anonymously reachable in devpi,
+    # so a malicious caller could spam unique UUIDs to exhaust memory.
+    # Cleanup expired entries first; if still over the cap, evict the
+    # least-recently-seen entry. Real deployments stay well under the
+    # cap (one entry per real replica).
+    if len(_replica_polls) > _REPLICA_POLL_MAX:
+        cutoff = now - _REPLICA_POLL_TTL
+        for k in list(_replica_polls.keys()):
+            if _replica_polls[k]["last_seen"] < cutoff:
+                del _replica_polls[k]
+        while len(_replica_polls) > _REPLICA_POLL_MAX:
+            oldest = min(
+                _replica_polls,
+                key=lambda k: _replica_polls[k]["last_seen"])
+            del _replica_polls[oldest]
+
+
+def _replicas_view(request):
+    """GET /+admin-api/replicas — last-poll info per replica.
+
+    Authoritative readout of where each replica is. The ``applied_serial``
+    field is the highest serial the replica claims to have applied
+    (start_serial - 1 from its most recent /+changelog/{N}- request).
+    Compare against ``status.serial`` from /+status to detect stuck
+    replicas reliably — no sampling, no heuristics.
+
+    Auth required: replica UUIDs / outside URLs are operational
+    metadata, not for anonymous consumption.
+    """
+    _require_authenticated(request)
+    now = time.time()
+    cutoff = now - _REPLICA_POLL_TTL
+    result = {}
+    for uuid in list(_replica_polls.keys()):
+        info = _replica_polls[uuid]
+        if info["last_seen"] < cutoff:
+            del _replica_polls[uuid]
+            continue
+        first_seen = info.get("first_seen_at_serial", info["last_seen"])
+        result[uuid] = {
+            "start_serial": info["start_serial"],
+            "applied_serial": info["start_serial"] - 1,
+            "last_seen": info["last_seen"],
+            "remote_ip": info["remote_ip"],
+            "outside_url": info["outside_url"],
+            "age_seconds": int(now - info["last_seen"]),
+            # How long the replica has been polling THIS exact serial.
+            # If high (> a few poll cycles) and non-zero lag, replica
+            # cannot apply the changelog entry it just fetched.
+            "stuck_seconds": int(now - first_seen),
+        }
+    return _json_response({"result": result})
+
+
 def _wants_html(request):
     accept = request.headers.get("Accept") or ""
     if not accept:
@@ -674,29 +879,64 @@ def _wants_html(request):
 # --- Token endpoints ---
 
 
-def _make_user_deleted_handler(xom):
-    """Subscriber for USER key changes — cleans up tokens on user deletion.
+def _make_user_changed_handler(xom):
+    """Subscriber for USER key changes — cleans tokens on user/index removal.
 
-    Runs in the keyfs notifier thread, after the deleting transaction commits.
-    Only delete events (value is None) trigger cleanup; password/email changes
-    leave tokens intact.
+    Runs in the keyfs notifier thread, after the transaction commits.
+
+    * USER deleted (value is None) → wipe all tokens for that user.
+    * USER mutated (e.g. ``DELETE /<user>/<index>``) → diff old vs new
+      ``indexes`` dict; for each index that disappeared, wipe its tokens.
+
+    Index removal isn't a separate keyfs key in devpi — the index lives
+    inside USER.config['indexes'] — so we detect it by comparing the new
+    USER value with the previous one fetched at ``ev.back_serial`` (same
+    technique used by ``devpi_server.model.on_userchange``).
     """
     def _handler(ev):
-        if ev.value is not None:
-            return
         username = ev.typedkey.params.get("user")
         if not username:
             return
         try:
-            count = tokens.reset_for_user(xom, username)
-            if count:
-                _log.info(
-                    "cleaned up %d admin token(s) for deleted user %s",
-                    count, username)
+            if ev.value is None:
+                count = tokens.reset_for_user(xom, username)
+                if count:
+                    _log.info(
+                        "cleaned up %d admin token(s) for deleted user %s",
+                        count, username)
+                return
+            removed = _removed_indexes(xom, ev)
+            for idx_name in removed:
+                count = tokens.reset_for_index(xom, username, idx_name)
+                if count:
+                    _log.info(
+                        "cleaned up %d admin token(s) for deleted "
+                        "index %s/%s",
+                        count, username, idx_name)
         except Exception:
             _log.exception(
-                "admin token cleanup failed for deleted user %s", username)
+                "admin token cleanup failed for user=%s", username)
     return _handler
+
+
+def _removed_indexes(xom, ev):
+    """Return index names present in the previous USER value but not the new."""
+    new_indexes = set((ev.value.get("indexes") or {}).keys())
+    if ev.back_serial < 0:
+        return set()
+    keyfs = xom.keyfs
+    try:
+        with keyfs.read_transaction(at_serial=ev.at_serial) as tx:
+            try:
+                old = tx.get_value_at(ev.typedkey, ev.back_serial)
+            except KeyError:
+                return set()
+    except Exception:
+        _log.warning(
+            "could not fetch previous USER value for diff", exc_info=True)
+        return set()
+    old_indexes = set((old.get("indexes") or {}).keys()) if old else set()
+    return old_indexes - new_indexes
 
 
 def _is_replica(xom):
@@ -725,11 +965,16 @@ def _validate_name(value, kind):
 def _check_can_issue(request, target_user):
     """Permission rule for token *issuance*.
 
-    Only regular users may issue tokens, and only for themselves. Root is
-    forbidden from issuing tokens entirely — a leaked root token would have
-    full server-wide privileges. Requests already authenticated via an admin
-    token are also rejected, so a leaked token cannot mint successor tokens
-    and outlive its TTL.
+    * Regular user → may issue tokens for themselves only.
+    * Root → may issue tokens for **any other** user (admin delegation: hand
+      a CI account a token without that account having to log in). Root may
+      NOT issue tokens for itself; a token bound to root would carry
+      server-wide privileges via devpi's special root ACL handling.
+    * Admin-token requests → never; a stolen token must not be able to
+      mint successors and outlive its TTL.
+
+    Tokens are also bound to a specific index (validated separately in
+    ``_check_index_perm``); this function only governs *who* may issue.
     """
     auth_user = _require_authenticated(request)
     if request.environ.get("adm.is_admin_token"):
@@ -738,15 +983,51 @@ def _check_can_issue(request, target_user):
                      "authenticate with a password",
         })
     if auth_user == "root":
-        raise HTTPForbidden(json_body={
-            "error": "root may not issue admin tokens; "
-                     "create a regular user account for automation",
-        })
+        if target_user == "root":
+            raise HTTPForbidden(json_body={
+                "error": "root may not issue tokens for itself",
+            })
+        return auth_user
     if auth_user != target_user:
         raise HTTPForbidden(json_body={
             "error": "users can only issue tokens for themselves",
         })
     return auth_user
+
+
+def _check_index_perm(stage, target_user, scope):
+    """Verify ``target_user`` has the given ``scope`` permission on the index.
+
+    We can't use ``request.has_permission`` here because root may issue for
+    a third party — ``has_permission`` evaluates against the *authenticated*
+    identity, which would be root. Instead we read the ACL list directly
+    and check membership, mirroring devpi's own principal logic without
+    the implicit root-grants-itself-read shortcut (which doesn't apply to
+    a non-root token-bearer anyway).
+
+    ``:ANONYMOUS:`` and ``:AUTHENTICATED:`` grant transitively to any
+    real user, so they pass the check. Devpi's ``ensure_acl_list``
+    normalises specials to upper case at write time, but we case-fold
+    here defensively in case a record was written via another path.
+    """
+    if scope == "read":
+        principals = stage.ixconfig.get("acl_read", [])
+    elif scope == "upload":
+        principals = stage.ixconfig.get("acl_upload", [])
+    else:
+        raise HTTPBadRequest(json_body={"error": f"invalid scope: {scope!r}"})
+    principals = list(principals) if principals else []
+    upper_specials = {
+        p.upper() for p in principals
+        if isinstance(p, str) and p.startswith(":") and p.endswith(":")}
+    if (":ANONYMOUS:" in upper_specials
+            or ":AUTHENTICATED:" in upper_specials
+            or target_user in principals):
+        return
+    raise HTTPForbidden(json_body={
+        "error": f"user {target_user!r} does not have {scope} permission "
+                 f"on this index",
+    })
 
 
 def _check_can_manage(request, target_user):
@@ -915,6 +1196,8 @@ def _issue_token_view(request):
 
     Body (JSON): {
         "user": "gitea-ci",          # optional, default = authenticated
+        "index": "gitea-ci/dev",     # required: bound 'user/index'
+        "scope": "read",             # required: 'read' or 'upload'
         "ttl_seconds": 3600,         # optional, default 1h, max 1y
         "label": "build-ci"          # optional
     }
@@ -934,6 +1217,25 @@ def _issue_token_view(request):
     if xom.model.get_user(target) is None:
         raise HTTPNotFound(
             json_body={"error": f"user {target!r} does not exist"})
+
+    index = body.get("index", "")
+    if not isinstance(index, str) or "/" not in index:
+        raise HTTPBadRequest(
+            json_body={"error": "index must be 'user/index'"})
+    idx_user, idx_name = index.split("/", 1)
+    _validate_name(idx_user, "user")
+    _validate_name(idx_name, "index")
+    stage = xom.model.getstage(idx_user, idx_name)
+    if stage is None:
+        raise HTTPNotFound(
+            json_body={"error": f"index {index!r} does not exist"})
+
+    scope = body.get("scope", "read")
+    if scope not in tokens.VALID_SCOPES:
+        raise HTTPBadRequest(json_body={
+            "error": f"scope must be one of {list(tokens.VALID_SCOPES)}",
+        })
+    _check_index_perm(stage, target, scope)
 
     ttl = body.get("ttl_seconds", tokens.DEFAULT_TTL)
     try:
@@ -956,11 +1258,14 @@ def _issue_token_view(request):
 
     token, meta = tokens.issue(
         xom,
-        target_user=target, issuer=auth_user, ttl_seconds=ttl,
+        target_user=target, target_index=index, scope=scope,
+        issuer=auth_user, ttl_seconds=ttl,
         label=label, client_ip=_client_ip(request))
     response = {
         "token": token,
         "user": meta["user"],
+        "index": meta["index"],
+        "scope": meta["scope"],
         "issued_at": meta["issued_at"],
         "expires_at": meta["expires_at"],
         "label": meta["label"],
@@ -1016,9 +1321,13 @@ def _pip_conf_view(request):
     idx_user, idx_name = index.split("/", 1)
     _validate_name(idx_user, "user")
     _validate_name(idx_name, "index")
-    if xom.model.getstage(idx_user, idx_name) is None:
+    stage = xom.model.getstage(idx_user, idx_name)
+    if stage is None:
         raise HTTPNotFound(
             json_body={"error": f"index {index!r} does not exist"})
+    # pip.conf is always a read-scope token (pip never uploads). Verify the
+    # bound user has read on the target index, mirroring _issue_token_view.
+    _check_index_perm(stage, target, "read")
 
     try:
         ttl = int(request.params.get("ttl", tokens.DEFAULT_TTL))
@@ -1034,7 +1343,8 @@ def _pip_conf_view(request):
 
     token, _meta = tokens.issue(
         xom,
-        target_user=target, issuer=auth_user, ttl_seconds=ttl,
+        target_user=target, target_index=index, scope="read",
+        issuer=auth_user, ttl_seconds=ttl,
         label=label, client_ip=_client_ip(request))
     if wait_seconds > 0:
         _wait_for_replicas(xom, wait_seconds)
@@ -1058,20 +1368,56 @@ def _list_tokens_view(request):
     _validate_name(target, "user")
     _check_can_manage(request, target)
     items = tokens.list_for_user(xom, target)
-    result = []
+    result = [_format_token_record(tid, meta) for tid, meta in items]
+    return _json_response({"result": result, "count": len(result)})
+
+
+def _format_token_record(tid, meta):
     now = int(time.time())
-    for tid, meta in items:
-        result.append({
-            "id": tid,
-            "id_short": tid[:8],
-            "user": meta.get("user"),
-            "issuer": meta.get("issuer"),
-            "issued_at": meta.get("issued_at"),
-            "expires_at": meta.get("expires_at"),
-            "expires_in": max(0, int(meta.get("expires_at", 0) - now)),
-            "label": meta.get("label", ""),
-            "client_ip": meta.get("client_ip", ""),
+    return {
+        "id": tid,
+        "id_short": tid[:8],
+        "user": meta.get("user"),
+        "index": meta.get("index", ""),
+        "scope": meta.get("scope", ""),
+        "issuer": meta.get("issuer"),
+        "issued_at": meta.get("issued_at"),
+        "expires_at": meta.get("expires_at"),
+        "expires_in": max(0, int(meta.get("expires_at", 0) - now)),
+        "label": meta.get("label", ""),
+        "client_ip": meta.get("client_ip", ""),
+    }
+
+
+def _list_index_tokens_view(request):
+    """GET /+admin-api/indexes/{user}/{index}/tokens
+
+    List active tokens bound to this index. Visibility:
+    * root → all tokens for this index
+    * non-root → only tokens issued by / for the requester
+    Anyone without ``pkg_read`` on the index gets 404 (hide existence).
+    """
+    xom = request.registry["xom"]
+    auth_user = _require_authenticated(request)
+    if request.environ.get("adm.is_admin_token"):
+        raise HTTPForbidden(json_body={
+            "error": "admin tokens cannot list tokens",
         })
+    idx_user = request.matchdict["user"]
+    idx_name = request.matchdict["index"]
+    _validate_name(idx_user, "user")
+    _validate_name(idx_name, "index")
+    stage = xom.model.getstage(idx_user, idx_name)
+    if stage is None:
+        raise HTTPNotFound(json_body={"error": "index not found"})
+    if not request.has_permission("pkg_read", context=stage):
+        # Hide existence from anyone without read access.
+        raise HTTPNotFound(json_body={"error": "index not found"})
+    items = tokens.list_for_index(xom, idx_user, idx_name)
+    if auth_user != "root":
+        items = [(tid, meta) for tid, meta in items
+                 if meta.get("user") == auth_user]
+    result = [_format_token_record(tid, meta) for tid, meta in items]
     return _json_response({"result": result, "count": len(result)})
 
 

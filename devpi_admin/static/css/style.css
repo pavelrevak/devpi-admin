@@ -153,7 +153,17 @@ body {
     color: var(--text);
     font-size: 1.1em;
     white-space: nowrap;
+    transition: color 0.3s ease;
 }
+
+/* Topbar health indicator — coloured by background poll of /+status. */
+.logo-health-green { color: #16a34a; }
+.logo-health-orange { color: #b45309; }
+.logo-health-red { color: #dc2626; }
+
+[data-theme="dark"] .logo-health-green { color: #4ade80; }
+[data-theme="dark"] .logo-health-orange { color: #fbbf24; }
+[data-theme="dark"] .logo-health-red { color: #f87171; }
 
 #main-nav {
     margin-left: auto;
@@ -326,6 +336,16 @@ body {
     color: var(--text);
     display: flex;
     align-items: center;
+}
+
+/* Topbar buttons share the same height even though their content
+   (icon vs. text-only vs. user/logout pair) differs. Without this the
+   theme-toggle (taller, 16px icon + 6px padding) and the login button
+   (.btn-small, 12px text + 4px padding) end up visibly mismatched. */
+.header-right .btn,
+.header-right .theme-btn {
+    box-sizing: border-box;
+    min-height: 30px;
 }
 
 .theme-btn:hover {
@@ -566,6 +586,11 @@ body {
     transition: opacity 0.6s ease-out;
 }
 
+.pipconf-notice-error {
+    color: #c0392b;
+    font-weight: 600;
+}
+
 .pipconf-notice-fade {
     opacity: 0;
 }
@@ -611,6 +636,15 @@ body {
     color: var(--accent-hover);
 }
 
+.tokens-table-wrap {
+    /* Fallback for narrow viewports: when columns can't shrink any
+       further, scroll horizontally inside the modal instead of forcing
+       the modal itself to overflow. */
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -4px;  /* small bleed so scroll edge doesn't crowd buttons */
+}
+
 .tokens-table {
     width: 100%;
     border-collapse: collapse;
@@ -622,6 +656,11 @@ body {
     padding: 6px 10px;
     border-bottom: 1px solid var(--border-light);
     text-align: left;
+    vertical-align: top;
+    /* No wrapping — overflow is handled by the .tokens-table-wrap
+       horizontal scroll. Wrapping makes labels span 4–5 lines and
+       the table looks ragged. */
+    white-space: nowrap;
 }
 
 .tokens-table th {
@@ -637,6 +676,28 @@ body {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px;
     color: var(--text-faint);
+}
+
+.token-scope {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: var(--border-light);
+    color: var(--text-muted);
+}
+
+.token-scope-read {
+    background: rgba(56, 132, 255, 0.15);
+    color: #2461c5;
+}
+
+.token-scope-upload {
+    background: rgba(214, 130, 17, 0.15);
+    color: #b8650b;
 }
 
 .tokens-empty {
@@ -791,6 +852,28 @@ body {
     color: #fbbf24;
 }
 
+.tag-world-writable {
+    background: #fee2e2;
+    color: #991b1b;
+    font-weight: 600;
+}
+
+[data-theme="dark"] .tag-world-writable {
+    background: #450a0a;
+    color: #fca5a5;
+}
+
+.tag-no-upload {
+    background: #e5e7eb;
+    color: #4b5563;
+    font-style: italic;
+}
+
+[data-theme="dark"] .tag-no-upload {
+    background: #1f2937;
+    color: #9ca3af;
+}
+
 .tag-upstream {
     background: #ede9fe;
     color: #6d28d9;
@@ -834,6 +917,10 @@ body {
     border: 1px solid var(--border);
 }
 
+.modal-wide {
+    max-width: 920px;
+}
+
 .modal-header {
     display: flex;
     align-items: center;
@@ -875,6 +962,22 @@ body {
     margin-top: 4px;
     font-size: 11px;
     color: var(--text-muted);
+}
+
+.modal-body .form-hint-warn {
+    border: 1px solid #fca5a5;
+    background: #fef2f2;
+    color: #991b1b;
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    margin-bottom: 12px;
+}
+
+[data-theme="dark"] .modal-body .form-hint-warn {
+    background: #1f0a0a;
+    border-color: #7f1d1d;
+    color: #fca5a5;
 }
 
 .modal-body label {
@@ -1632,6 +1735,53 @@ body {
     background: color-mix(in srgb, var(--danger) 15%, transparent);
     color: var(--danger);
 }
+
+.replica-sync {
+    font-weight: 500;
+}
+
+.replica-sync-in-sync {
+    color: var(--success);
+}
+
+.replica-sync-lagging {
+    color: #b45309;
+    font-weight: 600;
+}
+
+[data-theme="dark"] .replica-sync-lagging {
+    color: #fbbf24;
+}
+
+.replica-sync-stuck {
+    color: #dc2626;
+    font-weight: 700;
+}
+
+[data-theme="dark"] .replica-sync-stuck {
+    color: #f87171;
+}
+
+.replica-sync-no-data {
+    color: #b45309;
+    font-style: italic;
+}
+
+[data-theme="dark"] .replica-sync-no-data {
+    color: #fbbf24;
+}
+
+.replica-stuck-hint {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+    color: var(--danger);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
 
 .status-row {
     display: flex;
