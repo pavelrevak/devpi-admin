@@ -48,6 +48,8 @@ talks to the standard devpi JSON API directly.
 - `bases` editor with drag & drop priority ordering and transitive inheritance display
 - `acl_upload` and `acl_read` tag pickers with user selection dropdown
 - `volatile`, `mirror_url`, `title` configuration
+- **Mirror package allow/deny lists** (`package_allowlist`, `package_denylist`) — see
+  *Mirror access control* below
 
 ### Read access control (`acl_read`)
 - Per-index list of principals allowed to read the index (download packages, browse simple)
@@ -58,6 +60,31 @@ talks to the standard devpi JSON API directly.
 - Enforced natively by devpi via the `pkg_read` permission on every download path,
   plus a tween that filters out invisible indexes from the root listing (`GET /`)
   and rejects direct access to private indexes with 404
+
+### Mirror access control (allow/deny lists)
+- Per-mirror `package_allowlist` and `package_denylist` filter the projects, versions
+  and simple-index links served from upstream. Only `type=mirror` indexes carry
+  these fields; stage indexes are unaffected
+- **Empty allowlist** = pass-through (everything allowed except denylist).
+  **Non-empty allowlist** = whitelist mode (only listed entries reach pip)
+- **Denylist always wins** — overrides any allowlist match
+- Entry formats (one per line in the modal):
+  - PEP 508 requirement — `numpy`, `numpy>=2.0`, `urllib3<1.26.5`
+  - Glob in name part — `mycompany-*`, `*-internal`, `mycompany-*<2.0`
+- **Multi-layer enforcement** so a denylist hit cannot be bypassed:
+  - `+simple/<project>/` — denied versions never appear in pip's discovery (devpi-server's
+    customizer hooks: `get_projects_filter_iter`, `get_versions_filter_iter`,
+    `get_simple_links_filter_iter`)
+  - `/<user>/<index>` listing — denied projects vanish from the project list
+  - `+f/<hash>/<filename>` direct download — tween returns 404 even for previously
+    cached files (defense in depth against shared/bookmarked URLs). The cached file
+    stays on disk; removing the deny rule restores access without re-fetching upstream
+- Use cases:
+  - **CVE blocklist** — `urllib3<1.26.5`, `cryptography<41.0.0`
+  - **Internal namespace ban** — `mycompany-*` keeps PyPI typosquats from shadowing
+    private packages on a public mirror
+  - **Whitelist-only mirrors** — paste curated `requirements.txt` style entries
+    into `package_allowlist`; everything else is blocked
 
 ### Admin tokens (scoped, revocable)
 - Opaque `adm_<id>.<secret>` tokens bound to a `(user, index, scope)` triple. Scope is
@@ -102,15 +129,16 @@ talks to the standard devpi JSON API directly.
 
 ### Packages
 - Client-side search with PEP 503 name normalization
-- Mirror indexes: shows only cached packages (filesystem scan, no 17 MB index download);
-  "Download full index" button available for complete browse
+- Stage indexes load packages automatically. Mirror indexes (e.g. `root/pypi` ≈ 780k
+  upstream projects, ~17 MB) require an explicit "Browse full index" click — no
+  auto-fetch
 - Package cards with latest version and `pip install` command
 
 ### Package detail (PyPI-like layout)
 - **Sidebar**: metadata (author, license, Python version, keywords, platform, maintainer,
   extras, project URLs, dependencies), `pip install` command, file downloads with upload dates
-- **Version list**: cached versions shown normally, uncached versions link to pypi.org (external);
-  "Load all versions" button for mirrors
+- **Version list**: every known version of the package, newest first, each linking to
+  its own detail view
 - **README**: rendered markdown (via `marked.js`); fetched from PyPI.org for mirror packages
   where devpi doesn't cache the description
 
@@ -341,11 +369,17 @@ The SPA HTML (`/+admin/`) is served with security headers - strict
 `'self'` + `https://pypi.org` for the README fallback, `frame-ancestors 'none'`),
 plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 
-The plugin uses devpi-server internals (`xom.model.getstage`, `stage.list_versions`,
-`stage.get_versiondata`, `stage.get_releaselinks`, `xom.keyfs`) and direct filesystem
-access (`serverdir/+files/`) for the cached-packages API. The filesystem scan is
-memoised per `(user, index)` and invalidated via `xom.keyfs.get_current_serial()`,
-so repeated requests don't re-walk the directory unless a file was added or removed.
+The plugin uses devpi-server internals: `xom.model.getstage`, `stage.list_versions`,
+`stage.get_versiondata`, `stage.get_releaselinks`, `xom.keyfs`.
+
+The mirror access control (`package_allowlist` / `package_denylist`) is implemented
+on top of devpi-server's stage customizer hooks (`get_projects_filter_iter`,
+`get_versions_filter_iter`, `get_simple_links_filter_iter`). devpi-server rejects
+duplicate customizer registrations for a given `index_type`, so instead of providing
+our own class we monkey-patch our methods onto the upstream `MirrorCustomizer`
+(an empty pass-through class designed exactly for this kind of extension). The
+patch runs once at module import. The tween additionally enforces denylist on
+direct `+f/` downloads to neutralise previously-cached or shared file URLs.
 
 ## Requirements
 
@@ -365,7 +399,7 @@ Routing is hash-based, so any of these URLs can be bookmarked or shared:
 | `#indexes` | All indexes |
 | `#indexes/<user>` | Indexes filtered by user |
 | `#packages/<user>/<index>` | Packages in an index |
-| `#package/<user>/<index>/<name>` | Package detail (latest cached version) |
+| `#package/<user>/<index>/<name>` | Package detail (latest version) |
 | `#package/<user>/<index>/<name>?version=<ver>` | Specific version |
 | `#users` | User management (requires login) |
 
@@ -392,21 +426,14 @@ backend would emit when behind a reverse proxy.
 - **Auth:** none (URL is not a secret; even anonymous viewers of public indexes need it)
 - **200:** `{"url": "https://devpi.example.com"}`
 
-### Mirror cache and metadata
+### Project metadata
 
-#### `GET /+admin-api/cached/{user}/{index}`
-List package names with files cached on disk for a mirror index. Scans
-`+files/{user}/{index}/+f/` and memoises the result per `(user, index)`, invalidated
-by keyfs serial bumps. Avoids the 17 MB index download for global mirrors like PyPI.
+#### `GET /+admin-api/versions/{user}/{index}/{project}`
+All known versions of a project, newest first. Backed by `stage.list_versions()` so
+the result is consistent across primary and replicas (PROJSIMPLELINKS in keyfs is
+replicated via the changelog).
 - **Auth:** `pkg_read` on the index
-- **200:** `{"result": ["foo", "bar", ...], "total": 42}`
-- **404:** index doesn't exist or is not a mirror
-
-#### `GET /+admin-api/versions/{user}/{index}/{project}[?all=1]`
-Version list with cached / uncached distinction. For mirror indexes `all` is null
-unless `?all=1` is passed, to avoid expensive upstream queries.
-- **Auth:** `pkg_read` on the index
-- **200:** `{"cached": ["1.0", "0.9"], "all": ["1.0", "0.9", "0.8"] | null}`
+- **200:** `{"versions": ["1.0", "0.9", "0.8"]}`
 
 #### `GET /+admin-api/versiondata/{user}/{index}/{project}/{version}`
 Metadata + file links for a single version (PEP 426 / PEP 621 fields plus `+links`
@@ -521,6 +548,7 @@ devpi-admin/
 │   ├── __init__.py          - version (from git tag via setuptools-scm)
 │   ├── main.py              - Pyramid hooks, tween, API views
 │   ├── tokens.py            - admin token gen / lookup / revoke / list (keyfs storage)
+│   ├── customizer.py        - mirror package allow/deny filter (patches MirrorCustomizer)
 │   └── static/
 │       ├── index.html       - SPA entry point
 │       ├── css/style.css
@@ -533,8 +561,7 @@ devpi-admin/
     ├── test_acl_read.py        - acl_read hooks, tween guards (scope/index), token issuance
     │                             rules, _check_index_perm, USER-changed handler, replica poll
     │                             tween + endpoint, public-url
-    ├── test_cached_versions.py - filesystem scan + cache invalidation
-    ├── test_helpers.py         - filename parsing, normalization
+    ├── test_filter.py          - package allow/deny customizer + tween +f/ block
     ├── test_hooks.py           - pluggy hook registration
     ├── test_json_safe.py       - readonly view conversion
     ├── test_package.py         - entry point, static files

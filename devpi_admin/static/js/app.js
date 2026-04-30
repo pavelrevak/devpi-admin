@@ -2345,21 +2345,17 @@
         }
 
         function fetchMirror() {
+            // Mirror indexes can carry hundreds of thousands of upstream
+            // projects (root/pypi ≈ 780k → 17 MB). We do not auto-fetch
+            // the listing; the user clicks "Browse full index" in the
+            // header to opt in. Empty content area shows the prompt.
             showHeadingAndLoading(true);
-            Api.get('/+admin-api/cached/' + indexPath).then(function (data) {
-                var cached = data.result || [];
-                var total = data.total || 0;
-                var fakeResult = {projects: cached, type: 'mirror', _total: total};
-                renderPackages(indexPath, fakeResult, true);
-            }).catch(function () {
-                // Plugin API not available — show only the download button
-                var loading = content.querySelector('.loading');
-                if (loading) loading.remove();
-                content.appendChild(el('p', {
-                    className: 'text-muted',
-                    textContent: 'Cached packages API not available. Use the "Download full index" button to browse.',
-                }));
-            });
+            var loading = content.querySelector('.loading');
+            if (loading) loading.remove();
+            content.appendChild(el('p', {
+                className: 'text-muted',
+                textContent: 'Click "Browse full index" above to load all upstream packages.',
+            }));
         }
 
         function showHeadingAndLoading(isMirror) {
@@ -2369,7 +2365,7 @@
             if (isMirror) {
                 actions.push(el('button', {
                     className: 'btn',
-                    textContent: 'Download full index',
+                    textContent: 'Browse full index',
                     onclick: function () {
                         showHeadingAndLoading(true);
                         Api.get('/' + indexPath).then(function (data) {
@@ -2431,25 +2427,13 @@
 
     function renderPackages(indexPath, result, isMirror) {
         var projects = result.projects || [];
-        var totalUpstream = result._total || 0;
         var loading = content.querySelector('.loading');
         if (loading) loading.remove();
-
-        // Mirror cached summary
-        if (isMirror && totalUpstream) {
-            content.appendChild(el('div', {className: 'mirror-info'}, [
-                el('span', {textContent: projects.length + ' cached'}),
-                ' of ',
-                el('span', {textContent: formatNum(totalUpstream) + ' upstream packages'}),
-            ]));
-        }
 
         if (projects.length === 0) {
             content.appendChild(el('p', {
                 className: 'text-muted',
-                textContent: isMirror
-                    ? 'No cached packages yet. Packages are cached on first access via pip.'
-                    : 'No packages in this index.',
+                textContent: 'No packages in this index.',
             }));
             return;
         }
@@ -2474,17 +2458,37 @@
             clear(grid);
 
             var matches;
+            var totalMatches = 0;
             if (q) {
-                matches = [];
+                // Score each match: 0 = exact, 1 = prefix, 2 = substring.
+                // Without scoring an alphabetical "first 100" cuts off
+                // common short names — searching "requests" in 780k PyPI
+                // would fill the slot with django-requests-* entries
+                // before reaching `requests` itself.
                 var qNorm = q.replace(/[-_.]/g, '');
+                var scored = [];
                 for (var j = 0; j < projects.length; j++) {
                     var name = projects[j].toLowerCase();
-                    if (name.indexOf(q) !== -1 ||
-                        name.replace(/[-_.]/g, '').indexOf(qNorm) !== -1) {
-                        matches.push(projects[j]);
-                        if (matches.length >= PKG_LIMIT) break;
+                    var nameNorm = name.replace(/[-_.]/g, '');
+                    var score;
+                    if (name === q || nameNorm === qNorm) {
+                        score = 0;
+                    } else if (name.indexOf(q) === 0 || nameNorm.indexOf(qNorm) === 0) {
+                        score = 1;
+                    } else if (name.indexOf(q) !== -1 || nameNorm.indexOf(qNorm) !== -1) {
+                        score = 2;
+                    } else {
+                        continue;
                     }
+                    scored.push({name: projects[j], score: score, len: name.length});
                 }
+                totalMatches = scored.length;
+                scored.sort(function (a, b) {
+                    return a.score - b.score
+                        || a.len - b.len
+                        || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+                });
+                matches = scored.slice(0, PKG_LIMIT).map(function (m) { return m.name; });
             } else {
                 matches = projects.slice(0, PKG_LIMIT);
             }
@@ -2492,9 +2496,9 @@
             if (matches.length === 0) {
                 infoEl.textContent = q ? 'No matching packages.' : '';
             } else if (q) {
-                infoEl.textContent = matches.length >= PKG_LIMIT
-                    ? 'Showing first ' + PKG_LIMIT + ' matches. Refine search for more.'
-                    : 'Found ' + matches.length + ' match' + (matches.length === 1 ? '' : 'es') + '.';
+                infoEl.textContent = totalMatches > PKG_LIMIT
+                    ? 'Showing top ' + PKG_LIMIT + ' of ' + formatNum(totalMatches) + ' matches. Refine search to narrow down.'
+                    : 'Found ' + totalMatches + ' match' + (totalMatches === 1 ? '' : 'es') + '.';
             } else {
                 infoEl.textContent = projects.length > PKG_LIMIT
                     ? 'Showing first ' + PKG_LIMIT + ' of ' + formatNum(projects.length) + ' packages. Use search to filter.'
@@ -2531,15 +2535,9 @@
         showLoading();
         var versionsUrl = '/+admin-api/versions/' + indexPath + '/' + pkg;
         Api.get(versionsUrl).then(function (verData) {
-            var cachedVersions = (verData.cached || []).sort(compareVersions);
-            var allVersions = verData.all ? verData.all.sort(compareVersions) : null;
-            var versions = cachedVersions;
+            var versions = (verData.versions || []).sort(compareVersions);
             var currentVer = selectedVersion && versions.indexOf(selectedVersion) !== -1
                 ? selectedVersion : versions[0];
-            if (!currentVer && allVersions) {
-                currentVer = selectedVersion && allVersions.indexOf(selectedVersion) !== -1
-                    ? selectedVersion : allVersions[0];
-            }
             if (!currentVer) {
                 clear(content);
                 showError(new Error('No versions found'));
@@ -2547,16 +2545,15 @@
             }
             var detailUrl = '/+admin-api/versiondata/' + indexPath + '/' + pkg + '/' + currentVer;
             return Api.get(detailUrl).then(function (detail) {
-                return {cachedVersions: cachedVersions, allVersions: allVersions,
-                    currentVer: currentVer, info: detail.result || {}};
+                return {versions: versions, currentVer: currentVer,
+                    info: detail.result || {}};
             }).catch(function () {
-                return {cachedVersions: cachedVersions, allVersions: allVersions,
-                    currentVer: currentVer, info: {version: currentVer, name: pkg}};
+                return {versions: versions, currentVer: currentVer,
+                    info: {version: currentVer, name: pkg}};
             });
         }).then(function (ctx) {
             if (!ctx) return;
-            var cachedVersions = ctx.cachedVersions;
-            var allVersions = ctx.allVersions;
+            var versions = ctx.versions;
             var currentVer = ctx.currentVer;
             var info = ctx.info;
             clear(content);
@@ -2578,7 +2575,7 @@
                 ] : []),
             ]));
 
-            if (cachedVersions.length === 0 && !allVersions) {
+            if (versions.length === 0) {
                 content.appendChild(el('p', {
                     className: 'text-muted',
                     textContent: 'No versions found.',
@@ -2727,124 +2724,35 @@
 
             // Versions list
             var versCard = el('div', {className: 'pkg-sidebar-section'});
-            var cachedSet = {};
-            for (var ci = 0; ci < cachedVersions.length; ci++) {
-                cachedSet[cachedVersions[ci]] = true;
-            }
-            var hasMirrorAll = allVersions !== null && allVersions.length > cachedVersions.length;
-
-            var versHead = el('div', {className: 'pkg-sidebar-versions-head'}, [
+            versCard.appendChild(el('div', {className: 'pkg-sidebar-versions-head'}, [
                 el('span', {className: 'pkg-sidebar-title', textContent: 'Versions'}),
-                el('span', {className: 'pkg-sidebar-count',
-                    textContent: String(cachedVersions.length) +
-                        (hasMirrorAll ? ' / ' + allVersions.length : '')}),
-            ]);
-            versCard.appendChild(versHead);
+                el('span', {className: 'pkg-sidebar-count', textContent: String(versions.length)}),
+            ]));
 
             var versList = el('div', {className: 'pkg-version-list'});
-
-            function buildVersionRow(ver, isCached) {
-                var isCurrent = ver === currentVer;
-                var cls = 'pkg-version-row';
-                if (isCurrent) cls += ' pkg-version-active';
-                if (!isCached) cls += ' pkg-version-uncached';
-                var row = el('div', {className: cls});
-                if (isCached) {
-                    row.appendChild(el('a', {
-                        href: '#package/' + indexPath + '/' + pkg + '?version=' + encodeURIComponent(ver),
-                        className: 'pkg-version-link',
-                        textContent: 'v' + ver,
-                    }));
-                    row.appendChild(el('button', {
+            for (var v = 0; v < versions.length; v++) {
+                var ver = versions[v];
+                var rowCls = 'pkg-version-row' + (ver === currentVer ? ' pkg-version-active' : '');
+                var row = el('div', {className: rowCls});
+                row.appendChild(el('a', {
+                    href: '#package/' + indexPath + '/' + pkg + '?version=' + encodeURIComponent(ver),
+                    className: 'pkg-version-link',
+                    textContent: 'v' + ver,
+                }));
+                row.appendChild((function (verLocal) {
+                    return el('button', {
                         className: 'pkg-version-del auth-only',
                         textContent: '\u00d7',
                         title: 'Delete version',
                         onclick: function (e) {
                             e.preventDefault();
                             e.stopPropagation();
-                            deleteVersion(indexPath, pkg, ver);
+                            deleteVersion(indexPath, pkg, verLocal);
                         },
-                    }));
-                } else {
-                    row.appendChild(el('a', {
-                        href: 'https://pypi.org/project/' + pkg + '/' + ver + '/',
-                        className: 'pkg-version-link',
-                        textContent: 'v' + ver,
-                        target: '_blank',
-                        rel: 'noopener',
-                        title: 'View on PyPI (not cached)',
-                    }));
-                    row.appendChild(el('span', {
-                        className: 'pkg-version-ext',
-                        textContent: '\u2197',
-                    }));
-                }
-                return row;
+                    });
+                })(ver));
+                versList.appendChild(row);
             }
-
-            // Show cached versions
-            for (var v = 0; v < cachedVersions.length; v++) {
-                versList.appendChild(buildVersionRow(cachedVersions[v], true));
-            }
-
-            // "Show all versions" button for mirrors
-            if (hasMirrorAll) {
-                var allList = el('div', {className: 'pkg-version-hidden', hidden: true});
-                var uncachedVersions = [];
-                for (var a = 0; a < allVersions.length; a++) {
-                    if (!cachedSet[allVersions[a]]) {
-                        uncachedVersions.push(allVersions[a]);
-                    }
-                }
-                for (var u = 0; u < uncachedVersions.length; u++) {
-                    allList.appendChild(buildVersionRow(uncachedVersions[u], false));
-                }
-                versList.appendChild(allList);
-
-                var showAllBtn = el('button', {
-                    className: 'pkg-version-more',
-                    textContent: 'Show all ' + allVersions.length + ' versions',
-                    onclick: function () {
-                        allList.hidden = false;
-                        showAllBtn.hidden = true;
-                    },
-                });
-                versList.appendChild(showAllBtn);
-            } else if (!allVersions) {
-                // Mirror: all versions not yet loaded
-                var loadAllBtn = el('button', {
-                    className: 'pkg-version-more',
-                    textContent: 'Load all versions...',
-                    onclick: function () {
-                        loadAllBtn.textContent = 'Loading...';
-                        loadAllBtn.disabled = true;
-                        Api.get('/+admin-api/versions/' + indexPath + '/' + pkg + '?all=1')
-                            .then(function (data) {
-                                var all = (data.all || []).sort(compareVersions);
-                                loadAllBtn.hidden = true;
-                                var uncached = [];
-                                for (var i = 0; i < all.length; i++) {
-                                    if (!cachedSet[all[i]]) uncached.push(all[i]);
-                                }
-                                for (var j = 0; j < uncached.length; j++) {
-                                    versList.insertBefore(
-                                        buildVersionRow(uncached[j], false),
-                                        loadAllBtn);
-                                }
-                                // Update count
-                                var countEl = versHead.querySelector('.pkg-sidebar-count');
-                                if (countEl) {
-                                    countEl.textContent = cachedVersions.length + ' / ' + all.length;
-                                }
-                            })
-                            .catch(function () {
-                                loadAllBtn.textContent = 'Failed to load';
-                            });
-                    },
-                });
-                versList.appendChild(loadAllBtn);
-            }
-
             versCard.appendChild(versList);
             sidebar.appendChild(versCard);
 

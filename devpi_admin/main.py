@@ -28,8 +28,6 @@ from devpi_admin.customizer import (
 
 
 STATIC_DIR = Path(__file__).parent / "static"
-_NORMALIZE_RE = re.compile(r"[-_.]+")
-_SDIST_EXTENSIONS = (".tar.gz", ".tar.bz2", ".zip")
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,49}$")
 _log = logging.getLogger(__name__)
 
@@ -200,14 +198,6 @@ def devpiserver_pyramid_configure(config, pyramid_config):
         _replicas_view, route_name="devpi_admin_replicas",
         request_method="GET")
 
-    # Cached packages API for mirror indexes.
-    pyramid_config.add_route(
-        "devpi_admin_cached",
-        "/+admin-api/cached/{user}/{index}")
-    pyramid_config.add_view(
-        _cached_packages_view, route_name="devpi_admin_cached",
-        request_method="GET")
-
     # Version listing (lightweight — no full metadata).
     pyramid_config.add_route(
         "devpi_admin_versions",
@@ -351,113 +341,12 @@ def _json_response(data):
     return Response(body=body.encode("utf-8"), content_type="application/json")
 
 
-def _validate_path_component(value):
-    """Reject path components that could cause traversal."""
-    if "/" in value or "\\" in value or value in (".", ".."):
-        raise ValueError(f"invalid path component: {value!r}")
-
-
-def _files_dir(xom, user, index):
-    """Return Path to +files dir for an index, with path validation."""
-    _validate_path_component(user)
-    _validate_path_component(index)
-    return Path(xom.config.serverdir) / "+files" / user / index / "+f"
-
-
-# Cache for the +files filesystem scan. Keyed by (user, index); value is
-# (serial, {project_name: {version, ...}}). devpi increments keyfs serial
-# on every file add/remove, so a serial match means the directory state
-# we cached is still authoritative — no need to re-walk.
-_files_scan_cache = {}
-_FILES_SCAN_CACHE_MAX = 32
-
-
-def _scan_files(xom, user, index):
-    """Return ``{normalized_name: {version, ...}}`` of cached files.
-
-    Result is memoised per ``(user, index)`` and re-scanned only when the
-    keyfs serial changes. On filesystem error the partial result is still
-    returned (and cached) — the next scan will retry.
-    """
-    serial = xom.keyfs.get_current_serial()
-    cached = _files_scan_cache.get((user, index))
-    if cached is not None and cached[0] == serial:
-        return cached[1]
-
-    files_dir = _files_dir(xom, user, index)
-    result = {}
-    try:
-        for f in files_dir.rglob("*"):
-            if not f.is_file():
-                continue
-            name, ver = _parse_filename(f.name)
-            if name:
-                result.setdefault(name, set()).add(ver)
-    except OSError:
-        _log.warning("Cannot scan %s", files_dir, exc_info=True)
-
-    if len(_files_scan_cache) >= _FILES_SCAN_CACHE_MAX:
-        # FIFO eviction; insertion order is preserved by dict in Python 3.7+.
-        _files_scan_cache.pop(next(iter(_files_scan_cache)))
-    _files_scan_cache[(user, index)] = (serial, result)
-    return result
-
-
-def _cached_packages_view(request):
-    """Return list of project names that have cached files on disk.
-
-    Backed by ``_scan_files`` — first call walks ``+files/{user}/{index}/``,
-    subsequent calls reuse the cached result until the keyfs serial changes.
-    """
-    user = request.matchdict["user"]
-    index = request.matchdict["index"]
-    xom = request.registry["xom"]
-
-    stage = _get_stage_or_404(xom, user, index)
-    _check_read_access(request, stage)
-    if not isinstance(stage, MirrorStage):
-        return HTTPNotFound(
-            json_body={"error": "not a mirror index"})
-
-    scan = _scan_files(xom, user, index)
-    cached = sorted(scan.keys())
-    return _json_response({"result": cached, "total": len(cached)})
-
-
-def _parse_filename(filename):
-    """Extract (normalized_name, version) from wheel or sdist filename.
-
-    Returns (None, None) if the filename is not recognized.
-    """
-    # wheel: {name}-{ver}(-{build})?-{python}-{abi}-{platform}.whl
-    if filename.endswith(".whl"):
-        parts = filename.split("-")
-        if len(parts) >= 3:
-            return _normalize(parts[0]), parts[1]
-        return None, None
-    # sdist: {name}-{ver}.tar.gz or {name}-{ver}.zip
-    for ext in _SDIST_EXTENSIONS:
-        if filename.endswith(ext):
-            base = filename[:-len(ext)]
-            idx = base.rfind("-")
-            if idx > 0:
-                return _normalize(base[:idx]), base[idx + 1:]
-            return None, None
-    return None, None
-
-
-def _normalize(name):
-    """PEP 503 name normalization."""
-    return _NORMALIZE_RE.sub("-", name).lower()
-
-
 def _versions_view(request):
-    """Return version list with cached/uncached distinction.
+    """Return all versions for a project, newest first.
 
-    For stage indexes all versions are local (cached). For mirror indexes
-    only versions that have downloaded files on disk are marked cached.
-    Returns ``{"cached": [...], "all": null}`` initially; the frontend
-    can request all versions via ``?all=1`` query parameter.
+    For mirror indexes this triggers a PROJSIMPLELINKS lookup (PyPI fetch
+    on first access, keyfs cache thereafter). The result is replicated
+    via the changelog so every node returns the same list.
     """
     user = request.matchdict["user"]
     index = request.matchdict["index"]
@@ -465,32 +354,8 @@ def _versions_view(request):
     xom = request.registry["xom"]
     stage = _get_stage_or_404(xom, user, index)
     _check_read_access(request, stage)
-
-    is_mirror = isinstance(stage, MirrorStage)
-    want_all = request.params.get("all") == "1"
-
-    if is_mirror:
-        cached_versions = _cached_versions_for_project(
-            xom, user, index, project)
-        all_versions = None
-        if want_all:
-            all_versions = sorted(
-                stage.list_versions(project), reverse=True)
-        return _json_response({
-            "cached": cached_versions,
-            "all": all_versions,
-        })
-
-    # Stage index: everything is local
     versions = sorted(stage.list_versions(project), reverse=True)
-    return _json_response({"cached": versions, "all": versions})
-
-
-def _cached_versions_for_project(xom, user, index, project):
-    """Return sorted list of versions that have files on disk."""
-    scan = _scan_files(xom, user, index)
-    versions = scan.get(_normalize(project), set())
-    return sorted(versions, reverse=True)
+    return _json_response({"versions": versions})
 
 
 def _versiondata_view(request):

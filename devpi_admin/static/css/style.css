@@ -1062,7 +1062,6 @@ body {
 .btn:focus-visible,
 .kebab-btn:focus-visible,
 .pkg-version-del:focus-visible,
-.pkg-version-more:focus-visible,
 .theme-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
@@ -1357,15 +1356,6 @@ body {
     font-weight: 600;
 }
 
-.pkg-version-uncached .pkg-version-link {
-    color: var(--text-faint);
-    font-style: italic;
-}
-
-.pkg-version-uncached .pkg-version-link:hover {
-    color: var(--text-muted);
-}
-
 .pkg-version-del {
     background: none;
     border: none;
@@ -1378,29 +1368,6 @@ body {
 }
 
 .pkg-version-del:hover {
-    background: var(--table-hover);
-}
-
-.pkg-version-ext {
-    font-size: 11px;
-    color: var(--text-faint);
-    padding: 0 6px;
-}
-
-.pkg-version-more {
-    display: block;
-    width: 100%;
-    padding: 6px 8px;
-    border: none;
-    background: none;
-    color: var(--accent);
-    font-size: 12px;
-    cursor: pointer;
-    text-align: left;
-    border-radius: 4px;
-}
-
-.pkg-version-more:hover {
     background: var(--table-hover);
 }
 
