@@ -128,7 +128,10 @@ talks to the standard devpi JSON API directly.
   doesn't overflow on stage indexes with long names.
 
 ### Packages
-- Client-side search with PEP 503 name normalization
+- Client-side search with PEP 503 name normalization and relevance ranking
+  (exact match > prefix match > substring match, then shortest name first) so
+  searching `requests` in a 780k-project upstream surfaces `requests` itself, not
+  `django-requests-cache` first
 - Stage indexes load packages automatically. Mirror indexes (e.g. `root/pypi` ≈ 780k
   upstream projects, ~17 MB) require an explicit "Browse full index" click — no
   auto-fetch
