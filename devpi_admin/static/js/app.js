@@ -56,6 +56,21 @@
         ]);
     }
 
+    function parseLinesField(elementId) {
+        // Split textarea content by newlines; trim; drop empty and
+        // '#'-prefixed comment lines so admins can paste annotated
+        // requirement-style snippets.
+        var raw = document.getElementById(elementId);
+        if (!raw) return [];
+        var lines = raw.value.split(/\r?\n/);
+        var out = [];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line && line.charAt(0) !== '#') out.push(line);
+        }
+        return out;
+    }
+
     function statusRow(label, value) {
         // value may be a string OR a DOM node (e.g. a styled <span> for
         // the replica sync state). textContent on a Node would coerce
@@ -2121,6 +2136,42 @@
                     value: isEdit && editIdx.mirror_url ? editIdx.mirror_url : 'https://pypi.org/simple/',
                 })));
 
+                // Allow/deny lists. Plain text, one PEP 508 entry per
+                // line. Empty allowlist = pass-through; denylist always
+                // wins. Lines starting with '#' are dropped client-side
+                // so admins can paste comments.
+                var allowInitial = (isEdit && Array.isArray(editIdx.package_allowlist))
+                    ? editIdx.package_allowlist.join('\n') : '';
+                mirrorFields.appendChild(el('div', {className: 'form-group'}, [
+                    el('label', {textContent: 'Package Allowlist'}),
+                    el('textarea', {
+                        id: 'form-package-allowlist',
+                        rows: 5,
+                        placeholder: 'numpy\nrequests>=2.0\nmycompany-*',
+                        value: allowInitial,
+                    }),
+                    el('div', {
+                        className: 'form-hint',
+                        textContent: 'One entry per line: PEP 508 (numpy, numpy>=2.0) or name with * wildcard (mycompany-*, *-internal, mycompany-*<2.0). Empty = all packages allowed.',
+                    }),
+                ]));
+
+                var denyInitial = (isEdit && Array.isArray(editIdx.package_denylist))
+                    ? editIdx.package_denylist.join('\n') : '';
+                mirrorFields.appendChild(el('div', {className: 'form-group'}, [
+                    el('label', {textContent: 'Package Denylist'}),
+                    el('textarea', {
+                        id: 'form-package-denylist',
+                        rows: 5,
+                        placeholder: 'urllib3<1.26.5\nmycompany-*\n*-evil',
+                        value: denyInitial,
+                    }),
+                    el('div', {
+                        className: 'form-hint',
+                        textContent: 'Always blocked. Overrides allowlist. Bare name (mycompany-*) bans the namespace; with specifier (urllib3<1.26.5) bans only matching versions.',
+                    }),
+                ]));
+
                 body.appendChild(stageFields);
                 body.appendChild(mirrorFields);
 
@@ -2185,6 +2236,8 @@
             data.acl_upload = getTagPickerValues('form-acl-upload');
         } else {
             data.mirror_url = document.getElementById('form-mirror-url').value.trim();
+            data.package_allowlist = parseLinesField('form-package-allowlist');
+            data.package_denylist = parseLinesField('form-package-denylist');
         }
         data.acl_read = getTagPickerValues('form-acl-read');
 

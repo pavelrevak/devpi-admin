@@ -1037,8 +1037,24 @@ body {
 .modal-body input[type="email"]:focus,
 .modal-body input[type="password"]:focus,
 .modal-body input[type="url"]:focus,
-.modal-body select:not(.tag-picker-add):focus {
+.modal-body select:not(.tag-picker-add):focus,
+.modal-body textarea:focus {
     border-color: var(--accent);
+}
+
+.modal-body textarea {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    outline: none;
+    background: var(--bg);
+    color: var(--text);
+    resize: vertical;
+    min-height: 80px;
+    box-sizing: border-box;
 }
 
 /* --- Focus visibility for keyboard navigation --- */

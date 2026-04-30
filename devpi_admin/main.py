@@ -23,6 +23,8 @@ from pyramid.httpexceptions import (
 from pyramid.response import FileResponse, Response
 
 from devpi_admin import tokens
+from devpi_admin.customizer import (
+    DevpiAdminMirrorCustomizer, is_version_allowed, parse_rules)
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -38,6 +40,11 @@ _log = logging.getLogger(__name__)
 #   index starts with `+`.
 _USER_PATH_RE = re.compile(r"^/([^/+][^/]*)/?$")
 _INDEX_ANY_RE = re.compile(r"^/([^/+][^/]*)/([^/+][^/]*)(/.*)?$")
+# Mirror download URL: /{user}/{index}/+f/{hashdir-a}/{hashdir-b}/{filename}
+# Capture user, index, and the filename (last path segment) for filename
+# parsing in the package allow/deny enforcement check.
+_PKG_FILE_RE = re.compile(
+    r"^/([^/+][^/]*)/([^/+][^/]*)/\+f/.+/([^/]+)$")
 
 # Method matrix per token scope. ``read`` is for pip / devpi download;
 # ``upload`` adds POST/PUT for package upload via ``twine`` / ``devpi upload``.
@@ -73,7 +80,15 @@ def devpiserver_indexconfig_defaults(index_type):
     # ACLList marker tells devpi to validate values via ensure_acl_list()
     # on every PUT/PATCH (normalizes :ANONYMOUS:/:AUTHENTICATED: case,
     # accepts comma-separated strings, strips whitespace).
-    return {"acl_read": ACLList([":ANONYMOUS:"])}
+    defaults = {"acl_read": ACLList([":ANONYMOUS:"])}
+    if index_type == "mirror":
+        # Plain list defaults trigger ensure_list() in devpi core, which
+        # accepts comma-separated input from PATCH and trims whitespace.
+        # Per-entry PEP 508 validation runs in our patched MirrorCustomizer
+        # (see devpi_admin/customizer.py).
+        defaults["package_allowlist"] = []
+        defaults["package_denylist"] = []
+    return defaults
 
 
 @hookimpl
@@ -571,7 +586,7 @@ def devpi_admin_tween_factory(handler, registry):
             # devpi produce its own 401 — no scope enforcement needed for
             # an unauthenticated request.
 
-        if request.method == "GET":
+        if request.method in ("GET", "HEAD"):
             if request.path == "/" and _wants_html(request):
                 return HTTPFound("/+admin/")
             denied = _user_listing_check(request)
@@ -580,6 +595,11 @@ def devpi_admin_tween_factory(handler, registry):
             denied = _read_acl_pre_check(request, xom)
             if denied is not None:
                 return denied
+            denied = _pkg_file_deny_check(request, xom)
+            if denied is not None:
+                return denied
+            if request.method == "HEAD":
+                return handler(request)
             response = handler(request)
             if request.path in ("/", "") and _is_json_response(response):
                 return _filter_root_listing(request, response, xom)
@@ -723,6 +743,52 @@ def _read_acl_pre_check(request, xom):
     if request.authenticated_userid is None:
         return HTTPForbidden(json_body={"error": "authentication required"})
     return HTTPNotFound(json_body={"error": "index not found"})
+
+
+def _pkg_file_deny_check(request, xom):
+    """Block ``/<user>/<index>/+f/<...>`` downloads of denied versions.
+
+    The customizer's filter hooks already hide denied versions from the
+    +simple/ index, but a previously-cached or shared direct file URL
+    would otherwise still resolve. We parse the basename, derive
+    ``(name, version)`` and apply the same allow/deny logic. The file
+    on disk is left intact — removing the deny rule restores access
+    without re-downloading from upstream.
+    """
+    match = _PKG_FILE_RE.match(request.path)
+    if match is None:
+        return None
+    user, index, basename = match.group(1), match.group(2), match.group(3)
+    try:
+        stage = xom.model.getstage(user, index)
+    except Exception:
+        return None
+    if stage is None or stage.ixconfig.get("type") != "mirror":
+        return None
+    allow_raw = stage.ixconfig.get("package_allowlist") or ()
+    deny_raw = stage.ixconfig.get("package_denylist") or ()
+    if not allow_raw and not deny_raw:
+        return None
+    try:
+        from devpi_common.metadata import splitbasename
+        from packaging.utils import canonicalize_name
+        name, version, _ext = splitbasename(basename, checkarch=False)
+    except Exception:
+        # Unparseable filename: fall through to devpi (it'll 404 if the
+        # entry is bogus). Filter is best-effort here.
+        return None
+    if not version:
+        return None
+    try:
+        allow = parse_rules(allow_raw)
+        deny = parse_rules(deny_raw)
+    except Exception:
+        # Stored rule is somehow invalid (shouldn't happen — validate_config
+        # gates writes). Don't crash downloads on a bad rule.
+        return None
+    if is_version_allowed(canonicalize_name(name), version, allow, deny):
+        return None
+    return HTTPNotFound(json_body={"error": "package version blocked by index policy"})
 
 
 def _is_json_response(response):
