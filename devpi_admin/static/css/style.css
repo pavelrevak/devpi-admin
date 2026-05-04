@@ -571,30 +571,6 @@ body {
     margin-bottom: 10px;
 }
 
-.pip-conf-result {
-    margin-top: 14px;
-    padding-top: 14px;
-    border-top: 1px solid var(--border);
-}
-
-.pipconf-notice {
-    margin-right: auto;
-    align-self: center;
-    color: #e07c1a;
-    font-size: 12px;
-    opacity: 1;
-    transition: opacity 0.6s ease-out;
-}
-
-.pipconf-notice-error {
-    color: #c0392b;
-    font-weight: 600;
-}
-
-.pipconf-notice-fade {
-    opacity: 0;
-}
-
 .pipconf-section-label {
     display: block;
     font-size: 12px;
@@ -625,12 +601,6 @@ body {
     color: var(--text);
 }
 
-.tokens-link {
-    color: var(--accent);
-    text-decoration: underline;
-    cursor: pointer;
-    font-size: 13px;
-}
 
 .tokens-link:hover {
     color: var(--accent-hover);
@@ -704,6 +674,282 @@ body {
     text-align: center;
     color: var(--text-faint);
     padding: 24px 12px;
+}
+
+.tokens-section {
+    margin-bottom: 18px;
+}
+
+.tokens-section:last-child {
+    margin-bottom: 0;
+}
+
+.tokens-section-heading {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin: 0 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border-light);
+}
+
+/* In-flight loading state for buttons: three pulsing dots replace
+   the label while the request is awaited. Width stays roughly constant
+   so the modal footer doesn't reflow. */
+.btn-loading {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-width: 80px;
+    cursor: wait;
+}
+
+.btn-loading-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.3;
+    animation: btn-loading-pulse 1.2s infinite ease-in-out;
+}
+
+.btn-loading-dot:nth-child(2) {
+    animation-delay: 0.2s;
+}
+
+.btn-loading-dot:nth-child(3) {
+    animation-delay: 0.4s;
+}
+
+@keyframes btn-loading-pulse {
+    0%, 60%, 100% { opacity: 0.3; transform: scale(1); }
+    30%           { opacity: 1;   transform: scale(1.3); }
+}
+
+/* Highlight the row of a token that was just issued so the user spots
+   it in the (potentially long) refreshed list. The brief glow fades
+   over a couple of seconds and then settles to neutral. */
+.tokens-row-just-created > td {
+    animation: tokens-row-flash 2.4s ease-out;
+}
+
+@keyframes tokens-row-flash {
+    0%   { background: #fff3a8; }
+    60%  { background: #fffaca; }
+    100% { background: transparent; }
+}
+
+[data-theme="dark"] .tokens-row-just-created > td {
+    animation: tokens-row-flash-dark 2.4s ease-out;
+}
+
+@keyframes tokens-row-flash-dark {
+    0%   { background: #4a4012; }
+    60%  { background: #2e2a14; }
+    100% { background: transparent; }
+}
+
+.macaroon-security-banner {
+    position: relative;
+    background: #fff8e1;
+    border: 1px solid #ffd97a;
+    color: #5b4500;
+    border-radius: 4px;
+    padding: 10px 32px 10px 12px;
+    margin-bottom: 14px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.macaroon-security-dismiss {
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: inherit;
+    font-size: 18px;
+    line-height: 1;
+    padding: 4px 8px;
+    opacity: 0.6;
+}
+
+.macaroon-security-dismiss:hover {
+    opacity: 1;
+}
+
+[data-theme="dark"] .macaroon-security-banner {
+    background: #3a2e10;
+    border-color: #6b5318;
+    color: #f0d989;
+}
+
+.macaroon-coming-soon {
+    text-align: center;
+    color: var(--text-faint);
+    padding: 24px 12px;
+    font-style: italic;
+}
+
+.macaroon-note {
+    color: var(--text-faint);
+    font-size: 12px;
+    margin: 0 0 12px;
+    line-height: 1.5;
+}
+
+.macaroon-warn {
+    color: #b8650b;
+    font-weight: 500;
+}
+
+[data-theme="dark"] .macaroon-warn {
+    color: #f0a35a;
+}
+
+.macaroon-faint {
+    color: var(--text-faint);
+}
+
+/* Read-only display of a value the user can't change in this form
+   instance (e.g. an index locked by the per-index Issue flow). */
+.form-static-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    padding: 8px 10px;
+    background: var(--table-head-bg);
+    border: 1px solid var(--border-light);
+    border-radius: 4px;
+    color: var(--text);
+}
+
+/* Chips inside macaroon listing cells — multi-value cells (indexes,
+   allowed, projects) wrap to additional rows instead of triggering
+   the table's horizontal scrollbar. */
+
+.tokens-table-macaroon td.macaroon-cell-wrap {
+    white-space: normal;
+    max-width: 320px;
+}
+
+.macaroon-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+}
+
+.macaroon-chip {
+    display: inline-block;
+    padding: 1px 7px;
+    background: var(--border-light);
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+
+/* Issue modal — permission picker */
+
+.macaroon-perms-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0;
+    padding: 8px 10px;
+    background: var(--table-head-bg);
+    border-radius: 4px;
+}
+
+.macaroon-perms-block.macaroon-perms-advanced {
+    border: 1px solid #ffd97a;
+    background: #fff8e1;
+}
+
+[data-theme="dark"] .macaroon-perms-block.macaroon-perms-advanced {
+    background: #3a2e10;
+    border-color: #6b5318;
+}
+
+.macaroon-perm-label {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.macaroon-perm-cb {
+    margin: 0;
+}
+
+.macaroon-perm-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-weight: 500;
+}
+
+.macaroon-perm-desc {
+    color: var(--text-faint);
+}
+
+.macaroon-adv-toggle {
+    background: none;
+    border: none;
+    color: var(--accent, #1976d2);
+    cursor: pointer;
+    padding: 4px 0;
+    font-size: 12px;
+    text-align: left;
+}
+
+.macaroon-warn-text {
+    color: #b8650b;
+    font-size: 12px;
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+[data-theme="dark"] .macaroon-warn-text {
+    color: #f0a35a;
+}
+
+.macaroon-exp-custom-wrap {
+    margin-top: 6px;
+}
+
+/* Issued (read-once) view */
+
+.macaroon-issued-warning {
+    background: #fdecea;
+    border: 1px solid #f5b8b1;
+    color: #8a1a10;
+    border-radius: 4px;
+    padding: 10px 12px;
+    margin: 0 0 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    font-weight: 500;
+}
+
+[data-theme="dark"] .macaroon-issued-warning {
+    background: #3a1612;
+    border-color: #6b2a23;
+    color: #f5a89e;
+}
+
+.macaroon-issued-block {
+    margin-bottom: 16px;
+}
+
+.macaroon-issued-label {
+    font-weight: 600;
+    margin-bottom: 4px;
+    font-size: 13px;
 }
 
 .pip-conf-preview {
@@ -1003,7 +1249,10 @@ body {
 .modal-body input[type="text"],
 .modal-body input[type="email"],
 .modal-body input[type="password"],
-.modal-body input[type="url"] {
+.modal-body input[type="url"],
+.modal-body input[type="datetime-local"],
+.modal-body input[type="date"],
+.modal-body input[type="time"] {
     width: 100%;
     height: 36px;
     padding: 0 10px;
@@ -1013,6 +1262,8 @@ body {
     outline: none;
     background: var(--bg);
     color: var(--text);
+    box-sizing: border-box;
+    font-family: inherit;
 }
 
 .modal-body select:not(.tag-picker-add) {
@@ -1037,6 +1288,9 @@ body {
 .modal-body input[type="email"]:focus,
 .modal-body input[type="password"]:focus,
 .modal-body input[type="url"]:focus,
+.modal-body input[type="datetime-local"]:focus,
+.modal-body input[type="date"]:focus,
+.modal-body input[type="time"]:focus,
 .modal-body select:not(.tag-picker-add):focus,
 .modal-body textarea:focus {
     border-color: var(--accent);

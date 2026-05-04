@@ -1345,7 +1345,11 @@ def _list_index_tokens_view(request):
         # Hide existence from anyone without read access.
         raise HTTPNotFound(json_body={"error": "index not found"})
     items = tokens.list_for_index(xom, idx_user, idx_name)
-    if auth_user != "root":
+    # Index owner / root see every token bound to this index — they're
+    # the people responsible for revoke decisions and need full audit
+    # visibility. Non-owners see only their own tokens (the bound user
+    # they themselves authenticate as), matching the per-user listing.
+    if auth_user != "root" and auth_user != idx_user:
         items = [(tid, meta) for tid, meta in items
                  if meta.get("user") == auth_user]
     result = [_format_token_record(tid, meta) for tid, meta in items]
