@@ -104,6 +104,54 @@
         return el('h2', {className: 'page-heading'}, children);
     }
 
+    // --- Plugin capabilities ---
+    //
+    // Some UI affordances (Macaroon tokens manager) only make sense when an
+    // optional server-side plugin is installed. We learn that from the
+    // devpi-server `/+api` (advertised feature flags) and `/+status`
+    // (importable Python distribution names) responses.
+    //
+    // Both are fetched anyway by the status page; loadPluginCaps() falls
+    // back to its own fetch when callers (users list, index detail) need
+    // the answer before the user has navigated to status.
+    var _pluginCaps = null;
+    var _pluginCapsPromise = null;
+
+    function _setPluginCaps(api, status) {
+        _pluginCaps = {
+            features: ((api && api.features) || []).slice(),
+            versioninfo: (status && status.versioninfo) || {},
+        };
+        return _pluginCaps;
+    }
+
+    function loadPluginCaps() {
+        if (_pluginCaps) return Promise.resolve(_pluginCaps);
+        if (_pluginCapsPromise) return _pluginCapsPromise;
+        _pluginCapsPromise = Promise.all([
+            Api.get('/+api').catch(function () { return {result: {}}; }),
+            Api.get('/+status').catch(function () { return {result: {}}; }),
+        ]).then(function (results) {
+            return _setPluginCaps(results[0].result, results[1].result);
+        }).catch(function () {
+            return _setPluginCaps({}, {});
+        });
+        return _pluginCapsPromise;
+    }
+
+    function hasDevpiTokens() {
+        if (!_pluginCaps) return false;
+        var f = _pluginCaps.features;
+        if (f && f.indexOf('tokens') !== -1) return true;
+        var v = _pluginCaps.versioninfo;
+        return !!(v && Object.prototype.hasOwnProperty.call(v, 'devpi-tokens'));
+    }
+
+    function devpiTokensVersion() {
+        if (!_pluginCaps || !_pluginCaps.versioninfo) return null;
+        return _pluginCaps.versioninfo['devpi-tokens'] || null;
+    }
+
     function buildKebabMenu(items) {
         var menu = el('div', {className: 'kebab-menu'});
         menu.appendChild(el('button', {
@@ -553,7 +601,7 @@
 
     function showUserTokensModal(username) {
         openModal(
-            'Tokens for ' + username,
+            'Admin tokens for ' + username,
             function (body) {
                 body.appendChild(el('div', {
                     id: 'tokens-list-container',
@@ -657,6 +705,903 @@
                 }),
             ]),
         ]);
+    }
+
+    // --- Macaroon tokens (devpi-tokens plugin) ---
+    //
+    // Optional second token manager: appears in the user kebab only when
+    // `devpi-tokens` is installed on the server. Talks directly to the
+    // devpi-tokens HTTP API (`/{user}/+token-create`, `/{user}/+tokens`,
+    // `/{user}/+tokens/{id}`) — we do NOT proxy through `/+admin-api/`.
+    //
+    // Different threat model from admin tokens (raw secret in keyfs, no
+    // audit log, derived tokens not listable). The modal shows a
+    // persistent security banner so users can make an informed choice.
+
+    // devpi-tokens advertises restrictions over the wire as opaque
+    // `name=value` / `name=v1,v2` strings (see
+    // devpi_tokens.restrictions.Restriction.dump()). The client side
+    // re-parses them so we can render them as columns and validate the
+    // existence of expected restrictions.
+    var MACAROON_LIST_RESTRICTIONS = {indexes: 1, projects: 1, allowed: 1};
+    var MACAROON_INT_RESTRICTIONS = {expires: 1, not_before: 1};
+
+    function parseMacaroonRestrictions(strings) {
+        var out = {};
+        if (!strings || !strings.length) return out;
+        for (var i = 0; i < strings.length; i++) {
+            var s = strings[i];
+            var eq = s.indexOf('=');
+            if (eq <= 0) continue;
+            var key = s.substring(0, eq);
+            var raw = s.substring(eq + 1);
+            if (MACAROON_LIST_RESTRICTIONS[key]) {
+                out[key] = raw ? raw.split(',') : [];
+            } else if (MACAROON_INT_RESTRICTIONS[key]) {
+                var n = parseInt(raw, 10);
+                out[key] = isNaN(n) ? null : n;
+            } else {
+                out[key] = raw;
+            }
+        }
+        return out;
+    }
+
+    function formatMacaroonTimestamp(unixTs) {
+        if (unixTs === null || unixTs === undefined) return '—';
+        var d = new Date(unixTs * 1000);
+        if (isNaN(d.getTime())) return String(unixTs);
+        // Locale-friendly short form, no seconds.
+        var iso = d.toISOString().replace('T', ' ').substring(0, 16);
+        return iso + ' UTC';
+    }
+
+    function shortMacaroonId(id) {
+        if (!id) return '';
+        return id.length > 12 ? id.substring(0, 12) : id;
+    }
+
+    // Security banner persists per logged-in user — keying by the human
+    // reading the screen, not by the user whose tokens they're managing
+    // (root managing alice's tokens still wants to see the note once).
+    // Stored in localStorage so it survives reloads but stays per-browser
+    // (different device = different trust context = banner re-appears).
+    function _macaroonBannerKey() {
+        return 'devpi-admin.macaroon-banner-dismissed.'
+            + (Api.getUser() || '_anon');
+    }
+
+    function isMacaroonBannerDismissed() {
+        try { return localStorage.getItem(_macaroonBannerKey()) === '1'; }
+        catch (e) { return false; }
+    }
+
+    function dismissMacaroonBanner() {
+        try { localStorage.setItem(_macaroonBannerKey(), '1'); } catch (e) {}
+    }
+
+    function buildMacaroonSecurityBanner() {
+        if (isMacaroonBannerDismissed()) return null;
+        var banner = el('div', {className: 'macaroon-security-banner'});
+        banner.appendChild(el('button', {
+            type: 'button',
+            className: 'macaroon-security-dismiss',
+            textContent: '×',
+            title: 'Hide and don\'t show again on this device',
+            onclick: function () {
+                dismissMacaroonBanner();
+                if (banner.parentNode) banner.parentNode.removeChild(banner);
+            },
+        }));
+        banner.appendChild(el('strong', {textContent: 'Security note. '}));
+        banner.appendChild(document.createTextNode(
+            'Devpi tokens (macaroon-based, served by the devpi-tokens '
+            + 'plugin) store the raw secret in the server keyfs. Anyone '
+            + 'with filesystem access to the devpi data dir (or a leaked '
+            + 'backup, or a replica disk dump) can use them. For '
+            + 'privileged workflows prefer Admin tokens (hash-only '
+            + 'storage, audit log).'
+        ));
+        return banner;
+    }
+
+    function buildMacaroonNote() {
+        return el('div', {className: 'macaroon-note'},
+            ['ⓘ Derived tokens (`devpi token-derive`) are not '
+                + 'listable — this view only shows initial tokens.']);
+    }
+
+    function showMacaroonTokensModal(username) {
+        openModal(
+            'Devpi tokens for ' + username,
+            function (body) {
+                var _bn = buildMacaroonSecurityBanner();
+                if (_bn) body.appendChild(_bn);
+                body.appendChild(buildMacaroonNote());
+                body.appendChild(el('div', {
+                    id: 'macaroon-tokens-list-container',
+                    textContent: 'Loading…',
+                }));
+            },
+            [
+                el('button', {
+                    className: 'btn',
+                    textContent: '+ Issue new',
+                    onclick: function () { showMacaroonIssueModal(username); },
+                }),
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ],
+            {width: 'wide'});
+        renderMacaroonTokensList(username);
+    }
+
+    function renderMacaroonTokensList(username) {
+        var container = document.getElementById('macaroon-tokens-list-container');
+        if (!container) return;
+        Api.get('/' + encodeURIComponent(username) + '/+tokens')
+            .then(function (data) {
+                clear(container);
+                var tokens = (data && data.result && data.result.tokens) || {};
+                var ids = Object.keys(tokens);
+                if (!ids.length) {
+                    container.appendChild(el('div', {
+                        className: 'tokens-empty',
+                        textContent: 'No Devpi tokens.',
+                    }));
+                    return;
+                }
+                var table = el('table', {className: 'tokens-table'});
+                var thead = el('thead');
+                thead.appendChild(el('tr', null, [
+                    el('th', {textContent: 'ID'}),
+                    el('th', {textContent: 'Indexes'}),
+                    el('th', {textContent: 'Allowed'}),
+                    el('th', {textContent: 'Projects'}),
+                    el('th', {textContent: 'Expires'}),
+                    el('th', {textContent: 'Not before'}),
+                    el('th', {}),
+                ]));
+                table.appendChild(thead);
+                var tbody = el('tbody');
+                // Stable order: by token id ascending.
+                ids.sort();
+                for (var i = 0; i < ids.length; i++) {
+                    var t = tokens[ids[i]] || {};
+                    var parsed = parseMacaroonRestrictions(t.restrictions);
+                    tbody.appendChild(buildMacaroonTokenRow(ids[i], parsed, username));
+                }
+                table.appendChild(tbody);
+                table.classList.add('tokens-table-macaroon');
+                var wrap = el('div', {className: 'tokens-table-wrap'});
+                wrap.appendChild(table);
+                container.appendChild(wrap);
+            })
+            .catch(function (err) {
+                clear(container);
+                container.appendChild(el('div', {
+                    className: 'error-text',
+                    textContent: 'Failed to load Devpi tokens: ' + err.message,
+                }));
+            });
+    }
+
+    function _macaroonRestrictionCell(values, fallbackText, warn) {
+        if (!values || !values.length) {
+            var span = el('span', {
+                className: warn ? 'macaroon-warn' : 'macaroon-faint',
+                textContent: fallbackText,
+            });
+            return el('td', {className: 'macaroon-cell-wrap'}, [span]);
+        }
+        // Render each value as a pill so multi-value cells flow to a new
+        // line instead of triggering the table's horizontal scrollbar.
+        var chips = el('div', {className: 'macaroon-chips'});
+        for (var i = 0; i < values.length; i++) {
+            chips.appendChild(el('span', {
+                className: 'macaroon-chip',
+                textContent: values[i],
+            }));
+        }
+        return el('td', {className: 'macaroon-cell-wrap'}, [chips]);
+    }
+
+    // Permission catalog — drives the checkbox grid in the Issue modal and
+    // gates the anti-footgun warning. Basic block is checked by default;
+    // destructive ops are collapsed in an "Advanced" section so a user
+    // does not include them without intent.
+    var MACAROON_PERMS_BASIC = [
+        {key: 'pkg_read', desc: 'pip install / browse'},
+        {key: 'upload', desc: 'twine upload (does NOT include delete)'},
+        {key: 'toxresult_upload', desc: 'upload tox results'},
+    ];
+    var MACAROON_PERMS_DESTRUCTIVE = [
+        {key: 'del_entry', desc: 'delete individual files'},
+        {key: 'del_project', desc: 'delete entire project'},
+        {key: 'del_verdata', desc: 'delete versions'},
+        {key: 'index_modify', desc: 'change index config (incl. ACLs)'},
+        {key: 'index_delete', desc: 'delete the index entirely'},
+    ];
+    var MACAROON_PERMS_DEFAULT_CHECKED = {pkg_read: 1, upload: 1};
+
+    var MACAROON_EXPIRES_PRESETS = [
+        {seconds: 3600, label: '1 hour'},
+        {seconds: 86400, label: '1 day'},
+        {seconds: 604800, label: '7 days'},
+        {seconds: 2592000, label: '30 days'},
+        {seconds: 7776000, label: '90 days'},
+        {seconds: 31536000, label: '1 year'},
+    ];
+    var MACAROON_DEFAULT_EXPIRES = 86400;  // 1 day — matches admin tokens
+    // pip-conf default; longer TTL or custom date is explicit opt-in.
+
+    var _MACAROON_INDEX_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+    function _parseLinesOrCsv(raw) {
+        // Accept newline OR comma separated, drop empties and # comments.
+        if (!raw) return [];
+        var parts = String(raw).split(/[\n,]+/);
+        var out = [];
+        for (var i = 0; i < parts.length; i++) {
+            var v = parts[i].trim();
+            if (v && v.charAt(0) !== '#') out.push(v);
+        }
+        return out;
+    }
+
+    function buildMacaroonTokenRow(tokenId, parsed, username) {
+        var indexesCell = _macaroonRestrictionCell(
+            parsed.indexes, '⚠ any', true);
+        var allowedCell = _macaroonRestrictionCell(
+            parsed.allowed, '⚠ all (except user_*)', true);
+        var projectsCell = _macaroonRestrictionCell(
+            parsed.projects, '—', false);
+        var idCell = el('td', {
+            className: 'mono',
+            textContent: shortMacaroonId(tokenId),
+            title: tokenId,
+        });
+        var actions = el('td', null, [
+            el('button', {
+                className: 'btn btn-small',
+                textContent: 'Revoke',
+                onclick: function () {
+                    if (!confirm('Revoke Devpi token "'
+                            + shortMacaroonId(tokenId) + '"?')) return;
+                    Api.del('/' + encodeURIComponent(username)
+                            + '/+tokens/' + encodeURIComponent(tokenId))
+                        .then(function () {
+                            renderMacaroonTokensList(username);
+                        })
+                        .catch(showModalError);
+                },
+            }),
+        ]);
+        return el('tr', null, [
+            idCell,
+            indexesCell,
+            allowedCell,
+            projectsCell,
+            el('td', {textContent: formatMacaroonTimestamp(parsed.expires)}),
+            el('td', {textContent: formatMacaroonTimestamp(parsed.not_before)}),
+            actions,
+        ]);
+    }
+
+    // --- Per-index macaroon listing ---
+    //
+    // devpi-tokens has no per-index listing endpoint; we fetch the index
+    // owner's whole token list (`GET /<owner>/+tokens`) and filter
+    // client-side by the `indexes` caveat. Tokens with no `indexes`
+    // restriction (super-tokens) implicitly grant access to every index
+    // and are always included.
+
+    function _macaroonTokenAppliesTo(parsed, userIdx) {
+        if (!parsed.indexes || !parsed.indexes.length) return true;
+        return parsed.indexes.indexOf(userIdx) !== -1;
+    }
+
+    function showIndexMacaroonTokensModal(idxUser, idxName) {
+        var userIdx = idxUser + '/' + idxName;
+        openModal(
+            'Devpi tokens for ' + userIdx,
+            function (body) {
+                var _bn = buildMacaroonSecurityBanner();
+                if (_bn) body.appendChild(_bn);
+                body.appendChild(el('div', {className: 'macaroon-note'}, [
+                    'ⓘ Showing tokens issued for ' + idxUser
+                        + ' that grant access to this index. '
+                        + 'Tokens without an `indexes` restriction '
+                        + '(super-tokens) are also included.',
+                ]));
+                body.appendChild(el('div', {
+                    id: 'macaroon-index-tokens-list-container',
+                    textContent: 'Loading…',
+                }));
+            },
+            [
+                el('button', {
+                    className: 'btn',
+                    textContent: '+ Issue new',
+                    onclick: function () {
+                        // Pre-select this index in the issue form.
+                        showMacaroonIssueModal(idxUser, [userIdx]);
+                    },
+                }),
+                el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                }),
+            ],
+            {width: 'wide'});
+        renderIndexMacaroonTokensList(idxUser, idxName);
+    }
+
+    function renderIndexMacaroonTokensList(idxUser, idxName) {
+        var userIdx = idxUser + '/' + idxName;
+        var container = document.getElementById(
+            'macaroon-index-tokens-list-container');
+        if (!container) return;
+        Api.get('/' + encodeURIComponent(idxUser) + '/+tokens')
+            .then(function (data) {
+                clear(container);
+                var tokens = (data && data.result && data.result.tokens) || {};
+                var ids = Object.keys(tokens);
+                // Filter to tokens that apply to this index.
+                var matching = [];
+                for (var i = 0; i < ids.length; i++) {
+                    var parsed = parseMacaroonRestrictions(
+                        (tokens[ids[i]] || {}).restrictions);
+                    if (_macaroonTokenAppliesTo(parsed, userIdx)) {
+                        matching.push({id: ids[i], parsed: parsed});
+                    }
+                }
+                if (!matching.length) {
+                    container.appendChild(el('div', {
+                        className: 'tokens-empty',
+                        textContent: 'No Devpi tokens for this index.',
+                    }));
+                    return;
+                }
+                var table = el('table', {
+                    className: 'tokens-table tokens-table-macaroon',
+                });
+                var thead = el('thead');
+                thead.appendChild(el('tr', null, [
+                    el('th', {textContent: 'ID'}),
+                    el('th', {textContent: 'Indexes'}),
+                    el('th', {textContent: 'Allowed'}),
+                    el('th', {textContent: 'Projects'}),
+                    el('th', {textContent: 'Expires'}),
+                    el('th', {textContent: 'Not before'}),
+                    el('th', {}),
+                ]));
+                table.appendChild(thead);
+                var tbody = el('tbody');
+                matching.sort(function (a, b) {
+                    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+                });
+                for (var j = 0; j < matching.length; j++) {
+                    tbody.appendChild(_buildMacaroonIndexTokenRow(
+                        matching[j].id, matching[j].parsed, idxUser, idxName));
+                }
+                table.appendChild(tbody);
+                var wrap = el('div', {className: 'tokens-table-wrap'});
+                wrap.appendChild(table);
+                container.appendChild(wrap);
+            })
+            .catch(function (err) {
+                clear(container);
+                container.appendChild(el('div', {
+                    className: 'error-text',
+                    textContent: 'Failed to load tokens: ' + err.message,
+                }));
+            });
+    }
+
+    // Same row layout as the per-user listing but the Revoke action
+    // refreshes the per-index filtered view, not the user-level one.
+    function _buildMacaroonIndexTokenRow(tokenId, parsed, idxUser, idxName) {
+        var indexesCell = _macaroonRestrictionCell(
+            parsed.indexes, '⚠ any', true);
+        var allowedCell = _macaroonRestrictionCell(
+            parsed.allowed, '⚠ all (except user_*)', true);
+        var projectsCell = _macaroonRestrictionCell(
+            parsed.projects, '—', false);
+        var idCell = el('td', {
+            className: 'mono',
+            textContent: shortMacaroonId(tokenId),
+            title: tokenId,
+        });
+        var actions = el('td', null, [
+            el('button', {
+                className: 'btn btn-small',
+                textContent: 'Revoke',
+                onclick: function () {
+                    if (!confirm('Revoke Devpi token "'
+                            + shortMacaroonId(tokenId) + '"?')) return;
+                    Api.del('/' + encodeURIComponent(idxUser)
+                            + '/+tokens/' + encodeURIComponent(tokenId))
+                        .then(function () {
+                            renderIndexMacaroonTokensList(idxUser, idxName);
+                        })
+                        .catch(showModalError);
+                },
+            }),
+        ]);
+        return el('tr', null, [
+            idCell,
+            indexesCell,
+            allowedCell,
+            projectsCell,
+            el('td', {textContent: formatMacaroonTimestamp(parsed.expires)}),
+            el('td', {textContent: formatMacaroonTimestamp(parsed.not_before)}),
+            actions,
+        ]);
+    }
+
+    // --- Macaroon issue modal ---
+
+    function _macaroonPermCheckbox(perm, checked) {
+        var cb = el('input', {
+            type: 'checkbox',
+            id: 'macaroon-perm-' + perm.key,
+            value: perm.key,
+            className: 'macaroon-perm-cb',
+        });
+        if (checked) cb.checked = true;
+        var label = el('label', {
+            className: 'macaroon-perm-label',
+            for: 'macaroon-perm-' + perm.key,
+        }, [
+            cb,
+            el('span', {className: 'macaroon-perm-name', textContent: perm.key}),
+            el('span', {className: 'macaroon-perm-desc', textContent: ' — ' + perm.desc}),
+        ]);
+        return label;
+    }
+
+    function showMacaroonIssueModal(username, preselectIndexes) {
+        // Fetch known indexes first so the picker can show options. While
+        // devpi-tokens accepts arbitrary user/index strings, restricting
+        // the UI to actually-existing indexes prevents typos and matches
+        // the existing acl_upload / acl_read picker UX.
+        var presel = (preselectIndexes || []).slice();
+        fetchRoot().then(function (rootResult) {
+            var allIndexes = getAllIndexes(rootResult)
+                .map(function (idx) { return idx._full; })
+                .sort();
+            _renderMacaroonIssueModal(username, allIndexes, presel);
+        }).catch(function () {
+            // Fall back to empty options — user can still pick via dropdown
+            // if there are server-side indexes not in this fetch.
+            _renderMacaroonIssueModal(username, presel, presel);
+        });
+    }
+
+    function _renderMacaroonIssueModal(username, indexOptions, preselect) {
+        openModal(
+            'Issue Devpi token — ' + username,
+            function (body) {
+                var _bn = buildMacaroonSecurityBanner();
+                if (_bn) body.appendChild(_bn);
+
+                // Indexes — tag picker (consistent with acl_upload/acl_read)
+                var indexesGroup = el('div', {className: 'form-group'});
+                indexesGroup.appendChild(el('label', {
+                    textContent: 'Indexes (required)',
+                }));
+                indexesGroup.appendChild(buildTagPicker(
+                    'macaroon-indexes', preselect || [],
+                    indexOptions, [], false, null));
+                indexesGroup.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'Pick from the dropdown. Cross-index '
+                        + 'requests will be denied by the token.',
+                }));
+                body.appendChild(indexesGroup);
+
+                // Permissions
+                var permsGroup = el('div', {className: 'form-group'});
+                permsGroup.appendChild(el('label', {textContent: 'Permissions'}));
+                permsGroup.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'At least one. Token will only allow operations '
+                        + 'in this set, intersected with the user\'s ACL.',
+                }));
+                var basicWrap = el('div', {className: 'macaroon-perms-block'});
+                for (var i = 0; i < MACAROON_PERMS_BASIC.length; i++) {
+                    var p = MACAROON_PERMS_BASIC[i];
+                    basicWrap.appendChild(_macaroonPermCheckbox(
+                        p, !!MACAROON_PERMS_DEFAULT_CHECKED[p.key]));
+                }
+                permsGroup.appendChild(basicWrap);
+
+                var advToggle = el('button', {
+                    type: 'button',
+                    className: 'macaroon-adv-toggle',
+                    textContent: '▸ Advanced (destructive operations)',
+                });
+                var advWrap = el('div', {
+                    className: 'macaroon-perms-block macaroon-perms-advanced',
+                    hidden: true,
+                });
+                advWrap.appendChild(el('div', {
+                    className: 'macaroon-warn-text',
+                    textContent: '⚠ These permissions allow data destruction '
+                        + 'or index reconfiguration. Only enable if the token '
+                        + 'is for a service that genuinely needs them.',
+                }));
+                for (var j = 0; j < MACAROON_PERMS_DESTRUCTIVE.length; j++) {
+                    advWrap.appendChild(
+                        _macaroonPermCheckbox(MACAROON_PERMS_DESTRUCTIVE[j], false));
+                }
+                advToggle.addEventListener('click', function () {
+                    advWrap.hidden = !advWrap.hidden;
+                    advToggle.textContent = (advWrap.hidden ? '▸' : '▾')
+                        + ' Advanced (destructive operations)';
+                });
+                permsGroup.appendChild(advToggle);
+                permsGroup.appendChild(advWrap);
+                body.appendChild(permsGroup);
+
+                // Projects (optional)
+                var projGroup = el('div', {className: 'form-group'});
+                projGroup.appendChild(el('label', {
+                    textContent: 'Project filter (optional)',
+                }));
+                projGroup.appendChild(el('textarea', {
+                    id: 'macaroon-projects',
+                    rows: 2,
+                    placeholder: 'mycompany-*\nnumpy',
+                    spellcheck: 'false',
+                }));
+                projGroup.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'One per line or comma-separated. '
+                        + 'Empty = all projects on the bound indexes.',
+                }));
+                body.appendChild(projGroup);
+
+                // Expires — single select with preset durations and a
+                // "Custom…" option that reveals an absolute datetime
+                // picker. Single source of truth, matches the visual
+                // language of every other modal field.
+                var expGroup = el('div', {className: 'form-group'});
+                expGroup.appendChild(el('label', {textContent: 'Expires'}));
+                var expSel = el('select', {id: 'macaroon-expires-select'});
+                for (var k = 0; k < MACAROON_EXPIRES_PRESETS.length; k++) {
+                    var preset = MACAROON_EXPIRES_PRESETS[k];
+                    var optEl = el('option', {
+                        value: String(preset.seconds),
+                        textContent: preset.label,
+                    });
+                    if (preset.seconds === MACAROON_DEFAULT_EXPIRES) {
+                        optEl.selected = true;
+                    }
+                    expSel.appendChild(optEl);
+                }
+                expSel.appendChild(el('option', {
+                    value: 'custom',
+                    textContent: 'Custom…',
+                }));
+                expGroup.appendChild(expSel);
+                var customWrap = el('div', {
+                    id: 'macaroon-exp-custom-wrap',
+                    className: 'macaroon-exp-custom-wrap',
+                    hidden: true,
+                });
+                customWrap.appendChild(el('input', {
+                    type: 'datetime-local',
+                    id: 'macaroon-exp-custom-date',
+                }));
+                expGroup.appendChild(customWrap);
+                expSel.addEventListener('change', function () {
+                    customWrap.hidden = (expSel.value !== 'custom');
+                    if (customWrap.hidden) {
+                        var f = document.getElementById('macaroon-exp-custom-date');
+                        if (f) f.value = '';
+                    }
+                });
+                body.appendChild(expGroup);
+
+                // Not before (optional)
+                var nbGroup = el('div', {className: 'form-group'});
+                nbGroup.appendChild(el('label', {
+                    textContent: 'Not before (optional)',
+                }));
+                nbGroup.appendChild(el('input', {
+                    type: 'datetime-local',
+                    id: 'macaroon-not-before',
+                }));
+                nbGroup.appendChild(el('div', {
+                    className: 'form-hint',
+                    textContent: 'Token is rejected before this time. '
+                        + 'Useful for scheduled rollouts.',
+                }));
+                body.appendChild(nbGroup);
+
+                // Issued result container (hidden until success)
+                body.appendChild(el('div', {
+                    id: 'macaroon-issued-result',
+                    hidden: true,
+                }));
+            },
+            [
+                el('button', {
+                    className: 'btn',
+                    textContent: 'Cancel',
+                    onclick: function () {
+                        showMacaroonTokensModal(username);
+                    },
+                }),
+                el('button', {
+                    id: 'macaroon-issue-submit',
+                    className: 'btn btn-primary',
+                    textContent: 'Issue token',
+                    onclick: function () {
+                        _submitMacaroonIssue(username, this);
+                    },
+                }),
+            ],
+            {width: 'wide'});
+    }
+
+    function _collectMacaroonForm() {
+        var indexes = getTagPickerValues('macaroon-indexes');
+        var projects = _parseLinesOrCsv(
+            (document.getElementById('macaroon-projects') || {}).value);
+        var allowed = [];
+        var cbs = document.querySelectorAll('.macaroon-perm-cb');
+        for (var i = 0; i < cbs.length; i++) {
+            if (cbs[i].checked) allowed.push(cbs[i].value);
+        }
+        // Expires: either a preset TTL (seconds from now / from not-before)
+        // or an absolute datetime when "Custom…" is selected.
+        var expSel = document.getElementById('macaroon-expires-select');
+        var ttl = null;
+        var expiresAbs = null;
+        if (expSel && expSel.value === 'custom') {
+            var customField = document.getElementById('macaroon-exp-custom-date');
+            if (customField && customField.value) {
+                var dc = new Date(customField.value);
+                if (!isNaN(dc.getTime())) expiresAbs = Math.floor(dc.getTime() / 1000);
+            }
+        } else if (expSel) {
+            ttl = parseInt(expSel.value, 10);
+        }
+        var nbField = document.getElementById('macaroon-not-before');
+        var notBefore = null;
+        if (nbField && nbField.value) {
+            var dn = new Date(nbField.value);
+            if (!isNaN(dn.getTime())) notBefore = Math.floor(dn.getTime() / 1000);
+        }
+        return {
+            indexes: indexes,
+            projects: projects,
+            allowed: allowed,
+            ttl: ttl,
+            expires_abs: expiresAbs,
+            not_before: notBefore,
+        };
+    }
+
+    function _validateMacaroonForm(form) {
+        if (!form.indexes.length) {
+            return 'Pick at least one index.';
+        }
+        for (var i = 0; i < form.indexes.length; i++) {
+            if (!_MACAROON_INDEX_RE.test(form.indexes[i])) {
+                return 'Invalid index format: "' + form.indexes[i]
+                    + '". Expected user/index.';
+            }
+        }
+        if (!form.allowed.length) {
+            return 'Select at least one permission.';
+        }
+        if (form.ttl === null && form.expires_abs === null) {
+            return 'Pick an expiry preset or enter a custom date.';
+        }
+        var now = Math.floor(Date.now() / 1000);
+        if (form.expires_abs !== null) {
+            if (form.expires_abs <= now) {
+                return 'Custom expiry date is in the past.';
+            }
+            if (form.not_before !== null && form.expires_abs <= form.not_before) {
+                return 'Custom expiry date must be after the not-before date.';
+            }
+        } else if (form.not_before !== null) {
+            if (form.not_before + form.ttl <= now) {
+                return 'Not-before plus expiry preset is already in the past.';
+            }
+        }
+        return null;
+    }
+
+    function _submitMacaroonIssue(username, btn) {
+        var form = _collectMacaroonForm();
+        var err = _validateMacaroonForm(form);
+        if (err) { showModalError(err); return; }
+        var nowSec = Math.floor(Date.now() / 1000);
+        var expires;
+        if (form.expires_abs !== null) {
+            expires = form.expires_abs;
+        } else {
+            var basis = form.not_before !== null ? form.not_before : nowSec;
+            expires = basis + form.ttl;
+        }
+        var body = {
+            indexes: form.indexes,
+            allowed: form.allowed,
+            expires: expires,
+        };
+        if (form.projects.length) body.projects = form.projects;
+        if (form.not_before !== null) body.not_before = form.not_before;
+
+        var orig = btn.textContent;
+        btn.textContent = 'Issuing…';
+        btn.disabled = true;
+        Api.post('/' + encodeURIComponent(username) + '/+token-create', body)
+            .then(function (data) {
+                var token = data && data.result && data.result.token;
+                if (!token) throw new Error('Server returned no token.');
+                _renderMacaroonIssued(username, token, form);
+            })
+            .catch(function (e) {
+                showModalError(e.message || 'Failed to issue token.');
+                btn.textContent = orig;
+                btn.disabled = false;
+            });
+    }
+
+    // --- Macaroon token-issued (read-once) view ---
+
+    function _macaroonHostPath(publicUrl, idx) {
+        // publicUrl is "https://devpi.example.com[:port]" (no trailing slash).
+        return publicUrl + '/' + idx;
+    }
+
+    function _macaroonAuthUrl(publicUrl, idx, username, token) {
+        // For pip.conf index-url. URL-encode the token because '+' / '=' /
+        // '/' are valid in macaroon base64 alphabet and would corrupt the URL.
+        var u = new URL(publicUrl);
+        var auth = encodeURIComponent(username) + ':' + encodeURIComponent(token);
+        return u.protocol + '//' + auth + '@' + u.host + '/' + idx + '/+simple/';
+    }
+
+    function _macaroonPipConfText(publicUrl, indexes, username, token) {
+        var lines = ['[global]'];
+        var primary = indexes[0];
+        lines.push('index-url = ' + _macaroonAuthUrl(publicUrl, primary, username, token));
+        for (var i = 1; i < indexes.length; i++) {
+            lines.push('extra-index-url = '
+                + _macaroonAuthUrl(publicUrl, indexes[i], username, token));
+        }
+        lines.push('trusted-host = ' + hostFromUrl(publicUrl));
+        lines.push('');
+        return lines.join('\n');
+    }
+
+    function _macaroonPypircText(publicUrl, indexes, username, token) {
+        var aliases = [];
+        var sections = [];
+        for (var i = 0; i < indexes.length; i++) {
+            var alias = 'devpi-' + indexes[i].replace(/\//g, '-');
+            aliases.push(alias);
+            sections.push(
+                '[' + alias + ']\n'
+                + 'repository = ' + _macaroonHostPath(publicUrl, indexes[i]) + '/\n'
+                + 'username = ' + username + '\n'
+                + 'password = ' + token);
+        }
+        return '[distutils]\n'
+            + 'index-servers = ' + aliases.join(' ') + '\n\n'
+            + sections.join('\n\n') + '\n';
+    }
+
+    function _macaroonTwineText(publicUrl, idx, username, token) {
+        return 'export TWINE_REPOSITORY_URL="'
+                + _macaroonHostPath(publicUrl, idx) + '/"\n'
+            + 'export TWINE_USERNAME="' + username + '"\n'
+            + 'export TWINE_PASSWORD="' + token + '"\n';
+    }
+
+    function _macaroonReadOnceBlock(label, content, filename) {
+        var wrap = el('div', {className: 'macaroon-issued-block'});
+        wrap.appendChild(el('div', {
+            className: 'macaroon-issued-label',
+            textContent: label,
+        }));
+        var actions = el('div', {className: 'pip-conf-actions'});
+        var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
+        copyBtn.addEventListener('click', function () {
+            copyText(content).then(function () { flashCopied(copyBtn); });
+        });
+        actions.appendChild(copyBtn);
+        if (filename) {
+            actions.appendChild(el('button', {
+                className: 'btn',
+                textContent: 'Download',
+                onclick: function () { downloadFile(content, filename); },
+            }));
+        }
+        wrap.appendChild(actions);
+        wrap.appendChild(el('pre', {
+            className: 'pip-conf-preview',
+            textContent: content,
+        }));
+        return wrap;
+    }
+
+    function _renderMacaroonIssued(username, token, form) {
+        // Hide form fields, swap footer to single "Done" button.
+        var ids = [
+            'macaroon-indexes', 'macaroon-projects', 'macaroon-not-before',
+            'macaroon-issue-submit',
+        ];
+        // Hide all form-group divs by walking from labels
+        var formGroups = modalBody.querySelectorAll('.form-group');
+        for (var g = 0; g < formGroups.length; g++) formGroups[g].hidden = true;
+        var advToggle = modalBody.querySelector('.macaroon-adv-toggle');
+        if (advToggle) advToggle.hidden = true;
+
+        // Replace footer
+        clear(modalFooter);
+        modalFooter.appendChild(el('button', {
+            className: 'btn btn-primary',
+            textContent: 'Done',
+            onclick: function () {
+                showMacaroonTokensModal(username);
+            },
+        }));
+
+        getPublicUrl().then(function (publicUrl) {
+            var result = document.getElementById('macaroon-issued-result');
+            if (!result) return;
+            clear(result);
+            result.hidden = false;
+
+            result.appendChild(el('div', {
+                className: 'macaroon-issued-warning',
+                textContent: '⚠ This is the only time the token is shown. '
+                    + 'Copy it now — it cannot be recovered, only revoked.',
+            }));
+
+            result.appendChild(_macaroonReadOnceBlock(
+                'Token (raw)', token, null));
+
+            // pip.conf — meaningful for any read-capable token
+            var hasRead = form.allowed.indexOf('pkg_read') !== -1;
+            if (hasRead) {
+                var pipConf = _macaroonPipConfText(
+                    publicUrl, form.indexes, username, token);
+                result.appendChild(_macaroonReadOnceBlock(
+                    'pip.conf', pipConf, 'pip.conf'));
+            }
+
+            // .pypirc + TWINE — for upload-capable tokens
+            var hasUpload = form.allowed.indexOf('upload') !== -1;
+            if (hasUpload) {
+                var pypirc = _macaroonPypircText(
+                    publicUrl, form.indexes, username, token);
+                result.appendChild(_macaroonReadOnceBlock(
+                    '.pypirc', pypirc, '.pypirc'));
+                // TWINE env block uses the first index (one repo per env).
+                var twine = _macaroonTwineText(
+                    publicUrl, form.indexes[0], username, token);
+                result.appendChild(_macaroonReadOnceBlock(
+                    'TWINE_* env', twine, null));
+            }
+
+            // user:token credential pair (curl, devpi login)
+            result.appendChild(_macaroonReadOnceBlock(
+                'user : token (for curl -u, devpi login, custom tools)',
+                username + ':' + token, null));
+        });
     }
 
     function formatExpiry(seconds) {
@@ -1598,7 +2543,8 @@
 
     function loadUsers() {
         showLoading();
-        fetchRoot().then(function (result) {
+        Promise.all([fetchRoot(), loadPluginCaps()]).then(function (parts) {
+            var result = parts[0];
             clear(content);
             var headerChildren = [el('h2', {textContent: 'Users'})];
             if (Api.getUser() === 'root') {
@@ -1635,12 +2581,21 @@
                         menuItems.push({label: 'Edit', onclick: function () { closeAllKebabs(); showUserModal(name, info); }});
                         (function (uname) {
                             menuItems.push({
-                                label: 'Tokens',
+                                label: 'Admin tokens',
                                 onclick: function () {
                                     closeAllKebabs();
                                     showUserTokensModal(uname);
                                 },
                             });
+                            if (hasDevpiTokens()) {
+                                menuItems.push({
+                                    label: 'Devpi tokens',
+                                    onclick: function () {
+                                        closeAllKebabs();
+                                        showMacaroonTokensModal(uname);
+                                    },
+                                });
+                            }
                         })(name);
                     }
                     if (currentUser === 'root' && name !== 'root') {
@@ -1821,9 +2776,14 @@
 
     function loadIndexes() {
         showLoading();
-        fetchRoot().then(function (result) {
+        // Load plugin caps in parallel — `renderIndexCards` consults
+        // `hasDevpiTokens()` to decide whether to surface the per-index
+        // Devpi tokens kebab item. Without this prefetch, navigating
+        // directly to /#indexes (no Status / Users visited first) would
+        // hide the item even on servers where the plugin is installed.
+        Promise.all([fetchRoot(), loadPluginCaps()]).then(function (parts) {
+            var result = parts[0];
             clear(content);
-
             content.appendChild(el('div', {id: 'indexes-header'}));
             content.appendChild(el('div', {id: 'indexes-content'}));
             renderIndexCards(result);
@@ -1995,6 +2955,19 @@
                             },
                         });
                     })(idx._full, idx.acl_upload);
+                }
+                if ((loggedIn === 'root' || loggedIn === idx._user)
+                        && hasDevpiTokens()) {
+                    (function (idxRef) {
+                        menuItems.push({
+                            label: 'Devpi tokens',
+                            onclick: function () {
+                                closeAllKebabs();
+                                showIndexMacaroonTokensModal(
+                                    idxRef._user, idxRef._name);
+                            },
+                        });
+                    })(idx);
                 }
                 if (loggedIn === 'root' || loggedIn === idx._user) {
                     (function (idxRef) {
@@ -2956,6 +3929,9 @@
             var api = results[0].result;
             var status = results[1].result;
             var replicaPolls = (results[2] && results[2].result) || {};
+            // Reuse this fetch to seed plugin capability cache so other
+            // views can synchronously branch on it.
+            _setPluginCaps(api, status);
             clear(content);
 
             content.appendChild(el('h2', {className: 'page-heading'}, ['Status']));
@@ -2985,6 +3961,13 @@
             );
             if (api.features && api.features.length) {
                 infoRows.push(['Features', api.features.join(', ')]);
+            }
+            if (hasDevpiTokens()) {
+                var tokensVer = devpiTokensVersion();
+                infoRows.push([
+                    'Devpi tokens',
+                    'supported' + (tokensVer ? ' (devpi-tokens ' + tokensVer + ')' : ''),
+                ]);
             }
             for (var i = 0; i < infoRows.length; i++) {
                 infoCard.appendChild(statusRow(infoRows[i][0], infoRows[i][1]));

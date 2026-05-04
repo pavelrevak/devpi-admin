@@ -123,9 +123,16 @@ talks to the standard devpi JSON API directly.
 
 ### Users
 - Create, edit (email, password), delete users (admin only)
-- **Tokens manager** (kebab -> Tokens) - per-user list with label, **index, scope**,
-  expiry, issuer, IP; revoke individual or "Reset all". Wide modal layout so the table
-  doesn't overflow on stage indexes with long names.
+- **Admin tokens manager** (kebab -> Admin tokens) - per-user list with label,
+  **index, scope**, expiry, issuer, IP; revoke individual or "Reset all". Wide modal
+  layout so the table doesn't overflow on stage indexes with long names.
+- **Devpi tokens manager** (kebab -> Devpi tokens, conditional) - appears only when
+  the optional `devpi-tokens` plugin is installed on the server. Lets you list,
+  issue, and revoke macaroon tokens via the same modal UX (tag picker for indexes,
+  permission checkboxes with destructive ops in an Advanced section, expiry select
+  with custom date, read-once issued view with pip.conf / .pypirc / TWINE env).
+  Different threat model from Admin tokens (raw secret in keyfs vs. hash-only),
+  surfaced via a dismissible security banner. See "Optional plugins" below.
 
 ### Packages
 - Client-side search with PEP 503 name normalization and relevance ranking
@@ -230,6 +237,43 @@ ExecStart=/opt/pypi/venv/bin/devpi-server \
 ```
 
 See `INSTALL.md` for a full systemd unit example.
+
+### Optional plugins
+
+#### `devpi-tokens` coexistence
+
+`devpi-admin` plays nicely with the `devpi-tokens` plugin. When installed,
+the SPA detects it (via `/+api` features list and `/+status` versioninfo)
+and adds a **Devpi tokens** kebab item to user cards and to your own index
+cards, exposing list / issue / revoke directly from the UI.
+
+```bash
+/var/lib/pypi/venv/bin/pip install devpi-tokens
+systemctl --user restart devpi
+```
+
+The two token systems run side by side without conflict:
+
+| | Admin tokens | Devpi tokens |
+|---|---|---|
+| Plugin | `devpi-admin` (built-in) | `devpi-tokens` (optional) |
+| Storage | SHA-256 hash in keyfs | Raw HMAC key in keyfs |
+| Listable (incl. derived) | yes, all | initial only — derived macaroons are stateless |
+| Audit log on lookup | yes | no |
+| HTTP method whitelist | `read` blocks DELETE; `upload` blocks DELETE | relies on `--allowed` permission filter |
+| Multi-index per token | no (1:1) | yes |
+| Per-project filter | no | yes (`--projects`) |
+| CLI compatibility | UI / API only | works with `devpi token-login` |
+
+**Threat model note.** Macaroon HMAC verification requires the secret in
+plaintext on the server, so `devpi-tokens` cannot hash-store; a leaked
+backup or replica disk dump exposes working credentials. Prefer Admin
+tokens for privileged workflows. The UI surfaces this via a (dismissible)
+security banner in every Devpi tokens modal.
+
+`acl_read` (provided by `devpi-admin`) applies to both token systems
+identically — devpi evaluates `pkg_read` ACL against whichever identity
+the auth chain produced, regardless of token source.
 
 ## Usage
 

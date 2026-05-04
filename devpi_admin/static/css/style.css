@@ -706,6 +706,194 @@ body {
     padding: 24px 12px;
 }
 
+.macaroon-security-banner {
+    position: relative;
+    background: #fff8e1;
+    border: 1px solid #ffd97a;
+    color: #5b4500;
+    border-radius: 4px;
+    padding: 10px 32px 10px 12px;
+    margin-bottom: 14px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.macaroon-security-dismiss {
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: inherit;
+    font-size: 18px;
+    line-height: 1;
+    padding: 4px 8px;
+    opacity: 0.6;
+}
+
+.macaroon-security-dismiss:hover {
+    opacity: 1;
+}
+
+[data-theme="dark"] .macaroon-security-banner {
+    background: #3a2e10;
+    border-color: #6b5318;
+    color: #f0d989;
+}
+
+.macaroon-coming-soon {
+    text-align: center;
+    color: var(--text-faint);
+    padding: 24px 12px;
+    font-style: italic;
+}
+
+.macaroon-note {
+    color: var(--text-faint);
+    font-size: 12px;
+    margin: 0 0 12px;
+    line-height: 1.5;
+}
+
+.macaroon-warn {
+    color: #b8650b;
+    font-weight: 500;
+}
+
+[data-theme="dark"] .macaroon-warn {
+    color: #f0a35a;
+}
+
+.macaroon-faint {
+    color: var(--text-faint);
+}
+
+/* Chips inside macaroon listing cells — multi-value cells (indexes,
+   allowed, projects) wrap to additional rows instead of triggering
+   the table's horizontal scrollbar. */
+
+.tokens-table-macaroon td.macaroon-cell-wrap {
+    white-space: normal;
+    max-width: 320px;
+}
+
+.macaroon-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+}
+
+.macaroon-chip {
+    display: inline-block;
+    padding: 1px 7px;
+    background: var(--border-light);
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+
+/* Issue modal — permission picker */
+
+.macaroon-perms-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0;
+    padding: 8px 10px;
+    background: var(--table-head-bg);
+    border-radius: 4px;
+}
+
+.macaroon-perms-block.macaroon-perms-advanced {
+    border: 1px solid #ffd97a;
+    background: #fff8e1;
+}
+
+[data-theme="dark"] .macaroon-perms-block.macaroon-perms-advanced {
+    background: #3a2e10;
+    border-color: #6b5318;
+}
+
+.macaroon-perm-label {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.macaroon-perm-cb {
+    margin: 0;
+}
+
+.macaroon-perm-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-weight: 500;
+}
+
+.macaroon-perm-desc {
+    color: var(--text-faint);
+}
+
+.macaroon-adv-toggle {
+    background: none;
+    border: none;
+    color: var(--accent, #1976d2);
+    cursor: pointer;
+    padding: 4px 0;
+    font-size: 12px;
+    text-align: left;
+}
+
+.macaroon-warn-text {
+    color: #b8650b;
+    font-size: 12px;
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+[data-theme="dark"] .macaroon-warn-text {
+    color: #f0a35a;
+}
+
+.macaroon-exp-custom-wrap {
+    margin-top: 6px;
+}
+
+/* Issued (read-once) view */
+
+.macaroon-issued-warning {
+    background: #fdecea;
+    border: 1px solid #f5b8b1;
+    color: #8a1a10;
+    border-radius: 4px;
+    padding: 10px 12px;
+    margin: 0 0 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    font-weight: 500;
+}
+
+[data-theme="dark"] .macaroon-issued-warning {
+    background: #3a1612;
+    border-color: #6b2a23;
+    color: #f5a89e;
+}
+
+.macaroon-issued-block {
+    margin-bottom: 16px;
+}
+
+.macaroon-issued-label {
+    font-weight: 600;
+    margin-bottom: 4px;
+    font-size: 13px;
+}
+
 .pip-conf-preview {
     background: var(--table-head-bg);
     border: 1px solid var(--border);
@@ -1003,7 +1191,10 @@ body {
 .modal-body input[type="text"],
 .modal-body input[type="email"],
 .modal-body input[type="password"],
-.modal-body input[type="url"] {
+.modal-body input[type="url"],
+.modal-body input[type="datetime-local"],
+.modal-body input[type="date"],
+.modal-body input[type="time"] {
     width: 100%;
     height: 36px;
     padding: 0 10px;
@@ -1013,6 +1204,8 @@ body {
     outline: none;
     background: var(--bg);
     color: var(--text);
+    box-sizing: border-box;
+    font-family: inherit;
 }
 
 .modal-body select:not(.tag-picker-add) {
@@ -1037,6 +1230,9 @@ body {
 .modal-body input[type="email"]:focus,
 .modal-body input[type="password"]:focus,
 .modal-body input[type="url"]:focus,
+.modal-body input[type="datetime-local"]:focus,
+.modal-body input[type="date"]:focus,
+.modal-body input[type="time"]:focus,
 .modal-body select:not(.tag-picker-add):focus,
 .modal-body textarea:focus {
     border-color: var(--accent);
