@@ -31,19 +31,13 @@ talks to the standard devpi JSON API directly.
 - Warning tags for ACL edge cases:
   - **`world-writable`** - `acl_upload` contains `:ANONYMOUS:`; supply-chain risk
   - **`no upload`** - `acl_upload` is empty; nobody (not even owner / root) can publish
-- Adaptive kebab menu - items hint whether a token will be issued:
-  - **`pip.conf`** (public read index, no auth needed) vs. **`pip.conf + token`** (private read)
-  - **`.pypirc`** (public upload, no auth needed) vs. **`.pypirc + token`** (private upload).
-    Hidden when nobody can upload (`acl_upload` empty).
-- **`pip.conf` modal** - issues a short-lived `read`-scope token bound to the index. Returns
-  the full `pip.conf` (Copy / Download), a one-off `pip install --index-url ...` command, and
-  the raw `user:token` pair for `curl`, `devpi login`, etc. Anonymous-readable indexes show
-  a static pip.conf without credentials.
-- **`.pypirc` modal** - issues an `upload`-scope token bound to the index. Returns the full
-  `.pypirc` (Copy / Download), `TWINE_*` environment variable block, a one-shot
-  `twine upload --repository-url ... -u ... -p ... dist/*` command, and the raw `user:token`
-  pair. Anonymous-upload indexes (rare; world-writable) show a static `.pypirc` without
-  credentials and a security warning.
+- Index card kebab:
+  - **`pip.conf`** (public indexes only) — static one-click pip.conf with the index URL,
+    no token issuance needed
+  - **`Tokens`** (owner / root only) — opens the per-index unified Tokens modal with two
+    sections (Admin + Devpi), shows existing tokens for this index, lets you issue new
+    ones with the index pre-filled and locked
+  - **`Edit`** / **`Delete`** (owner / root)
 - Create / edit / delete indexes via modal dialogs
 - `bases` editor with drag & drop priority ordering and transitive inheritance display
 - `acl_upload` and `acl_read` tag pickers with user selection dropdown
@@ -108,8 +102,9 @@ talks to the standard devpi JSON API directly.
   users (admin delegation) but not for itself. Admin-token-authenticated requests cannot
   issue further tokens. Issuance verifies the target user is in `acl_read` /
   `acl_upload` of the target index.
-- **Management rules**: list / revoke is allowed for the token owner or root. Per-index
-  token list endpoint shows only the caller's own tokens (root sees all).
+- **Management rules**: list / revoke is allowed for the token owner or root. The
+  per-index token list shows all tokens for **index owner / root**; other callers see
+  only tokens bound to themselves.
 - **Auto-cleanup**:
   - User delete -> all tokens for that user removed from keyfs
   - Index delete -> all tokens bound to that index removed (USER subscriber diffs the
@@ -123,16 +118,33 @@ talks to the standard devpi JSON API directly.
 
 ### Users
 - Create, edit (email, password), delete users (admin only)
-- **Admin tokens manager** (kebab -> Admin tokens) - per-user list with label,
-  **index, scope**, expiry, issuer, IP; revoke individual or "Reset all". Wide modal
-  layout so the table doesn't overflow on stage indexes with long names.
-- **Devpi tokens manager** (kebab -> Devpi tokens, conditional) - appears only when
-  the optional `devpi-tokens` plugin is installed on the server. Lets you list,
-  issue, and revoke macaroon tokens via the same modal UX (tag picker for indexes,
-  permission checkboxes with destructive ops in an Advanced section, expiry select
-  with custom date, read-once issued view with pip.conf / .pypirc / TWINE env).
-  Different threat model from Admin tokens (raw secret in keyfs vs. hash-only),
-  surfaced via a dismissible security banner. See "Optional plugins" below.
+- **Tokens manager** (kebab -> Tokens) - unified modal with one or two sections:
+  - **Admin tokens** (built-in) — per-user list with label, index, scope, expiry,
+    issuer, IP; individual revoke or "Reset all"
+  - **Devpi tokens** (only when the `devpi-tokens` plugin is installed) — list of
+    macaroon tokens with parsed restrictions (indexes, allowed permissions, projects,
+    expires, not-before); individual revoke
+  - Empty sections hide automatically (no clutter). Banner above Devpi section
+    (dismissible per user) explains the different threat model — raw secret in keyfs
+    vs. hash-only Admin storage.
+- **Issue token** (`+ Issue new` button) — single unified modal for both backends:
+  - Token type selector at the top picks Admin vs. Devpi (Devpi default when the
+    plugin is installed). Hidden when only Admin is available.
+  - Index picker shows everything the bound user can access (owns, or appears in
+    `acl_read` / `acl_upload`). Devpi uses a multi tag picker; Admin uses a single
+    select.
+  - Admin scope dropdown adapts to the picked index: public indexes get only
+    `upload` (read tokens are useless when anyone can read), private indexes get
+    both with `read` as default.
+  - Devpi permissions are checkboxes; destructive operations (`del_*`,
+    `index_modify`, `index_delete`) are tucked behind an "Advanced" toggle with a
+    visual warning.
+  - Expiry: presets (1 hour to 1 year) plus a `Custom…` datetime option. Optional
+    Not-before for delayed activation (Devpi only).
+  - On success the modal swaps to a read-once view with the raw token, pip.conf,
+    `.pypirc`, `TWINE_*` env, and a `user:token` pair — but only the configs that
+    actually match the issued token's intent (no pip.conf for upload-only or
+    public-index tokens; no `.pypirc` for read-only tokens).
 
 ### Packages
 - Client-side search with PEP 503 name normalization and relevance ranking
@@ -242,10 +254,12 @@ See `INSTALL.md` for a full systemd unit example.
 
 #### `devpi-tokens` coexistence
 
-`devpi-admin` plays nicely with the `devpi-tokens` plugin. When installed,
-the SPA detects it (via `/+api` features list and `/+status` versioninfo)
-and adds a **Devpi tokens** kebab item to user cards and to your own index
-cards, exposing list / issue / revoke directly from the UI.
+`devpi-admin` plays nicely with the optional `devpi-tokens` plugin. When
+installed, the SPA detects it (via `/+api` features list and `/+status`
+versioninfo) and **automatically merges Devpi tokens into the same Tokens
+modal** that lists Admin tokens — same kebab item ("Tokens"), same
+"+ Issue new" flow, same per-index Tokens modal. The user picks the
+backend in the Issue form via a token-type selector.
 
 ```bash
 /var/lib/pypi/venv/bin/pip install devpi-tokens
@@ -263,17 +277,23 @@ The two token systems run side by side without conflict:
 | HTTP method whitelist | `read` blocks DELETE; `upload` blocks DELETE | relies on `--allowed` permission filter |
 | Multi-index per token | no (1:1) | yes |
 | Per-project filter | no | yes (`--projects`) |
+| Cross-user index | no (must be in ACL) | yes (any user/index pair) |
 | CLI compatibility | UI / API only | works with `devpi token-login` |
 
 **Threat model note.** Macaroon HMAC verification requires the secret in
 plaintext on the server, so `devpi-tokens` cannot hash-store; a leaked
 backup or replica disk dump exposes working credentials. Prefer Admin
-tokens for privileged workflows. The UI surfaces this via a (dismissible)
-security banner in every Devpi tokens modal.
+tokens for privileged workflows. The UI surfaces this via a (dismissible
+per-user) security banner above the Devpi section of every Tokens modal.
 
 `acl_read` (provided by `devpi-admin`) applies to both token systems
 identically — devpi evaluates `pkg_read` ACL against whichever identity
 the auth chain produced, regardless of token source.
+
+**Testing without the plugin installed.** Append `?no-devpi-tokens` to any
+SPA URL to make the UI behave as if the plugin weren't there (kebab item
+disappears, type selector hides, etc.). Saves you a `pip uninstall + restart`
+round-trip when verifying graceful degradation.
 
 ## Usage
 

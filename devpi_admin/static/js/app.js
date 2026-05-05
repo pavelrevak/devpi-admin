@@ -140,6 +140,11 @@
     }
 
     function hasDevpiTokens() {
+        // Dev override: append `?no-devpi-tokens` (or `&no-devpi-tokens`)
+        // to the URL to simulate a server without the plugin without
+        // actually uninstalling. Useful for verifying the SPA degrades
+        // gracefully (kebab item disappears, type selector hides, etc).
+        if (location.search.indexOf('no-devpi-tokens') !== -1) return false;
         if (!_pluginCaps) return false;
         var f = _pluginCaps.features;
         if (f && f.indexOf('tokens') !== -1) return true;
@@ -353,11 +358,6 @@
         {value: 31536000, label: '1 year'},
     ];
 
-    var _pipConfLastTokenId = null;
-    var _pipConfLastTokenKept = false;
-    var _uploadLastTokenId = null;
-    var _uploadLastTokenKept = false;
-
     function shellQuote(s) {
         // POSIX-safe single quoting; escapes any embedded single quotes.
         return "'" + String(s).replace(/'/g, "'\\''") + "'";
@@ -394,21 +394,6 @@
         return !aclUpload || aclUpload.length === 0;
     }
 
-    function canIssueUploadToken(loggedIn, aclUpload) {
-        var u = aclUpload || [];
-        // Frozen index: no Allow ACEs in __acl__ → backend would reject
-        // any token we issue. Don't offer the menu item at all.
-        if (isUploadFrozen(u)) return false;
-        // Anonymous-upload index lets anyone publish — no auth, no
-        // token. The .pypirc modal still has something useful to show
-        // (repository URL), so allow even unauthenticated visitors.
-        if (u.indexOf(':ANONYMOUS:') >= 0) return true;
-        if (!loggedIn) return false;
-        if (loggedIn === 'root') return true;
-        if (u.indexOf(':AUTHENTICATED:') >= 0) return true;
-        return u.indexOf(loggedIn) >= 0;
-    }
-
     function isPublicAclRead(aclRead) {
         if (!aclRead || !aclRead.length) return true;
         for (var i = 0; i < aclRead.length; i++) {
@@ -429,221 +414,28 @@
         return false;
     }
 
-    function showPipConfModal(indexPath, aclRead) {
-        _pipConfLastTokenId = null;
-        _pipConfLastTokenKept = false;
-        var currentUser = Api.getUser();
-        var isPublic = isPublicAclRead(aclRead);
-        // No need to issue a token for indexes anyone can read,
-        // or when the visitor isn't authenticated.
-        if (isPublic || !currentUser) {
-            return showPipConfStaticModal(indexPath);
-        }
 
-        var isRoot = currentUser === 'root';
-        var candidateUsers = [];
-        if (isRoot) {
-            // Root cannot issue tokens for itself (backend rejects with
-            // 403). Offer only other principals from acl_read.
-            for (var i = 0; i < (aclRead || []).length; i++) {
-                var u = aclRead[i];
-                if (!u || u.indexOf(':') === 0 || u === 'root') continue;
-                if (candidateUsers.indexOf(u) < 0) candidateUsers.push(u);
-            }
-            // ACL might list only special principals (e.g. :AUTHENTICATED:)
-            // — fall back to the index owner so root can still issue.
-            if (!candidateUsers.length) {
-                var owner = indexPath.split('/')[0];
-                if (owner && owner !== 'root') candidateUsers.push(owner);
-            }
-            if (!candidateUsers.length) return;
-        } else {
-            candidateUsers.push(currentUser);
-        }
-
-        openModal(
-            'pip.conf for ' + indexPath,
-            function (body) {
-                body.appendChild(formGroup('User', (function () {
-                    var sel = el('select', {id: 'pipconf-user'});
-                    for (var i = 0; i < candidateUsers.length; i++) {
-                        sel.appendChild(el('option', {
-                            value: candidateUsers[i],
-                            textContent: candidateUsers[i],
-                        }));
-                    }
-                    sel.disabled = candidateUsers.length === 1;
-                    return sel;
-                })()));
-
-                body.appendChild(formGroup('Token TTL', (function () {
-                    var sel = el('select', {id: 'pipconf-ttl'});
-                    for (var i = 0; i < TTL_OPTIONS.length; i++) {
-                        var opt = TTL_OPTIONS[i];
-                        var optEl = el('option', {
-                            value: String(opt.value),
-                            textContent: opt.label,
-                        });
-                        if (opt.value === 86400) optEl.selected = true;
-                        sel.appendChild(optEl);
-                    }
-                    return sel;
-                })()));
-
-                body.appendChild(formGroup('Label (optional)', el('input', {
-                    type: 'text',
-                    id: 'pipconf-label',
-                    value: 'pip-conf ' + indexPath,
-                    maxLength: 200,
-                })));
-
-                body.appendChild(el('div', {
-                    className: 'form-hint',
-                    textContent: 'Token is read-only — it cannot change passwords or be exchanged for a session token. The pip.conf will contain credentials in the URL; treat it as a secret.',
-                }));
-
-                body.appendChild(el('div', {
-                    id: 'pipconf-result',
-                    className: 'pip-conf-result',
-                    hidden: true,
-                }));
-            },
-            [
-                el('span', {
-                    id: 'pipconf-notice',
-                    className: 'pipconf-notice',
-                    hidden: true,
-                }),
-                el('button', {
-                    className: 'btn btn-primary',
-                    textContent: 'Generate',
-                    id: 'pipconf-generate',
-                    onclick: function () { generatePipConf(indexPath); },
-                }),
-                el('button', {
-                    className: 'btn',
-                    textContent: 'Close',
-                    onclick: closeModal,
-                }),
-            ]);
-    }
-
-    function generatePipConf(indexPath) {
-        var user = document.getElementById('pipconf-user').value;
-        var ttl = parseInt(document.getElementById('pipconf-ttl').value, 10);
-        var label = document.getElementById('pipconf-label').value;
-        var btn = document.getElementById('pipconf-generate');
-        btn.disabled = true;
-        var orig = btn.textContent;
-        btn.textContent = 'Generating…';
-
-        // Revoke previously-generated token from this same modal session
-        // unless the user committed to it (Copy or Download). Prevents
-        // piles of unused tokens while not killing one already in clipboard.
-        var prevId = _pipConfLastTokenId;
-        var prevKept = _pipConfLastTokenKept;
-        var didRevoke = false;
-        _pipConfLastTokenId = null;
-        _pipConfLastTokenKept = false;
-        var revokePromise;
-        if (prevId && !prevKept) {
-            didRevoke = true;
-            revokePromise = Api.del('/+admin-api/tokens/' + encodeURIComponent(prevId))
-                .catch(function () {});
-        } else {
-            revokePromise = Promise.resolve();
-        }
-
-        var url = '/+admin-api/pip-conf?index=' + encodeURIComponent(indexPath)
-            + '&user=' + encodeURIComponent(user)
-            + '&ttl=' + ttl
-            + '&label=' + encodeURIComponent(label);
-
-        revokePromise.then(function () {
-            // Need raw text/plain response, so use fetch directly instead of Api.get
-            return fetch(url, {
-                method: 'GET',
-                headers: {
-                    'X-Devpi-Auth': btoa(Api.getUser() + ':' + Api.getToken()),
-                    'Accept': 'text/plain',
-                },
-            });
-        }).then(function (res) {
-            if (!res.ok) {
-                return res.json().then(function (j) {
-                    throw new Error(j.error || ('Status ' + res.status));
-                });
-            }
-            return res.text();
-        }).then(function (content) {
-            var token = extractTokenSecret(content);
-            // Token format is `adm_<id>.<secret>`; the revoke endpoint
-            // expects just <id>, so strip the prefix and the secret tail.
-            _pipConfLastTokenId = null;
-            if (token) {
-                var rest = token.substring(4);  // strip "adm_"
-                var dot = rest.indexOf('.');
-                _pipConfLastTokenId = dot > 0 ? rest.substring(0, dot) : null;
-            }
-            renderPipConfResult(content, indexPath, didRevoke);
-            btn.textContent = 'Regenerate';
-        }).catch(function (err) {
-            // Route through the same auto-fading slot as the "Previous
-            // token was revoked." notice so successive clicks don't pile
-            // up modal-level errors.
-            var msg = (err && err.message) || 'Operation failed';
-            showPipConfNotice(msg, 'error');
-            btn.textContent = orig;
-        }).finally(function () {
-            btn.disabled = false;
-        });
-    }
-
-    function showUserTokensModal(username) {
-        openModal(
-            'Admin tokens for ' + username,
-            function (body) {
-                body.appendChild(el('div', {
-                    id: 'tokens-list-container',
-                    textContent: 'Loading…',
-                }));
-            },
-            [
-                el('button', {
-                    className: 'btn',
-                    textContent: 'Reset all',
-                    onclick: function () {
-                        if (!confirm('Revoke ALL tokens for ' + username + '?')) return;
-                        Api.del('/+admin-api/users/' + encodeURIComponent(username) + '/tokens')
-                            .then(function () { renderTokensList(username); })
-                            .catch(showModalError);
-                    },
-                }),
-                el('button', {
-                    className: 'btn btn-primary',
-                    textContent: 'Close',
-                    onclick: closeModal,
-                }),
-            ],
-            // Tokens table has many columns — request the wide layout
-            // so it doesn't overflow the default 520px modal.
-            {width: 'wide'});
-        renderTokensList(username);
-    }
-
-    function renderTokensList(username) {
-        var container = document.getElementById('tokens-list-container');
-        if (!container) return;
-        Api.get('/+admin-api/users/' + encodeURIComponent(username) + '/tokens')
+    function renderTokensList(username, opts) {
+        opts = opts || {};
+        var containerId = opts.containerId || 'tokens-list-container';
+        var hideOnEmpty = !!opts.hideOnEmpty;
+        var container = document.getElementById(containerId);
+        if (!container) return Promise.resolve(0);
+        return Api.get('/+admin-api/users/' + encodeURIComponent(username) + '/tokens')
             .then(function (data) {
                 clear(container);
                 var tokens = data.result || [];
                 if (!tokens.length) {
+                    if (hideOnEmpty) {
+                        // Caller orchestrates the empty state across both
+                        // sections — don't show our own placeholder.
+                        return 0;
+                    }
                     container.appendChild(el('div', {
                         className: 'tokens-empty',
                         textContent: 'No active tokens.',
                     }));
-                    return;
+                    return 0;
                 }
                 var table = el('table', {className: 'tokens-table'});
                 var thead = el('thead');
@@ -668,6 +460,7 @@
                 var wrap = el('div', {className: 'tokens-table-wrap'});
                 wrap.appendChild(table);
                 container.appendChild(wrap);
+                return tokens.length;
             })
             .catch(function (err) {
                 clear(container);
@@ -675,11 +468,12 @@
                     className: 'error-text',
                     textContent: 'Failed to load tokens: ' + err.message,
                 }));
+                return 0;
             });
     }
 
     function buildTokenRow(t, username) {
-        return el('tr', null, [
+        var row = el('tr', null, [
             el('td', {textContent: t.label || '(no label)'}),
             el('td', {className: 'mono', textContent: t.index || '—'}),
             el('td', null, [
@@ -705,6 +499,8 @@
                 }),
             ]),
         ]);
+        _markJustIssued(row, t.id);
+        return row;
     }
 
     // --- Macaroon tokens (devpi-tokens plugin) ---
@@ -811,15 +607,72 @@
                 + 'listable — this view only shows initial tokens.']);
     }
 
-    function showMacaroonTokensModal(username) {
+    // Unified per-user Tokens modal: combines Admin tokens + Devpi tokens
+    // (when the plugin is installed) into a single view. Each section
+    // hides itself when its list is empty so the modal isn't cluttered
+    // with empty placeholders. A single "+ Issue new" button opens the
+    // unified Issue modal where the user picks the backend.
+    function showTokensModal(username) {
+        // Make sure plugin caps are loaded — without this we could miss
+        // the Devpi section on a deep-link reload of the User card.
+        loadPluginCaps().then(function () {
+            _renderUnifiedTokensModal(username);
+        });
+    }
+
+    function _renderUnifiedTokensModal(username) {
+        var hasDevpi = hasDevpiTokens();
         openModal(
-            'Devpi tokens for ' + username,
+            'Tokens for ' + username,
             function (body) {
-                var _bn = buildMacaroonSecurityBanner();
-                if (_bn) body.appendChild(_bn);
-                body.appendChild(buildMacaroonNote());
+                if (hasDevpi) {
+                    var bn = buildMacaroonSecurityBanner();
+                    if (bn) body.appendChild(bn);
+                }
+
+                var adminSection = el('div', {
+                    id: 'tokens-admin-section',
+                    className: 'tokens-section',
+                    hidden: true,
+                });
+                adminSection.appendChild(el('h3', {
+                    className: 'tokens-section-heading',
+                    textContent: 'Admin tokens',
+                }));
+                adminSection.appendChild(el('div', {
+                    id: 'tokens-list-container',
+                }));
+                body.appendChild(adminSection);
+
+                if (hasDevpi) {
+                    var devpiSection = el('div', {
+                        id: 'tokens-devpi-section',
+                        className: 'tokens-section',
+                        hidden: true,
+                    });
+                    devpiSection.appendChild(el('h3', {
+                        className: 'tokens-section-heading',
+                        textContent: 'Devpi tokens',
+                    }));
+                    devpiSection.appendChild(buildMacaroonNote());
+                    devpiSection.appendChild(el('div', {
+                        id: 'macaroon-tokens-list-container',
+                    }));
+                    body.appendChild(devpiSection);
+                }
+
+                // Catch-all when both sections turn out empty.
                 body.appendChild(el('div', {
-                    id: 'macaroon-tokens-list-container',
+                    id: 'tokens-empty-both',
+                    className: 'tokens-empty',
+                    textContent: 'No tokens.',
+                    hidden: true,
+                }));
+
+                // Loading indicator until both fetches resolve.
+                body.appendChild(el('div', {
+                    id: 'tokens-loading',
+                    className: 'tokens-empty',
                     textContent: 'Loading…',
                 }));
             },
@@ -827,7 +680,25 @@
                 el('button', {
                     className: 'btn',
                     textContent: '+ Issue new',
-                    onclick: function () { showMacaroonIssueModal(username); },
+                    onclick: function () {
+                        showIssueTokenModal(username);
+                    },
+                }),
+                el('button', {
+                    className: 'btn',
+                    textContent: 'Reset all admin',
+                    title: 'Revoke every admin token bound to this user. '
+                        + 'Devpi tokens are not affected.',
+                    onclick: function () {
+                        if (!confirm('Revoke ALL admin tokens for '
+                                + username + '?')) return;
+                        Api.del('/+admin-api/users/'
+                                + encodeURIComponent(username) + '/tokens')
+                            .then(function () {
+                                _populateUnifiedTokens(username, hasDevpi);
+                            })
+                            .catch(showModalError);
+                    },
                 }),
                 el('button', {
                     className: 'btn btn-primary',
@@ -836,23 +707,47 @@
                 }),
             ],
             {width: 'wide'});
-        renderMacaroonTokensList(username);
+        _populateUnifiedTokens(username, hasDevpi);
     }
 
-    function renderMacaroonTokensList(username) {
-        var container = document.getElementById('macaroon-tokens-list-container');
-        if (!container) return;
-        Api.get('/' + encodeURIComponent(username) + '/+tokens')
+    function _populateUnifiedTokens(username, hasDevpi) {
+        var p1 = renderTokensList(username, {hideOnEmpty: true});
+        var p2 = hasDevpi
+            ? renderMacaroonTokensList(username, {hideOnEmpty: true})
+            : Promise.resolve(0);
+        Promise.all([p1, p2]).then(function (counts) {
+            var loadingEl = document.getElementById('tokens-loading');
+            if (loadingEl) loadingEl.hidden = true;
+            var adminCount = counts[0] || 0;
+            var devpiCount = counts[1] || 0;
+            var adminEl = document.getElementById('tokens-admin-section');
+            if (adminEl) adminEl.hidden = (adminCount === 0);
+            var devpiEl = document.getElementById('tokens-devpi-section');
+            if (devpiEl) devpiEl.hidden = (devpiCount === 0);
+            var emptyEl = document.getElementById('tokens-empty-both');
+            if (emptyEl) emptyEl.hidden = (adminCount + devpiCount > 0);
+        });
+    }
+
+
+    function renderMacaroonTokensList(username, opts) {
+        opts = opts || {};
+        var containerId = opts.containerId || 'macaroon-tokens-list-container';
+        var hideOnEmpty = !!opts.hideOnEmpty;
+        var container = document.getElementById(containerId);
+        if (!container) return Promise.resolve(0);
+        return Api.get('/' + encodeURIComponent(username) + '/+tokens')
             .then(function (data) {
                 clear(container);
                 var tokens = (data && data.result && data.result.tokens) || {};
                 var ids = Object.keys(tokens);
                 if (!ids.length) {
+                    if (hideOnEmpty) return 0;
                     container.appendChild(el('div', {
                         className: 'tokens-empty',
                         textContent: 'No Devpi tokens.',
                     }));
-                    return;
+                    return 0;
                 }
                 var table = el('table', {className: 'tokens-table'});
                 var thead = el('thead');
@@ -879,6 +774,7 @@
                 var wrap = el('div', {className: 'tokens-table-wrap'});
                 wrap.appendChild(table);
                 container.appendChild(wrap);
+                return ids.length;
             })
             .catch(function (err) {
                 clear(container);
@@ -886,6 +782,7 @@
                     className: 'error-text',
                     textContent: 'Failed to load Devpi tokens: ' + err.message,
                 }));
+                return 0;
             });
     }
 
@@ -1004,21 +901,75 @@
         return parsed.indexes.indexOf(userIdx) !== -1;
     }
 
-    function showIndexMacaroonTokensModal(idxUser, idxName) {
+    // Per-index unified Tokens modal — same shape as the per-user version
+    // but the listing endpoints filter to tokens bound to this index.
+    // Issue button preselects the index so the user can't accidentally
+    // create a token for a different one.
+    function showIndexTokensModal(idxUser, idxName, aclRead) {
+        loadPluginCaps().then(function () {
+            _renderUnifiedIndexTokensModal(idxUser, idxName, aclRead);
+        });
+    }
+
+    function _renderUnifiedIndexTokensModal(idxUser, idxName, aclRead) {
         var userIdx = idxUser + '/' + idxName;
+        var hasDevpi = hasDevpiTokens();
         openModal(
-            'Devpi tokens for ' + userIdx,
+            'Tokens for ' + userIdx,
             function (body) {
-                var _bn = buildMacaroonSecurityBanner();
-                if (_bn) body.appendChild(_bn);
-                body.appendChild(el('div', {className: 'macaroon-note'}, [
-                    'ⓘ Showing tokens issued for ' + idxUser
-                        + ' that grant access to this index. '
-                        + 'Tokens without an `indexes` restriction '
-                        + '(super-tokens) are also included.',
-                ]));
+                if (hasDevpi) {
+                    var bn = buildMacaroonSecurityBanner();
+                    if (bn) body.appendChild(bn);
+                }
+
+                var adminSection = el('div', {
+                    id: 'index-tokens-admin-section',
+                    className: 'tokens-section',
+                    hidden: true,
+                });
+                adminSection.appendChild(el('h3', {
+                    className: 'tokens-section-heading',
+                    textContent: 'Admin tokens',
+                }));
+                adminSection.appendChild(el('div', {
+                    id: 'index-admin-tokens-list-container',
+                }));
+                body.appendChild(adminSection);
+
+                if (hasDevpi) {
+                    var devpiSection = el('div', {
+                        id: 'index-tokens-devpi-section',
+                        className: 'tokens-section',
+                        hidden: true,
+                    });
+                    devpiSection.appendChild(el('h3', {
+                        className: 'tokens-section-heading',
+                        textContent: 'Devpi tokens',
+                    }));
+                    devpiSection.appendChild(el('div', {
+                        className: 'macaroon-note',
+                    }, [
+                        'ⓘ Showing tokens issued for ' + idxUser
+                            + ' that grant access to this index. '
+                            + 'Tokens without an `indexes` restriction '
+                            + '(super-tokens) are also included.',
+                    ]));
+                    devpiSection.appendChild(el('div', {
+                        id: 'macaroon-index-tokens-list-container',
+                    }));
+                    body.appendChild(devpiSection);
+                }
+
                 body.appendChild(el('div', {
-                    id: 'macaroon-index-tokens-list-container',
+                    id: 'index-tokens-empty-both',
+                    className: 'tokens-empty',
+                    textContent: 'No tokens for this index.',
+                    hidden: true,
+                }));
+
+                body.appendChild(el('div', {
+                    id: 'index-tokens-loading',
+                    className: 'tokens-empty',
                     textContent: 'Loading…',
                 }));
             },
@@ -1027,8 +978,19 @@
                     className: 'btn',
                     textContent: '+ Issue new',
                     onclick: function () {
-                        // Pre-select this index in the issue form.
-                        showMacaroonIssueModal(idxUser, [userIdx]);
+                        // Issue for the index owner; preselect this index
+                        // so the form can hint that admin scope=read is
+                        // useless on a public index, etc. Done returns
+                        // to this per-index modal so the new token is
+                        // visible in context.
+                        showIssueTokenModal(idxUser, {
+                            preselectIndexes: [userIdx],
+                            lockIndex: true,
+                            returnTo: function () {
+                                showIndexTokensModal(
+                                    idxUser, idxName, aclRead);
+                            },
+                        });
                     },
                 }),
                 el('button', {
@@ -1038,15 +1000,124 @@
                 }),
             ],
             {width: 'wide'});
-        renderIndexMacaroonTokensList(idxUser, idxName);
+        _populateIndexTokens(idxUser, idxName, hasDevpi);
     }
 
-    function renderIndexMacaroonTokensList(idxUser, idxName) {
+    function _populateIndexTokens(idxUser, idxName, hasDevpi) {
+        var p1 = renderIndexAdminTokensList(idxUser, idxName, {hideOnEmpty: true});
+        var p2 = hasDevpi
+            ? renderIndexMacaroonTokensList(idxUser, idxName, {hideOnEmpty: true})
+            : Promise.resolve(0);
+        Promise.all([p1, p2]).then(function (counts) {
+            var loadingEl = document.getElementById('index-tokens-loading');
+            if (loadingEl) loadingEl.hidden = true;
+            var adminCount = counts[0] || 0;
+            var devpiCount = counts[1] || 0;
+            var adminEl = document.getElementById('index-tokens-admin-section');
+            if (adminEl) adminEl.hidden = (adminCount === 0);
+            var devpiEl = document.getElementById('index-tokens-devpi-section');
+            if (devpiEl) devpiEl.hidden = (devpiCount === 0);
+            var emptyEl = document.getElementById('index-tokens-empty-both');
+            if (emptyEl) emptyEl.hidden = (adminCount + devpiCount > 0);
+        });
+    }
+
+    function renderIndexAdminTokensList(idxUser, idxName, opts) {
+        opts = opts || {};
+        var containerId = opts.containerId || 'index-admin-tokens-list-container';
+        var hideOnEmpty = !!opts.hideOnEmpty;
+        var container = document.getElementById(containerId);
+        if (!container) return Promise.resolve(0);
+        var url = '/+admin-api/indexes/' + encodeURIComponent(idxUser)
+            + '/' + encodeURIComponent(idxName) + '/tokens';
+        return Api.get(url)
+            .then(function (data) {
+                clear(container);
+                var tokens = (data && data.result) || [];
+                if (!tokens.length) {
+                    if (hideOnEmpty) return 0;
+                    container.appendChild(el('div', {
+                        className: 'tokens-empty',
+                        textContent: 'No admin tokens for this index.',
+                    }));
+                    return 0;
+                }
+                var table = el('table', {className: 'tokens-table'});
+                var thead = el('thead');
+                thead.appendChild(el('tr', null, [
+                    el('th', {textContent: 'Label'}),
+                    el('th', {textContent: 'Scope'}),
+                    el('th', {textContent: 'Expires'}),
+                    el('th', {textContent: 'Issuer'}),
+                    el('th', {textContent: 'IP'}),
+                    el('th', {textContent: 'ID'}),
+                    el('th', {}),
+                ]));
+                table.appendChild(thead);
+                var tbody = el('tbody');
+                for (var i = 0; i < tokens.length; i++) {
+                    tbody.appendChild(_buildIndexAdminTokenRow(
+                        tokens[i], idxUser, idxName));
+                }
+                table.appendChild(tbody);
+                var wrap = el('div', {className: 'tokens-table-wrap'});
+                wrap.appendChild(table);
+                container.appendChild(wrap);
+                return tokens.length;
+            })
+            .catch(function (err) {
+                clear(container);
+                container.appendChild(el('div', {
+                    className: 'error-text',
+                    textContent: 'Failed to load admin tokens: ' + err.message,
+                }));
+                return 0;
+            });
+    }
+
+    function _buildIndexAdminTokenRow(t, idxUser, idxName) {
+        // No "Index" column — the whole table is already index-scoped.
+        var row = el('tr', null, [
+            el('td', {textContent: t.label || '(no label)'}),
+            el('td', null, [
+                el('span', {
+                    className: 'token-scope token-scope-' + (t.scope || 'unknown'),
+                    textContent: t.scope || '—',
+                }),
+            ]),
+            el('td', {textContent: formatExpiry(t.expires_in)}),
+            el('td', {textContent: t.issuer}),
+            el('td', {textContent: t.client_ip || '—'}),
+            el('td', {className: 'mono', textContent: t.id_short}),
+            el('td', null, [
+                el('button', {
+                    className: 'btn btn-small',
+                    textContent: 'Revoke',
+                    onclick: function () {
+                        if (!confirm('Revoke admin token "'
+                                + (t.label || t.id_short) + '"?')) return;
+                        Api.del('/+admin-api/tokens/' + encodeURIComponent(t.id))
+                            .then(function () {
+                                renderIndexAdminTokensList(idxUser, idxName);
+                            })
+                            .catch(showModalError);
+                    },
+                }),
+            ]),
+        ]);
+        _markJustIssued(row, t.id);
+        return row;
+    }
+
+    function renderIndexMacaroonTokensList(idxUser, idxName, opts) {
+        opts = opts || {};
+        var containerId = opts.containerId
+            || 'macaroon-index-tokens-list-container';
+        var hideOnEmpty = !!opts.hideOnEmpty;
         var userIdx = idxUser + '/' + idxName;
-        var container = document.getElementById(
-            'macaroon-index-tokens-list-container');
-        if (!container) return;
-        Api.get('/' + encodeURIComponent(idxUser) + '/+tokens')
+        var container = document.getElementById(containerId);
+        if (!container) return Promise.resolve(0);
+        return Api.get('/' + encodeURIComponent(idxUser) + '/+tokens')
             .then(function (data) {
                 clear(container);
                 var tokens = (data && data.result && data.result.tokens) || {};
@@ -1061,11 +1132,12 @@
                     }
                 }
                 if (!matching.length) {
+                    if (hideOnEmpty) return 0;
                     container.appendChild(el('div', {
                         className: 'tokens-empty',
                         textContent: 'No Devpi tokens for this index.',
                     }));
-                    return;
+                    return 0;
                 }
                 var table = el('table', {
                     className: 'tokens-table tokens-table-macaroon',
@@ -1093,6 +1165,7 @@
                 var wrap = el('div', {className: 'tokens-table-wrap'});
                 wrap.appendChild(table);
                 container.appendChild(wrap);
+                return matching.length;
             })
             .catch(function (err) {
                 clear(container);
@@ -1100,6 +1173,7 @@
                     className: 'error-text',
                     textContent: 'Failed to load tokens: ' + err.message,
                 }));
+                return 0;
             });
     }
 
@@ -1165,48 +1239,208 @@
         return label;
     }
 
-    function showMacaroonIssueModal(username, preselectIndexes) {
-        // Fetch known indexes first so the picker can show options. While
-        // devpi-tokens accepts arbitrary user/index strings, restricting
-        // the UI to actually-existing indexes prevents typos and matches
-        // the existing acl_upload / acl_read picker UX.
-        var presel = (preselectIndexes || []).slice();
+    // Token types supported by the unified Issue modal. The selector at the
+    // top of the modal switches the form between Devpi tokens (multi-index,
+    // permission checkboxes) and Admin tokens (single index, scope select).
+    // Devpi is the default unless the plugin isn't installed.
+    var TOKEN_TYPE_DEVPI = 'devpi';
+    var TOKEN_TYPE_ADMIN = 'admin';
+
+    // Public entry point. `options` may include:
+    //  • `preselectType` — 'devpi' or 'admin'
+    //  • `preselectIndexes` — list of 'user/index' strings
+    //  • `lockIndex` — when true, hides the index picker entirely and
+    //    binds the form to `preselectIndexes[0]` (used by per-index
+    //    Tokens flow where the index is already fixed by the entry).
+    //  • `returnTo` — function called when user clicks Done after issue
+    //    (defaults to the per-user unified Tokens modal).
+    var _issueReturnTo = null;
+    var _issueLockedIndex = null;
+    function showIssueTokenModal(username, options) {
+        options = options || {};
+        var presel = (options.preselectIndexes || []).slice();
+        var preselType = options.preselectType || TOKEN_TYPE_DEVPI;
+        _issueReturnTo = options.returnTo || function () {
+            showTokensModal(username);
+        };
+        _issueLockedIndex = (options.lockIndex && presel.length)
+            ? presel[0] : null;
+        // If the user asked for Devpi but the plugin isn't installed, silently
+        // fall back to Admin — saves them a trip back through the kebab.
+        if (preselType === TOKEN_TYPE_DEVPI && !hasDevpiTokens()) {
+            preselType = TOKEN_TYPE_ADMIN;
+        }
         fetchRoot().then(function (rootResult) {
-            var allIndexes = getAllIndexes(rootResult)
-                .map(function (idx) { return idx._full; })
-                .sort();
-            _renderMacaroonIssueModal(username, allIndexes, presel);
+            var indexInfos = getAllIndexes(rootResult);
+            var aclByIndex = {};
+            // Indexes accessible to the bound user: ones they own, ones
+            // listing them in acl_read, ones listing them in acl_upload.
+            // Root sees every index (bypasses ACLs everywhere). The
+            // unified set powers both the Devpi multi-picker and the
+            // Admin single-select; the issuer doesn't need to think
+            // about which backend supports what.
+            var isRoot = username === 'root';
+            var accessible = [];
+            for (var i = 0; i < indexInfos.length; i++) {
+                var idx = indexInfos[i];
+                aclByIndex[idx._full] = idx.acl_read || null;
+                if (isRoot
+                        || idx._user === username
+                        || (idx.acl_read && idx.acl_read.indexOf(username) !== -1)
+                        || (idx.acl_upload && idx.acl_upload.indexOf(username) !== -1)) {
+                    accessible.push(idx._full);
+                }
+            }
+            // Always include preselect entries — caller knows what they
+            // want, even when the bound user has no obvious ACL match.
+            for (var p = 0; p < presel.length; p++) {
+                if (accessible.indexOf(presel[p]) === -1) {
+                    accessible.push(presel[p]);
+                }
+            }
+            _issueContext = {
+                accessibleIndexes: accessible.sort(),
+                aclByIndex: aclByIndex,
+            };
+            _renderIssueTokenModal(username, presel, preselType);
         }).catch(function () {
-            // Fall back to empty options — user can still pick via dropdown
-            // if there are server-side indexes not in this fetch.
-            _renderMacaroonIssueModal(username, presel, presel);
+            _issueContext = {
+                accessibleIndexes: presel.slice(),
+                aclByIndex: {},
+            };
+            _renderIssueTokenModal(username, presel, preselType);
         });
     }
 
-    function _renderMacaroonIssueModal(username, indexOptions, preselect) {
+    // Backwards-compat alias — internal callers may still use the old name.
+    function showMacaroonIssueModal(username, preselectIndexes) {
+        showIssueTokenModal(username, {
+            preselectType: TOKEN_TYPE_DEVPI,
+            preselectIndexes: preselectIndexes,
+        });
+    }
+
+    function _applyTokenTypeVisibility(type) {
+        // Show form groups whose `data-token-only` matches; hide others.
+        // Groups without the attribute are common (always shown).
+        var nodes = modalBody.querySelectorAll('[data-token-only]');
+        for (var i = 0; i < nodes.length; i++) {
+            var only = nodes[i].getAttribute('data-token-only');
+            nodes[i].hidden = (only !== type);
+        }
+    }
+
+    function _renderIssueTokenModal(username, preselect, initialType) {
+        var indexOptions = (_issueContext && _issueContext.accessibleIndexes) || [];
+        var locked = _issueLockedIndex;
+        var title = locked
+            ? 'Issue token for ' + locked
+            : 'Issue token — ' + username;
         openModal(
-            'Issue Devpi token — ' + username,
+            title,
             function (body) {
+                // Token type selector — only meaningful when both backends
+                // are available. With only Admin tokens (no devpi-tokens
+                // plugin) we hide the chooser to keep the form compact.
+                var typeSel = el('select', {id: 'token-type-select'});
+                typeSel.appendChild(el('option', {
+                    value: TOKEN_TYPE_DEVPI,
+                    textContent: 'Devpi tokens — multi-index, fine permissions, derivable',
+                }));
+                typeSel.appendChild(el('option', {
+                    value: TOKEN_TYPE_ADMIN,
+                    textContent: 'Admin tokens — single index/scope, hash-only storage, audit log',
+                }));
+                typeSel.value = initialType;
+                if (hasDevpiTokens()) {
+                    body.appendChild(formGroup('Token type', typeSel));
+                }
+                // Always present so the collector can read `.value` even
+                // when the chooser is hidden.
+
+                // Devpi-only: security banner (optionally dismissed).
                 var _bn = buildMacaroonSecurityBanner();
-                if (_bn) body.appendChild(_bn);
+                if (_bn) {
+                    _bn.setAttribute('data-token-only', TOKEN_TYPE_DEVPI);
+                    body.appendChild(_bn);
+                }
 
-                // Indexes — tag picker (consistent with acl_upload/acl_read)
-                var indexesGroup = el('div', {className: 'form-group'});
-                indexesGroup.appendChild(el('label', {
-                    textContent: 'Indexes (required)',
-                }));
-                indexesGroup.appendChild(buildTagPicker(
-                    'macaroon-indexes', preselect || [],
-                    indexOptions, [], false, null));
-                indexesGroup.appendChild(el('div', {
-                    className: 'form-hint',
-                    textContent: 'Pick from the dropdown. Cross-index '
-                        + 'requests will be denied by the token.',
-                }));
-                body.appendChild(indexesGroup);
+                // Indexes accessible to the bound user. Both pickers
+                // share the same set; the issuer never has to choose
+                // "include indexes from other users" because we already
+                // included everything the bound user has ACL access to.
+                // When `locked` is set, the index is fixed by the entry
+                // point (per-index Tokens kebab) — show it as a static
+                // label instead of an interactive picker.
+                var adminIdxSel;  // hoisted; needed by scope refresh logic
+                if (locked) {
+                    var lockedRow = el('div', {className: 'form-group'});
+                    lockedRow.appendChild(el('label', {textContent: 'Index'}));
+                    lockedRow.appendChild(el('div', {
+                        className: 'form-static-value',
+                        textContent: locked,
+                    }));
+                    body.appendChild(lockedRow);
+                    // Hidden <select> exposes the same `admin-index-select`
+                    // id so the scope-refresh helper can read .value
+                    // without branching.
+                    adminIdxSel = el('select', {
+                        id: 'admin-index-select',
+                        hidden: true,
+                    });
+                    adminIdxSel.appendChild(el('option', {
+                        value: locked,
+                        textContent: locked,
+                    }));
+                    body.appendChild(adminIdxSel);
+                } else {
+                    var devpiIdxGroup = el('div', {className: 'form-group'});
+                    devpiIdxGroup.setAttribute('data-token-only', TOKEN_TYPE_DEVPI);
+                    devpiIdxGroup.appendChild(el('label', {
+                        textContent: 'Indexes (required)',
+                    }));
+                    devpiIdxGroup.appendChild(buildTagPicker(
+                        'macaroon-indexes', preselect || [],
+                        indexOptions, [], false, null));
+                    devpiIdxGroup.appendChild(el('div', {
+                        className: 'form-hint',
+                        textContent: 'Cross-index requests will be denied '
+                            + 'by the token.',
+                    }));
+                    body.appendChild(devpiIdxGroup);
 
-                // Permissions
+                    var adminIdxGroup = el('div', {className: 'form-group'});
+                    adminIdxGroup.setAttribute('data-token-only', TOKEN_TYPE_ADMIN);
+                    adminIdxGroup.appendChild(el('label', {
+                        textContent: 'Index (required)',
+                    }));
+                    adminIdxSel = el('select', {id: 'admin-index-select'});
+                    // Single-select with a real index always selected —
+                    // no empty placeholder. Preselect wins; otherwise the
+                    // first accessible index is the default.
+                    var adminPicked = (preselect && preselect.length)
+                        ? preselect[0] : (indexOptions[0] || '');
+                    for (var ii = 0; ii < indexOptions.length; ii++) {
+                        var optI = el('option', {
+                            value: indexOptions[ii],
+                            textContent: indexOptions[ii],
+                        });
+                        if (adminPicked === indexOptions[ii]) optI.selected = true;
+                        adminIdxSel.appendChild(optI);
+                    }
+                    if (!indexOptions.length) {
+                        adminIdxSel.appendChild(el('option', {
+                            value: '',
+                            textContent: '(no accessible indexes)',
+                        }));
+                    }
+                    adminIdxGroup.appendChild(adminIdxSel);
+                    body.appendChild(adminIdxGroup);
+                }
+
+                // Devpi-only: permissions checkbox grid + advanced section.
                 var permsGroup = el('div', {className: 'form-group'});
+                permsGroup.setAttribute('data-token-only', TOKEN_TYPE_DEVPI);
                 permsGroup.appendChild(el('label', {textContent: 'Permissions'}));
                 permsGroup.appendChild(el('div', {
                     className: 'form-hint',
@@ -1249,8 +1483,72 @@
                 permsGroup.appendChild(advWrap);
                 body.appendChild(permsGroup);
 
-                // Projects (optional)
+                // Admin-only: scope select. Admin tokens have a single
+                // operational mode per token — read OR upload (no DELETE).
+                // For public indexes (no acl_read restriction), read is
+                // disabled because anyone can pip install without auth —
+                // a read token would be wasted bytes.
+                var scopeGroup = el('div', {className: 'form-group'});
+                scopeGroup.setAttribute('data-token-only', TOKEN_TYPE_ADMIN);
+                scopeGroup.appendChild(el('label', {textContent: 'Scope'}));
+                // Options are (re)built by _refreshAdminScopeOptions
+                // based on the picked index — public indexes get only
+                // upload, private indexes get both.
+                var scopeSel = el('select', {id: 'admin-scope-select'});
+                scopeGroup.appendChild(scopeSel);
+                var scopeHint = el('div', {
+                    id: 'admin-scope-hint',
+                    className: 'form-hint',
+                });
+                scopeGroup.appendChild(scopeHint);
+
+                // Rebuild the scope options whenever the picked index
+                // changes. Public indexes don't get the `read` option at
+                // all (it would issue a useless token — anyone can pip
+                // install without auth). Private indexes get both, with
+                // `read` selected by default as the more common case.
+                function _refreshAdminScopeOptions() {
+                    var sel = document.getElementById('admin-index-select');
+                    var picked = sel && sel.value;
+                    var aclByIndex = (_issueContext && _issueContext.aclByIndex) || {};
+                    var publicIdx = picked && isPublicAclRead(aclByIndex[picked]);
+                    var prevValue = scopeSel.value;
+                    clear(scopeSel);
+                    if (!publicIdx) {
+                        scopeSel.appendChild(el('option', {
+                            value: 'read',
+                            textContent: 'read — pip install / browse (GET, HEAD)',
+                        }));
+                    }
+                    scopeSel.appendChild(el('option', {
+                        value: 'upload',
+                        textContent: 'upload — twine upload (no DELETE)',
+                    }));
+                    // Restore prior selection when still valid; otherwise
+                    // pick the only option that's left.
+                    if (publicIdx) {
+                        scopeSel.value = 'upload';
+                    } else if (prevValue === 'upload') {
+                        scopeSel.value = 'upload';
+                    } else {
+                        scopeSel.value = 'read';
+                    }
+                    scopeHint.textContent = publicIdx
+                        ? 'Index ' + picked + ' is public — only upload '
+                            + 'scope is meaningful (pip install works '
+                            + 'without auth on this index).'
+                        : '';
+                }
+                adminIdxSel.addEventListener('change', _refreshAdminScopeOptions);
+                // Apply once on initial render so a preselected index
+                // (e.g. opened from per-index Tokens kebab) gates scope
+                // immediately.
+                setTimeout(_refreshAdminScopeOptions, 0);
+                body.appendChild(scopeGroup);
+
+                // Devpi-only: project filter.
                 var projGroup = el('div', {className: 'form-group'});
+                projGroup.setAttribute('data-token-only', TOKEN_TYPE_DEVPI);
                 projGroup.appendChild(el('label', {
                     textContent: 'Project filter (optional)',
                 }));
@@ -1267,10 +1565,7 @@
                 }));
                 body.appendChild(projGroup);
 
-                // Expires — single select with preset durations and a
-                // "Custom…" option that reveals an absolute datetime
-                // picker. Single source of truth, matches the visual
-                // language of every other modal field.
+                // Common: expires picker (presets + custom datetime).
                 var expGroup = el('div', {className: 'form-group'});
                 expGroup.appendChild(el('label', {textContent: 'Expires'}));
                 var expSel = el('select', {id: 'macaroon-expires-select'});
@@ -1309,8 +1604,9 @@
                 });
                 body.appendChild(expGroup);
 
-                // Not before (optional)
+                // Devpi-only: not-before (delayed activation).
                 var nbGroup = el('div', {className: 'form-group'});
+                nbGroup.setAttribute('data-token-only', TOKEN_TYPE_DEVPI);
                 nbGroup.appendChild(el('label', {
                     textContent: 'Not before (optional)',
                 }));
@@ -1325,18 +1621,39 @@
                 }));
                 body.appendChild(nbGroup);
 
-                // Issued result container (hidden until success)
+                // Admin-only: free-form label (audit log column).
+                var labelGroup = el('div', {className: 'form-group'});
+                labelGroup.setAttribute('data-token-only', TOKEN_TYPE_ADMIN);
+                labelGroup.appendChild(el('label', {
+                    textContent: 'Label (optional)',
+                }));
+                labelGroup.appendChild(el('input', {
+                    type: 'text',
+                    id: 'admin-label',
+                    maxLength: 200,
+                    placeholder: 'e.g. ci-prod, gitea-ci, ansible-deploy',
+                }));
+                body.appendChild(labelGroup);
+
+                // Issued result container (hidden until success).
                 body.appendChild(el('div', {
                     id: 'macaroon-issued-result',
                     hidden: true,
                 }));
+
+                // Wire type chooser; apply initial visibility.
+                typeSel.addEventListener('change', function () {
+                    _applyTokenTypeVisibility(typeSel.value);
+                });
+                _applyTokenTypeVisibility(typeSel.value);
             },
             [
                 el('button', {
                     className: 'btn',
                     textContent: 'Cancel',
                     onclick: function () {
-                        showMacaroonTokensModal(username);
+                        if (_issueReturnTo) _issueReturnTo();
+                        else closeModal();
                     },
                 }),
                 el('button', {
@@ -1344,24 +1661,18 @@
                     className: 'btn btn-primary',
                     textContent: 'Issue token',
                     onclick: function () {
-                        _submitMacaroonIssue(username, this);
+                        _submitIssue(username, this);
                     },
                 }),
             ],
             {width: 'wide'});
     }
 
-    function _collectMacaroonForm() {
-        var indexes = getTagPickerValues('macaroon-indexes');
-        var projects = _parseLinesOrCsv(
-            (document.getElementById('macaroon-projects') || {}).value);
-        var allowed = [];
-        var cbs = document.querySelectorAll('.macaroon-perm-cb');
-        for (var i = 0; i < cbs.length; i++) {
-            if (cbs[i].checked) allowed.push(cbs[i].value);
-        }
-        // Expires: either a preset TTL (seconds from now / from not-before)
-        // or an absolute datetime when "Custom…" is selected.
+    function _collectIssueForm() {
+        var typeEl = document.getElementById('token-type-select');
+        var type = (typeEl && typeEl.value) || TOKEN_TYPE_DEVPI;
+
+        // Common: expires (preset TTL or absolute datetime).
         var expSel = document.getElementById('macaroon-expires-select');
         var ttl = null;
         var expiresAbs = null;
@@ -1374,25 +1685,52 @@
         } else if (expSel) {
             ttl = parseInt(expSel.value, 10);
         }
-        var nbField = document.getElementById('macaroon-not-before');
-        var notBefore = null;
-        if (nbField && nbField.value) {
-            var dn = new Date(nbField.value);
-            if (!isNaN(dn.getTime())) notBefore = Math.floor(dn.getTime() / 1000);
+
+        var form = {type: type, ttl: ttl, expires_abs: expiresAbs};
+
+        if (type === TOKEN_TYPE_DEVPI) {
+            // Locked index overrides the picker (pickers are hidden).
+            form.indexes = _issueLockedIndex
+                ? [_issueLockedIndex]
+                : getTagPickerValues('macaroon-indexes');
+            form.projects = _parseLinesOrCsv(
+                (document.getElementById('macaroon-projects') || {}).value);
+            var allowed = [];
+            var cbs = document.querySelectorAll('.macaroon-perm-cb');
+            for (var i = 0; i < cbs.length; i++) {
+                if (cbs[i].checked) allowed.push(cbs[i].value);
+            }
+            form.allowed = allowed;
+            var nbField = document.getElementById('macaroon-not-before');
+            form.not_before = null;
+            if (nbField && nbField.value) {
+                var dn = new Date(nbField.value);
+                if (!isNaN(dn.getTime())) form.not_before = Math.floor(dn.getTime() / 1000);
+            }
+        } else {
+            // Admin: single index, single scope, optional label.
+            if (_issueLockedIndex) {
+                form.indexes = [_issueLockedIndex];
+            } else {
+                var idxSel = document.getElementById('admin-index-select');
+                form.indexes = idxSel && idxSel.value ? [idxSel.value] : [];
+            }
+            var scopeSel = document.getElementById('admin-scope-select');
+            form.scope = (scopeSel && scopeSel.value) || 'read';
+            var labelEl = document.getElementById('admin-label');
+            form.label = (labelEl && labelEl.value) || '';
+            // Admin tokens don't carry a not_before — server uses
+            // issued_at as the floor.
+            form.not_before = null;
         }
-        return {
-            indexes: indexes,
-            projects: projects,
-            allowed: allowed,
-            ttl: ttl,
-            expires_abs: expiresAbs,
-            not_before: notBefore,
-        };
+        return form;
     }
 
-    function _validateMacaroonForm(form) {
+    function _validateIssueForm(form) {
         if (!form.indexes.length) {
-            return 'Pick at least one index.';
+            return form.type === TOKEN_TYPE_DEVPI
+                ? 'Pick at least one index.'
+                : 'Pick an index.';
         }
         for (var i = 0; i < form.indexes.length; i++) {
             if (!_MACAROON_INDEX_RE.test(form.indexes[i])) {
@@ -1400,8 +1738,17 @@
                     + '". Expected user/index.';
             }
         }
-        if (!form.allowed.length) {
-            return 'Select at least one permission.';
+        if (form.type === TOKEN_TYPE_DEVPI) {
+            if (!form.allowed.length) {
+                return 'Select at least one permission.';
+            }
+        } else {
+            if (form.scope !== 'read' && form.scope !== 'upload') {
+                return 'Pick a scope (read or upload).';
+            }
+            if (form.label && form.label.length > 200) {
+                return 'Label must be 200 characters or fewer.';
+            }
         }
         if (form.ttl === null && form.expires_abs === null) {
             return 'Pick an expiry preset or enter a custom date.';
@@ -1419,42 +1766,96 @@
                 return 'Not-before plus expiry preset is already in the past.';
             }
         }
+        // Admin tokens have a server-side TTL floor of 60 s and ceiling of
+        // 1 year. Pre-flight here so the user gets a clearer error than
+        // the raw 400 from the backend.
+        if (form.type === TOKEN_TYPE_ADMIN) {
+            var effTtl;
+            if (form.expires_abs !== null) {
+                effTtl = form.expires_abs - now;
+            } else {
+                effTtl = form.ttl;
+            }
+            if (effTtl < 60) {
+                return 'Admin tokens must live at least 60 seconds.';
+            }
+            if (effTtl > 31536000) {
+                return 'Admin tokens cannot live longer than 1 year.';
+            }
+        }
         return null;
     }
 
-    function _submitMacaroonIssue(username, btn) {
-        var form = _collectMacaroonForm();
-        var err = _validateMacaroonForm(form);
+    function _submitIssue(username, btn) {
+        var form = _collectIssueForm();
+        var err = _validateIssueForm(form);
         if (err) { showModalError(err); return; }
         var nowSec = Math.floor(Date.now() / 1000);
-        var expires;
-        if (form.expires_abs !== null) {
-            expires = form.expires_abs;
-        } else {
-            var basis = form.not_before !== null ? form.not_before : nowSec;
-            expires = basis + form.ttl;
-        }
-        var body = {
-            indexes: form.indexes,
-            allowed: form.allowed,
-            expires: expires,
-        };
-        if (form.projects.length) body.projects = form.projects;
-        if (form.not_before !== null) body.not_before = form.not_before;
 
-        var orig = btn.textContent;
-        btn.textContent = 'Issuing…';
-        btn.disabled = true;
-        Api.post('/' + encodeURIComponent(username) + '/+token-create', body)
+        var endpoint, body;
+        if (form.type === TOKEN_TYPE_DEVPI) {
+            var basis = form.not_before !== null ? form.not_before : nowSec;
+            var expires = form.expires_abs !== null ? form.expires_abs
+                : basis + form.ttl;
+            body = {
+                indexes: form.indexes,
+                allowed: form.allowed,
+                expires: expires,
+            };
+            if (form.projects.length) body.projects = form.projects;
+            if (form.not_before !== null) body.not_before = form.not_before;
+            endpoint = '/' + encodeURIComponent(username) + '/+token-create';
+        } else {
+            var ttlSec = form.expires_abs !== null
+                ? form.expires_abs - nowSec : form.ttl;
+            body = {
+                user: username,
+                index: form.indexes[0],
+                scope: form.scope,
+                ttl_seconds: ttlSec,
+                label: form.label || '',
+            };
+            endpoint = '/+admin-api/token';
+        }
+
+        _setBtnLoading(btn);
+        Api.post(endpoint, body)
             .then(function (data) {
-                var token = data && data.result && data.result.token;
+                var token = form.type === TOKEN_TYPE_DEVPI
+                    ? (data && data.result && data.result.token)
+                    : (data && data.token);
                 if (!token) throw new Error('Server returned no token.');
-                _renderMacaroonIssued(username, token, form);
+                // Capture an identifier so the next listing render can
+                // highlight this row. Devpi returns `devpi-<id>-<rest>`;
+                // admin returns the full `adm_<id>.<secret>` token + a
+                // top-level `id_short` we currently don't surface — the
+                // backend bundles `meta` though, take meta.id_short
+                // when present, else parse from token.
+                if (form.type === TOKEN_TYPE_DEVPI) {
+                    // Macaroon ids are second segment after "devpi-".
+                    var raw = token.indexOf('-') !== -1
+                        ? token.substring(token.indexOf('-') + 1) : '';
+                    // The macaroon serialised form embeds the id base64;
+                    // the listing keys by the `username-tokenid` hash, so
+                    // we can't trivially pre-compute it here. Skip.
+                    _justIssuedTokenId = null;
+                } else {
+                    // Admin token format is `adm_<id>.<secret>` — strip
+                    // the prefix and the secret tail to get the id used
+                    // by the listing.
+                    if (token.substring(0, 4) === 'adm_') {
+                        var rest = token.substring(4);
+                        var dot = rest.indexOf('.');
+                        _justIssuedTokenId = dot > 0 ? rest.substring(0, dot) : null;
+                    } else {
+                        _justIssuedTokenId = null;
+                    }
+                }
+                _renderIssued(username, token, form);
             })
             .catch(function (e) {
                 showModalError(e.message || 'Failed to issue token.');
-                btn.textContent = orig;
-                btn.disabled = false;
+                _restoreBtn(btn);
             });
     }
 
@@ -1537,27 +1938,77 @@
         return wrap;
     }
 
-    function _renderMacaroonIssued(username, token, form) {
-        // Hide form fields, swap footer to single "Done" button.
-        var ids = [
-            'macaroon-indexes', 'macaroon-projects', 'macaroon-not-before',
-            'macaroon-issue-submit',
-        ];
-        // Hide all form-group divs by walking from labels
+    // Map a successful issuance to (canRead, canUpload) booleans driving
+    // which configs the result view renders. We follow the user's stated
+    // intent rather than what the backend technically allows: an admin
+    // upload-scope token can GET, but if you picked upload you wanted
+    // upload — surfacing pip.conf would be noise. For Devpi tokens the
+    // user picked permissions explicitly, so we mirror that.
+    function _issuedCapabilities(form) {
+        if (form.type === TOKEN_TYPE_DEVPI) {
+            return {
+                canRead: form.allowed.indexOf('pkg_read') !== -1,
+                canUpload: form.allowed.indexOf('upload') !== -1,
+            };
+        }
+        return {
+            canRead: form.scope === 'read',
+            canUpload: form.scope === 'upload',
+        };
+    }
+
+    // Issue context — populated when the modal opens, consulted by the
+    // result view so it knows which indexes are public (no pip.conf
+    // creds needed) vs. private (auth required).
+    var _issueContext = null;
+
+    // Token id of the most recently issued token (admin or devpi). When
+    // the listing renders next, the row matching this id gets a brief
+    // highlight so the user can spot what they just created.
+    var _justIssuedTokenId = null;
+    function _markJustIssued(rowEl, tokenId) {
+        if (_justIssuedTokenId && tokenId === _justIssuedTokenId) {
+            rowEl.classList.add('tokens-row-just-created');
+        }
+    }
+
+    function _anyIndexPrivate(indexes) {
+        if (!_issueContext || !_issueContext.aclByIndex) return true;
+        for (var i = 0; i < indexes.length; i++) {
+            var acl = _issueContext.aclByIndex[indexes[i]];
+            if (!isPublicAclRead(acl)) return true;
+        }
+        return false;
+    }
+
+    function _renderIssued(username, token, form) {
+        // Hide all form-group divs and the advanced-perms toggle so only
+        // the issued blocks remain. Type chooser too — switching type
+        // mid-issued state would be confusing.
         var formGroups = modalBody.querySelectorAll('.form-group');
         for (var g = 0; g < formGroups.length; g++) formGroups[g].hidden = true;
         var advToggle = modalBody.querySelector('.macaroon-adv-toggle');
         if (advToggle) advToggle.hidden = true;
+        // Hide any data-token-only nodes that aren't form-groups (e.g.
+        // the security banner).
+        var only = modalBody.querySelectorAll('[data-token-only]');
+        for (var o = 0; o < only.length; o++) only[o].hidden = true;
 
-        // Replace footer
         clear(modalFooter);
+        // Done returns to whatever opened the Issue modal (per-user
+        // unified Tokens modal by default; per-index Tokens modal when
+        // launched from an index card). The unified listing always
+        // shows both Admin and Devpi sections, so the user sees their
+        // freshly-issued token in context.
         modalFooter.appendChild(el('button', {
             className: 'btn btn-primary',
             textContent: 'Done',
-            onclick: function () {
-                showMacaroonTokensModal(username);
+            onclick: _issueReturnTo || function () {
+                showTokensModal(username);
             },
         }));
+
+        var caps = _issuedCapabilities(form);
 
         getPublicUrl().then(function (publicUrl) {
             var result = document.getElementById('macaroon-issued-result');
@@ -1574,30 +2025,29 @@
             result.appendChild(_macaroonReadOnceBlock(
                 'Token (raw)', token, null));
 
-            // pip.conf — meaningful for any read-capable token
-            var hasRead = form.allowed.indexOf('pkg_read') !== -1;
-            if (hasRead) {
+            // pip.conf only matters when at least one bound index actually
+            // requires authentication. For all-public indexes anyone could
+            // pip install via the bare URL — surfacing pip.conf-with-creds
+            // would mislead the user into thinking it's needed.
+            if (caps.canRead && _anyIndexPrivate(form.indexes)) {
                 var pipConf = _macaroonPipConfText(
                     publicUrl, form.indexes, username, token);
                 result.appendChild(_macaroonReadOnceBlock(
                     'pip.conf', pipConf, 'pip.conf'));
             }
 
-            // .pypirc + TWINE — for upload-capable tokens
-            var hasUpload = form.allowed.indexOf('upload') !== -1;
-            if (hasUpload) {
+            if (caps.canUpload) {
                 var pypirc = _macaroonPypircText(
                     publicUrl, form.indexes, username, token);
                 result.appendChild(_macaroonReadOnceBlock(
                     '.pypirc', pypirc, '.pypirc'));
-                // TWINE env block uses the first index (one repo per env).
+                // TWINE env uses the first index (one repo per env).
                 var twine = _macaroonTwineText(
                     publicUrl, form.indexes[0], username, token);
                 result.appendChild(_macaroonReadOnceBlock(
                     'TWINE_* env', twine, null));
             }
 
-            // user:token credential pair (curl, devpi login)
             result.appendChild(_macaroonReadOnceBlock(
                 'user : token (for curl -u, devpi login, custom tools)',
                 username + ':' + token, null));
@@ -1689,555 +2139,33 @@
             ]);
     }
 
-    function showPipConfNotice(text, kind) {
-        // Single notice slot in the pip.conf modal footer. Both info
-        // ("Previous token was revoked.") and error ("root may not issue
-        // tokens for itself") land here; the latest message replaces
-        // any prior one and auto-fades after a few seconds.
-        var notice = document.getElementById('pipconf-notice');
-        if (!notice) return;
-        notice.textContent = text;
-        notice.classList.remove('pipconf-notice-fade');
-        notice.classList.toggle('pipconf-notice-error', kind === 'error');
-        notice.hidden = false;
-        clearTimeout(notice._fadeTimer);
-        clearTimeout(notice._hideTimer);
-        // Errors stick around longer than info messages so the user has
-        // time to read the failure reason.
-        var holdMs = kind === 'error' ? 6000 : 3000;
-        notice._fadeTimer = setTimeout(function () {
-            notice.classList.add('pipconf-notice-fade');
-        }, holdMs);
-        notice._hideTimer = setTimeout(function () {
-            notice.hidden = true;
-            notice.textContent = '';
-            notice.classList.remove('pipconf-notice-fade');
-            notice.classList.remove('pipconf-notice-error');
-        }, holdMs + 700);
-    }
-
-    function showRevokedNotice() {
-        showPipConfNotice('Previous token was revoked.', 'info');
-    }
-
-    function clearPipConfNotice() {
-        // Drop any pending notice immediately — used after a successful
-        // generate so a stale error from the previous attempt doesn't
-        // linger over fresh credentials.
-        var notice = document.getElementById('pipconf-notice');
-        if (!notice) return;
-        clearTimeout(notice._fadeTimer);
-        clearTimeout(notice._hideTimer);
-        notice.hidden = true;
-        notice.textContent = '';
-        notice.classList.remove('pipconf-notice-fade');
-        notice.classList.remove('pipconf-notice-error');
-    }
-
-    function renderPipConfResult(content, indexPath, didRevoke) {
-        var result = document.getElementById('pipconf-result');
-        clear(result);
-        result.hidden = false;
-
-        // Wipe any prior error/info notice first; the revoke message
-        // (if any) is re-shown immediately below so it survives.
-        clearPipConfNotice();
-        if (didRevoke) {
-            showRevokedNotice();
-        }
-
-        // Block 1: pip.conf file
-        result.appendChild(el('label', {
-            className: 'pipconf-section-label',
-            textContent: 'pip.conf',
-        }));
-        var actions = el('div', {className: 'pip-conf-actions'});
-        var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-        copyBtn.addEventListener('click', function () {
-            copyText(content).then(function () {
-                _pipConfLastTokenKept = true;
-                flashCopied(copyBtn);
-            });
-        });
-        actions.appendChild(copyBtn);
-        actions.appendChild(el('button', {
-            className: 'btn',
-            textContent: 'Download',
-            onclick: function () {
-                _pipConfLastTokenKept = true;
-                downloadFile(content, 'pip.conf');
-            },
-        }));
-        result.appendChild(actions);
-        result.appendChild(el('pre', {
-            className: 'pip-conf-preview',
-            textContent: content,
-        }));
-
-        // Block 2: one-off install command (most ready-to-use)
-        var indexUrl = extractIndexUrl(content);
-        if (indexUrl) {
-            // Derive trusted-host from the backend-provided URL so it
-            // matches index-url even if the deployment lives behind a
-            // proxy with a different hostname than the browser's tab.
-            var oneOffCmd = 'pip install --index-url ' + indexUrl
-                + ' --trusted-host ' + hostFromUrl(indexUrl) + ' <package>';
-            result.appendChild(el('label', {
-                className: 'pipconf-section-label',
-                textContent: 'One-off install command',
-            }));
-            var cmdRow = el('div', {className: 'pip-oneoff-row'});
-            var cmdInput = el('input', {
-                type: 'text',
-                className: 'pip-oneoff-input',
-                value: oneOffCmd,
-                readOnly: true,
-                spellcheck: false,
-            });
-            cmdInput.addEventListener('focus', function () { this.select(); });
-            cmdRow.appendChild(cmdInput);
-            var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-            cmdCopyBtn.addEventListener('click', function () {
-                copyText(oneOffCmd).then(function () {
-                    _pipConfLastTokenKept = true;
-                    flashCopied(cmdCopyBtn);
-                });
-            });
-            cmdRow.appendChild(cmdCopyBtn);
-            result.appendChild(cmdRow);
-            result.appendChild(el('div', {
-                className: 'form-hint',
-                textContent: 'Replace <package> with the package name.',
-            }));
-        }
-
-        // Block 3: raw user:token credential pair (most generic)
-        var creds = extractCreds(content);
-        if (creds) {
-            result.appendChild(el('label', {
-                className: 'pipconf-section-label',
-                textContent: 'User : token (for curl -u, devpi login, custom tools)',
-            }));
-            var tokRow = el('div', {className: 'pip-oneoff-row'});
-            var tokInput = el('input', {
-                type: 'text',
-                className: 'pip-oneoff-input',
-                value: creds,
-                readOnly: true,
-                spellcheck: false,
-            });
-            tokInput.addEventListener('focus', function () { this.select(); });
-            tokRow.appendChild(tokInput);
-            var tokCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-            tokCopyBtn.addEventListener('click', function () {
-                copyText(creds).then(function () {
-                    _pipConfLastTokenKept = true;
-                    flashCopied(tokCopyBtn);
-                });
-            });
-            tokRow.appendChild(tokCopyBtn);
-            result.appendChild(tokRow);
-        }
-    }
-
-    // --- .pypirc modal (upload-scope token for twine / devpi upload) ---
-
-    function showPypircStaticModal(indexPath) {
-        // Anonymous-upload index: no credentials needed. Twine still
-        // wants a [section] in .pypirc, so we emit one without password.
-        // URL fetched from backend so it matches whatever a tokened
-        // .pypirc would produce on the same deployment.
-        getPublicUrl().then(function (publicUrl) {
-            var repoUrl = publicUrl + '/' + indexPath + '/';
-            var content = '[distutils]\n'
-                + 'index-servers = devpi\n\n'
-                + '[devpi]\n'
-                + 'repository = ' + repoUrl + '\n';
-            var oneOffCmd = 'twine upload --repository-url ' + repoUrl + ' dist/*';
-            _renderPypircStaticModal(indexPath, content, oneOffCmd);
-        });
-    }
-
-    function _renderPypircStaticModal(indexPath, content, oneOffCmd) {
-        openModal(
-            '.pypirc for ' + indexPath,
-            function (body) {
-                body.appendChild(el('div', {
-                    className: 'form-hint form-hint-warn',
-                    textContent: 'This index allows anonymous upload — '
-                        + 'no token is needed. Make sure this is what you '
-                        + 'want; world-writable indexes are a supply-chain '
-                        + 'attack vector.',
-                }));
-
-                body.appendChild(el('label', {
-                    className: 'pipconf-section-label',
-                    textContent: '.pypirc (twine)',
-                }));
-                var actions = el('div', {className: 'pip-conf-actions'});
-                var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-                copyBtn.addEventListener('click', function () {
-                    copyText(content).then(function () { flashCopied(copyBtn); });
-                });
-                actions.appendChild(copyBtn);
-                actions.appendChild(el('button', {
-                    className: 'btn',
-                    textContent: 'Download',
-                    onclick: function () { downloadFile(content, '.pypirc'); },
-                }));
-                body.appendChild(actions);
-                body.appendChild(el('pre', {
-                    className: 'pip-conf-preview',
-                    textContent: content,
-                }));
-
-                body.appendChild(el('label', {
-                    className: 'pipconf-section-label',
-                    textContent: 'One-shot twine command',
-                }));
-                var cmdRow = el('div', {className: 'pip-oneoff-row'});
-                var cmdInput = el('input', {
-                    type: 'text',
-                    className: 'pip-oneoff-input',
-                    value: oneOffCmd,
-                    readOnly: true,
-                    spellcheck: false,
-                });
-                cmdInput.addEventListener('focus', function () { this.select(); });
-                cmdRow.appendChild(cmdInput);
-                var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-                cmdCopyBtn.addEventListener('click', function () {
-                    copyText(oneOffCmd).then(function () { flashCopied(cmdCopyBtn); });
-                });
-                cmdRow.appendChild(cmdCopyBtn);
-                body.appendChild(cmdRow);
-            },
-            [
-                el('button', {
-                    className: 'btn btn-primary',
-                    textContent: 'Close',
-                    onclick: closeModal,
-                }),
-            ]);
-    }
-
-
-    function showUploadTokenModal(indexPath, aclUpload) {
-        _uploadLastTokenId = null;
-        _uploadLastTokenKept = false;
-        // World-writable index: anonymous upload — render a static
-        // .pypirc with no credentials (mirror of pip.conf public flow).
-        if (isAnonymousAclUpload(aclUpload)) {
-            return showPypircStaticModal(indexPath);
-        }
-        var currentUser = Api.getUser();
-        if (!currentUser) return;
-        var isRoot = currentUser === 'root';
-
-        var candidateUsers = [];
-        if (isRoot) {
-            // Root may issue for any non-root principal in acl_upload.
-            for (var i = 0; i < (aclUpload || []).length; i++) {
-                var u = aclUpload[i];
-                if (!u || u.indexOf(':') === 0 || u === 'root') continue;
-                if (candidateUsers.indexOf(u) < 0) candidateUsers.push(u);
-            }
-            // If acl_upload contains only special principals (e.g. just
-            // :AUTHENTICATED:), fall back to the index owner so root can
-            // still hand out a token without editing the ACL first.
-            if (!candidateUsers.length) {
-                var owner = indexPath.split('/')[0];
-                if (owner && owner !== 'root') candidateUsers.push(owner);
-            }
-        } else {
-            candidateUsers.push(currentUser);
-        }
-        if (!candidateUsers.length) return;
-
-        openModal(
-            '.pypirc for ' + indexPath,
-            function (body) {
-                body.appendChild(formGroup('User', (function () {
-                    var sel = el('select', {id: 'upload-token-user'});
-                    for (var i = 0; i < candidateUsers.length; i++) {
-                        sel.appendChild(el('option', {
-                            value: candidateUsers[i],
-                            textContent: candidateUsers[i],
-                        }));
-                    }
-                    sel.disabled = candidateUsers.length === 1;
-                    return sel;
-                })()));
-
-                body.appendChild(formGroup('Token TTL', (function () {
-                    var sel = el('select', {id: 'upload-token-ttl'});
-                    for (var i = 0; i < TTL_OPTIONS.length; i++) {
-                        var opt = TTL_OPTIONS[i];
-                        var optEl = el('option', {
-                            value: String(opt.value),
-                            textContent: opt.label,
-                        });
-                        if (opt.value === 86400) optEl.selected = true;
-                        sel.appendChild(optEl);
-                    }
-                    return sel;
-                })()));
-
-                body.appendChild(formGroup('Label (optional)', el('input', {
-                    type: 'text',
-                    id: 'upload-token-label',
-                    value: 'twine ' + indexPath,
-                    maxLength: 200,
-                })));
-
-                body.appendChild(el('div', {
-                    className: 'form-hint',
-                    textContent: 'Upload token acts as a temporary password '
-                        + 'for twine / devpi upload. It cannot delete '
-                        + 'packages, change passwords, or issue further '
-                        + 'tokens — but treat it like a password anyway.',
-                }));
-
-                body.appendChild(el('div', {
-                    id: 'upload-token-result',
-                    className: 'pip-conf-result',
-                    hidden: true,
-                }));
-            },
-            [
-                // Reuse the pip-conf flash slot id — only one modal is
-                // open at a time, and the helpers (showPipConfNotice /
-                // clearPipConfNotice) work uniformly for both.
-                el('span', {
-                    id: 'pipconf-notice',
-                    className: 'pipconf-notice',
-                    hidden: true,
-                }),
-                el('button', {
-                    className: 'btn btn-primary',
-                    textContent: 'Generate',
-                    id: 'upload-token-generate',
-                    onclick: function () { generateUploadToken(indexPath); },
-                }),
-                el('button', {
-                    className: 'btn',
-                    textContent: 'Close',
-                    onclick: closeModal,
-                }),
-            ]);
-    }
-
-    function generateUploadToken(indexPath) {
-        var user = document.getElementById('upload-token-user').value;
-        var ttl = parseInt(document.getElementById('upload-token-ttl').value, 10);
-        var label = document.getElementById('upload-token-label').value;
-        var btn = document.getElementById('upload-token-generate');
-        btn.disabled = true;
-        var orig = btn.textContent;
-        btn.textContent = 'Generating…';
-
-        // Same revoke-on-regen policy as pip.conf: drop the previous
-        // token unless the user already copied/downloaded it.
-        var prevId = _uploadLastTokenId;
-        var prevKept = _uploadLastTokenKept;
-        var didRevoke = false;
-        _uploadLastTokenId = null;
-        _uploadLastTokenKept = false;
-        var revokePromise;
-        if (prevId && !prevKept) {
-            didRevoke = true;
-            revokePromise = Api.del('/+admin-api/tokens/'
-                + encodeURIComponent(prevId)).catch(function () {});
-        } else {
-            revokePromise = Promise.resolve();
-        }
-
-        revokePromise.then(function () {
-            return Promise.all([
-                Api.post('/+admin-api/token', {
-                    user: user,
-                    index: indexPath,
-                    scope: 'upload',
-                    ttl_seconds: ttl,
-                    label: label,
-                    wait_replicas: true,
-                }),
-                getPublicUrl(),
-            ]);
-        }).then(function (results) {
-            var data = results[0];
-            var publicUrl = results[1];
-            var token = data.token || '';
-            if (token.indexOf('adm_') === 0) {
-                var rest = token.substring(4);
-                var dot = rest.indexOf('.');
-                _uploadLastTokenId = dot > 0 ? rest.substring(0, dot) : null;
-            }
-            renderUploadTokenResult(data, indexPath, didRevoke, publicUrl);
-            btn.textContent = 'Regenerate';
-        }).catch(function (err) {
-            var msg = (err && err.message) || 'Operation failed';
-            showPipConfNotice(msg, 'error');
-            btn.textContent = orig;
-        }).finally(function () {
-            btn.disabled = false;
-        });
-    }
-
-    function renderUploadTokenResult(data, indexPath, didRevoke, publicUrl) {
-        var result = document.getElementById('upload-token-result');
-        clear(result);
-        result.hidden = false;
-        clearPipConfNotice();
-        if (didRevoke) showRevokedNotice();
-
-        var user = data.user;
-        var token = data.token;
-        var base = publicUrl || location.origin.replace(/\/+$/, '');
-        var repoUrl = base + '/' + indexPath + '/';
-
-        // Block 1: .pypirc — config file consumed by twine
-        var pypircContent = '[distutils]\n'
-            + 'index-servers = devpi\n\n'
-            + '[devpi]\n'
-            + 'repository = ' + repoUrl + '\n'
-            + 'username = ' + user + '\n'
-            + 'password = ' + token + '\n';
-        result.appendChild(el('label', {
-            className: 'pipconf-section-label',
-            textContent: '.pypirc (twine)',
-        }));
-        var actions = el('div', {className: 'pip-conf-actions'});
-        var copyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-        copyBtn.addEventListener('click', function () {
-            copyText(pypircContent).then(function () {
-                _uploadLastTokenKept = true;
-                flashCopied(copyBtn);
-            });
-        });
-        actions.appendChild(copyBtn);
-        actions.appendChild(el('button', {
-            className: 'btn',
-            textContent: 'Download',
-            onclick: function () {
-                _uploadLastTokenKept = true;
-                downloadFile(pypircContent, '.pypirc');
-            },
-        }));
-        result.appendChild(actions);
-        result.appendChild(el('pre', {
-            className: 'pip-conf-preview',
-            textContent: pypircContent,
-        }));
-
-        // Block 2: TWINE_* environment variables — for CI runners
-        var envBlock = 'export TWINE_REPOSITORY_URL=' + repoUrl + '\n'
-            + 'export TWINE_USERNAME=' + user + '\n'
-            + 'export TWINE_PASSWORD=' + shellQuote(token);
-        result.appendChild(el('label', {
-            className: 'pipconf-section-label',
-            textContent: 'Environment variables (twine)',
-        }));
-        var envActions = el('div', {className: 'pip-conf-actions'});
-        var envCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-        envCopyBtn.addEventListener('click', function () {
-            copyText(envBlock).then(function () {
-                _uploadLastTokenKept = true;
-                flashCopied(envCopyBtn);
-            });
-        });
-        envActions.appendChild(envCopyBtn);
-        result.appendChild(envActions);
-        result.appendChild(el('pre', {
-            className: 'pip-conf-preview',
-            textContent: envBlock,
-        }));
-
-        // Block 3: one-shot twine upload command
-        var twineCmd = 'twine upload --repository-url ' + repoUrl
-            + ' -u ' + user + ' -p ' + shellQuote(token) + ' dist/*';
-        result.appendChild(el('label', {
-            className: 'pipconf-section-label',
-            textContent: 'One-shot twine command',
-        }));
-        var cmdRow = el('div', {className: 'pip-oneoff-row'});
-        var cmdInput = el('input', {
-            type: 'text',
-            className: 'pip-oneoff-input',
-            value: twineCmd,
-            readOnly: true,
-            spellcheck: false,
-        });
-        cmdInput.addEventListener('focus', function () { this.select(); });
-        cmdRow.appendChild(cmdInput);
-        var cmdCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-        cmdCopyBtn.addEventListener('click', function () {
-            copyText(twineCmd).then(function () {
-                _uploadLastTokenKept = true;
-                flashCopied(cmdCopyBtn);
-            });
-        });
-        cmdRow.appendChild(cmdCopyBtn);
-        result.appendChild(cmdRow);
-
-        // Block 4: raw user:token credential pair (for curl, devpi login)
-        var creds = user + ':' + token;
-        result.appendChild(el('label', {
-            className: 'pipconf-section-label',
-            textContent: 'User : token (for curl -u, devpi login, custom tools)',
-        }));
-        var tokRow = el('div', {className: 'pip-oneoff-row'});
-        var tokInput = el('input', {
-            type: 'text',
-            className: 'pip-oneoff-input',
-            value: creds,
-            readOnly: true,
-            spellcheck: false,
-        });
-        tokInput.addEventListener('focus', function () { this.select(); });
-        tokRow.appendChild(tokInput);
-        var tokCopyBtn = el('button', {className: 'btn', textContent: 'Copy'});
-        tokCopyBtn.addEventListener('click', function () {
-            copyText(creds).then(function () {
-                _uploadLastTokenKept = true;
-                flashCopied(tokCopyBtn);
-            });
-        });
-        tokRow.appendChild(tokCopyBtn);
-        result.appendChild(tokRow);
-    }
-
     function flashCopied(btn) {
         var orig = btn.textContent;
         btn.textContent = 'Copied!';
         setTimeout(function () { btn.textContent = orig; }, 1200);
     }
 
-    function extractIndexUrl(pipConfContent) {
-        var m = pipConfContent.match(/^index-url\s*=\s*(\S+)/m);
-        return m ? m[1] : null;
+    // Replace a button's content with three pulsing dots while a request
+    // is in-flight. Disables the button to prevent double-submit. Caller
+    // restores via `_restoreBtn` on error; on success the modal re-renders
+    // its body so restoration isn't needed.
+    function _setBtnLoading(btn) {
+        btn._origText = btn.textContent;
+        clear(btn);
+        for (var i = 0; i < 3; i++) {
+            btn.appendChild(el('span', {className: 'btn-loading-dot'}));
+        }
+        btn.classList.add('btn-loading');
+        btn.disabled = true;
     }
 
-    function extractTokenSecret(pipConfContent) {
-        var m = pipConfContent.match(/^index-url\s*=\s*https?:\/\/[^:]+:([^@]+)@/m);
-        if (!m) return null;
-        try {
-            return decodeURIComponent(m[1]);
-        } catch (e) {
-            return m[1];
-        }
+    function _restoreBtn(btn) {
+        btn.classList.remove('btn-loading');
+        clear(btn);
+        if (btn._origText) btn.textContent = btn._origText;
+        btn.disabled = false;
     }
 
-    function extractCreds(pipConfContent) {
-        // Returns "user:token" extracted (URL-decoded) from the index-url.
-        var m = pipConfContent.match(/^index-url\s*=\s*https?:\/\/([^:]+):([^@]+)@/m);
-        if (!m) return null;
-        try {
-            return decodeURIComponent(m[1]) + ':' + decodeURIComponent(m[2]);
-        } catch (e) {
-            return m[1] + ':' + m[2];
-        }
-    }
 
     // Pip block for package detail: shows clickable "pip install <pkg>" command.
     // Assumes pip.conf has been configured separately via the per-index modal.
@@ -2581,21 +2509,12 @@
                         menuItems.push({label: 'Edit', onclick: function () { closeAllKebabs(); showUserModal(name, info); }});
                         (function (uname) {
                             menuItems.push({
-                                label: 'Admin tokens',
+                                label: 'Tokens',
                                 onclick: function () {
                                     closeAllKebabs();
-                                    showUserTokensModal(uname);
+                                    showTokensModal(uname);
                                 },
                             });
-                            if (hasDevpiTokens()) {
-                                menuItems.push({
-                                    label: 'Devpi tokens',
-                                    onclick: function () {
-                                        closeAllKebabs();
-                                        showMacaroonTokensModal(uname);
-                                    },
-                                });
-                            }
                         })(name);
                     }
                     if (currentUser === 'root' && name !== 'root') {
@@ -2930,41 +2849,36 @@
                 card.appendChild(details);
 
                 // Kebab menu items: pip.conf for everyone, upload token
-                // for principals with acl_upload (stage indexes only),
-                // edit/delete for owners.
+                // pip.conf as a one-click static download — only meaningful
+                // for public indexes (no credentials required). Private
+                // indexes route through the unified Tokens flow where the
+                // user picks scope/TTL and gets a credentialed pip.conf.
                 var loggedIn = Api.getUser();
                 var menuItems = [];
-                (function (path, aclRead) {
-                    var needsToken = !isPublicAclRead(aclRead);
-                    menuItems.push({
-                        label: 'pip.conf' + (needsToken ? ' + token' : ''),
-                        onclick: function () {
-                            closeAllKebabs();
-                            showPipConfModal(path, aclRead);
-                        },
-                    });
-                })(idx._full, idx.acl_read);
-                if (!isMirror && canIssueUploadToken(loggedIn, idx.acl_upload)) {
-                    (function (path, aclUpload) {
-                        var needsToken = !isAnonymousAclUpload(aclUpload);
+                if (isPublicAclRead(idx.acl_read)) {
+                    (function (path) {
                         menuItems.push({
-                            label: '.pypirc' + (needsToken ? ' + token' : ''),
+                            label: 'pip.conf',
                             onclick: function () {
                                 closeAllKebabs();
-                                showUploadTokenModal(path, aclUpload);
+                                showPipConfStaticModal(path);
                             },
                         });
-                    })(idx._full, idx.acl_upload);
+                    })(idx._full);
                 }
-                if ((loggedIn === 'root' || loggedIn === idx._user)
-                        && hasDevpiTokens()) {
+                // Unified per-index Tokens manager — replaces the old
+                // separate "pip.conf + token" / ".pypirc + token" / "Devpi
+                // tokens" trio. Issuance is now consistent across user and
+                // index contexts.
+                if (loggedIn === 'root' || loggedIn === idx._user) {
                     (function (idxRef) {
                         menuItems.push({
-                            label: 'Devpi tokens',
+                            label: 'Tokens',
                             onclick: function () {
                                 closeAllKebabs();
-                                showIndexMacaroonTokensModal(
-                                    idxRef._user, idxRef._name);
+                                showIndexTokensModal(
+                                    idxRef._user, idxRef._name,
+                                    idxRef.acl_read || null);
                             },
                         });
                     })(idx);
@@ -3349,30 +3263,35 @@
             }
             (function () {
                 var aclRead = (indexInfo && indexInfo.acl_read) || [];
-                var needsToken = !isPublicAclRead(aclRead);
-                actions.push(el('button', {
-                    className: 'btn',
-                    textContent: 'pip.conf' + (needsToken ? ' + token' : ''),
-                    onclick: function () {
-                        showPipConfModal(indexPath, aclRead);
-                    },
-                }));
-            })();
-            if (!isMirror && canIssueUploadToken(
-                    Api.getUser(),
-                    (indexInfo && indexInfo.acl_upload) || [])) {
-                (function () {
-                    var aclUpload = (indexInfo && indexInfo.acl_upload) || [];
-                    var needsToken = !isAnonymousAclUpload(aclUpload);
+                // Quick-action pip.conf only useful for public indexes
+                // (no creds required). Private indexes go through Tokens.
+                if (isPublicAclRead(aclRead)) {
                     actions.push(el('button', {
                         className: 'btn',
-                        textContent: '.pypirc' + (needsToken ? ' + token' : ''),
+                        textContent: 'pip.conf',
                         onclick: function () {
-                            showUploadTokenModal(indexPath, aclUpload);
+                            showPipConfStaticModal(indexPath);
                         },
                     }));
-                })();
-            }
+                }
+            })();
+            (function () {
+                // Unified Tokens flow — replaces the old "pip.conf + token"
+                // and ".pypirc + token" buttons. Owner / root only.
+                var loggedIn = Api.getUser();
+                var idxUser = indexPath.split('/')[0];
+                if (loggedIn === 'root' || loggedIn === idxUser) {
+                    var idxName = indexPath.split('/')[1];
+                    var aclRead = (indexInfo && indexInfo.acl_read) || null;
+                    actions.push(el('button', {
+                        className: 'btn auth-only',
+                        textContent: 'Tokens',
+                        onclick: function () {
+                            showIndexTokensModal(idxUser, idxName, aclRead);
+                        },
+                    }));
+                }
+            })();
             actions.push(el('button', {
                 className: 'btn auth-only',
                 textContent: 'Edit',
