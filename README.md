@@ -14,16 +14,16 @@ talks to the standard devpi JSON API directly.
 - Server info with version of devpi-server and all installed plugins (auto-detected)
 - Cache metrics with hit-rate bars (storage, changelog, relpath caches)
 - Whoosh search index queue status
-- **Replica status** (master only, authenticated users only) - per-replica cards with
-  authoritative `applied_serial` vs. master serial. Three states:
-  - **in sync** - replica matches master serial
+- **Replica status** (primary only, authenticated users only) - per-replica cards with
+  authoritative `applied_serial` vs. primary serial. Three states:
+  - **in sync** - replica matches primary serial
   - **lagging** - replica is behind but advancing
   - **stuck** - replica has been polling the same serial for >=30 s; usually means a
     server-side plugin (`devpi-admin`, `devpi-web`, ...) is missing or out of date on the replica
 - **Topbar health indicator** - the `devpi admin` logo is coloured green / orange / red
   on every page, refreshed every 30 s in the background:
   - server reachable, all replicas in sync
-  - at least one replica lagging (visible to authenticated master operators)
+  - at least one replica lagging (visible to authenticated primary operators)
   - server not responding
 
 ### Indexes
@@ -205,10 +205,10 @@ for HTML requests while `devpi-web` would still serve its own HTML on other rout
 ### Replicas: install on every node
 
 `devpi-admin` registers custom keyfs keys (`+admin/tokens/...`,
-`+admin/user-tokens/...`, `+admin/index-tokens/...`). Master writes to these on every
-token issue / revoke. **Replicas without `devpi-admin` installed cannot apply those
-changelog entries** - `import_changes` fails with `AssertionError` on the missing
-keyfs key, the replica rolls back to the prior serial, and replication stalls.
+`+admin/user-tokens/...`, `+admin/index-tokens/...`). The primary writes to these on
+every token issue / revoke. **Replicas without `devpi-admin` installed cannot apply
+those changelog entries** - `import_changes` fails with `AssertionError` on the
+missing keyfs key, the replica rolls back to the prior serial, and replication stalls.
 
 The dashboard's stuck-replica detection is designed exactly for this: a `stuck`
 state on a replica card almost always means a plugin (typically `devpi-admin` itself,
@@ -217,14 +217,14 @@ is straightforward:
 
 ```bash
 # on the replica
-~/.venv/bin/pip install --upgrade devpi-admin   # match master version
+~/.venv/bin/pip install --upgrade devpi-admin   # match primary version
 systemctl restart devpi
 ```
 
 Replication resumes from the failed serial automatically - no manual keyfs surgery.
 
-**Upgrade order:** replicas first, then master. If you upgrade master first and that
-release introduces a new keyfs key, replicas would crash on the very next poll.
+**Upgrade order:** replicas first, then primary. If you upgrade the primary first and
+that release introduces a new keyfs key, replicas would crash on the very next poll.
 
 See `INSTALL.md` section 11 for full step-by-step replica setup and dashboard interpretation.
 
@@ -567,7 +567,7 @@ Revoke a single token.
 - **200:** `{"revoked": true, "id": "abc..."}`
 - **404:** token id not found
 
-### Replication observability (master only)
+### Replication observability (primary only)
 
 #### `GET /+admin-api/replicas`
 Last-known poll info per replica, captured from each `GET /+changelog/{N}-` request via
@@ -578,7 +578,7 @@ applied (`start_serial - 1` from its most recent poll). Compare against `/+statu
 Why this isn't `polling_replicas` from `/+status`: devpi-server overwrites
 `xom.polling_replicas[uuid].serial` during streaming and gives a misleading "caught up"
 reading once the response generator drains. Capturing `start_serial` at the request
-boundary is the only stable signal master alone can produce.
+boundary is the only stable signal the primary alone can produce.
 
 - **Auth:** required
 - **200:**
@@ -598,7 +598,7 @@ boundary is the only stable signal master alone can produce.
   }
   ```
 - Entries auto-expire after 10 min of silence. Dict size capped at 256 entries
-  (least-recently-seen evicted first) so an attacker spamming UUIDs cannot exhaust master memory.
+  (least-recently-seen evicted first) so an attacker spamming UUIDs cannot exhaust primary memory.
 
 ## Project layout
 

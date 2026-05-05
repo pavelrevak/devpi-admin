@@ -3873,8 +3873,14 @@
             for (var vk = 0; vk < verKeys.length; vk++) {
                 infoRows.push([verKeys[vk], ver[verKeys[vk]]]);
             }
+            // devpi-server still emits "MASTER" in /+status (as of 6.x)
+            // even though upstream is in the middle of renaming to
+            // "PRIMARY". Display the new name; internal checks below
+            // accept both for forward compatibility.
+            var displayedRole = status.role === 'MASTER'
+                ? 'PRIMARY' : (status.role || '?');
             infoRows.push(
-                ['Role', status.role || '?'],
+                ['Role', displayedRole],
                 ['Host', status.host + ':' + status.port],
                 ['Serial', String(status.serial || 0)]
             );
@@ -3958,7 +3964,10 @@
             // need network topology info.
             var pollingReplicas = status.polling_replicas || {};
             var replicaUuids = Object.keys(pollingReplicas);
-            if (status.role === 'MASTER' && replicaUuids.length > 0
+            // Accept both names — server still emits MASTER but upstream
+            // is renaming to PRIMARY.
+            if ((status.role === 'MASTER' || status.role === 'PRIMARY')
+                    && replicaUuids.length > 0
                     && Api.getUser()) {
                 var masterSerial = status.serial || 0;
                 var now = Date.now() / 1000;
@@ -4120,8 +4129,9 @@
         if (!status) {
             kind = 'red';
             tip = 'devpi server is not responding';
-        } else if (Api.getUser() && status.role === 'MASTER') {
-            // Authenticated on master: detect lagging/stuck replicas via
+        } else if (Api.getUser()
+                && (status.role === 'MASTER' || status.role === 'PRIMARY')) {
+            // Authenticated on primary: detect lagging/stuck replicas via
             // applied_serial vs current keyfs serial.
             var pollingReplicas = status.polling_replicas || {};
             var uuids = Object.keys(pollingReplicas);
