@@ -150,7 +150,7 @@ class AdminTokenCheckTests(unittest.TestCase):
                      "/alice/dev/+simple/", "/alice/dev/+f/foo.whl",
                      "/alice/dev/foo/1.0"):
             self.assertIsNone(
-                _admin_token_check(self._make("GET", path), self._meta()),
+                _admin_token_check(self._make("GET", path), self._meta(), None),
                 "GET %s should be allowed" % path)
 
     def test_read_scope_blocks_management_paths(self):
@@ -158,30 +158,31 @@ class AdminTokenCheckTests(unittest.TestCase):
                      "/+admin-api/users/alice/tokens", "/+status",
                      "/alice", "/alice/"):
             self.assertIsNotNone(
-                _admin_token_check(self._make("GET", path), self._meta()),
+                _admin_token_check(self._make("GET", path), self._meta(), None),
                 "GET %s should be blocked" % path)
 
     def test_read_scope_blocks_other_index(self):
         # Token bound to alice/dev cannot reach bob/prod.
         self.assertIsNotNone(_admin_token_check(
-            self._make("GET", "/bob/prod"), self._meta()))
+            self._make("GET", "/bob/prod"), self._meta(), None))
         self.assertIsNotNone(_admin_token_check(
-            self._make("GET", "/bob/prod/+simple/foo"), self._meta()))
+            self._make("GET", "/bob/prod/+simple/foo"), self._meta(), None))
         # Even alice's *other* index is blocked.
         self.assertIsNotNone(_admin_token_check(
-            self._make("GET", "/alice/staging"), self._meta()))
+            self._make("GET", "/alice/staging"), self._meta(), None))
 
     def test_head_treated_like_get(self):
         self.assertIsNone(_admin_token_check(
-            self._make("HEAD", "/alice/dev"), self._meta()))
+            self._make("HEAD", "/alice/dev"), self._meta(), None))
         self.assertIsNotNone(_admin_token_check(
-            self._make("HEAD", "/+login"), self._meta()))
+            self._make("HEAD", "/+login"), self._meta(), None))
 
     def test_read_scope_blocks_writes_everywhere(self):
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             for path in ("/alice/dev", "/alice/dev/foo", "/+login"):
                 self.assertIsNotNone(
-                    _admin_token_check(self._make(method, path), self._meta()),
+                    _admin_token_check(
+                        self._make(method, path), self._meta(), None),
                     "%s %s must be blocked for read-scope token"
                     % (method, path))
 
@@ -191,10 +192,10 @@ class AdminTokenCheckTests(unittest.TestCase):
         meta = self._meta(scope="upload")
         for method in ("POST", "PUT"):
             self.assertIsNone(_admin_token_check(
-                self._make(method, "/alice/dev"), meta),
+                self._make(method, "/alice/dev"), meta, None),
                 "%s should be allowed" % method)
             self.assertIsNone(_admin_token_check(
-                self._make(method, "/alice/dev/foo/1.0"), meta))
+                self._make(method, "/alice/dev/foo/1.0"), meta, None))
 
     def test_upload_scope_blocks_delete(self):
         # Even with upload scope, DELETE is never allowed — package
@@ -202,31 +203,142 @@ class AdminTokenCheckTests(unittest.TestCase):
         meta = self._meta(scope="upload")
         for path in ("/alice/dev", "/alice/dev/foo", "/alice/dev/foo/1.0"):
             self.assertIsNotNone(
-                _admin_token_check(self._make("DELETE", path), meta),
+                _admin_token_check(self._make("DELETE", path), meta, None),
                 "DELETE %s must be blocked even for upload scope" % path)
 
     def test_upload_scope_blocks_other_index(self):
         meta = self._meta(scope="upload")
         self.assertIsNotNone(_admin_token_check(
-            self._make("POST", "/bob/prod"), meta))
+            self._make("POST", "/bob/prod"), meta, None))
 
     def test_upload_scope_blocks_management_paths(self):
         meta = self._meta(scope="upload")
         for path in ("/+login", "/+admin-api/token", "/+admin/", "/"):
             self.assertIsNotNone(
-                _admin_token_check(self._make("POST", path), meta))
+                _admin_token_check(self._make("POST", path), meta, None))
 
     # --- malformed meta (defensive) ---
 
     def test_unknown_scope_blocked(self):
         meta = {"user": "alice", "index": "alice/dev", "scope": "weird"}
         self.assertIsNotNone(_admin_token_check(
-            self._make("GET", "/alice/dev"), meta))
+            self._make("GET", "/alice/dev"), meta, None))
 
     def test_missing_index_blocked(self):
         meta = {"user": "alice", "scope": "read"}
         self.assertIsNotNone(_admin_token_check(
-            self._make("GET", "/alice/dev"), meta))
+            self._make("GET", "/alice/dev"), meta, None))
+
+
+class AdminTokenBasesAwareTests(unittest.TestCase):
+    """File-download cross-index GETs are allowed when the target index
+    is reachable through the bound stage's SRO (bases inheritance).
+
+    devpi's ``+simple/`` view on a stage emits links pointing to the
+    base index that physically hosts the file (e.g. mirror-fed packages
+    on ``villapro/staging`` link to ``/root/pypi/+f/...``); pip then
+    follows them with the bound token and must not be 403'd.
+    """
+
+    def _make(self, method, path):
+        req = MagicMock()
+        req.method = method
+        req.path = path
+        return req
+
+    def _meta(self, index="villapro/staging"):
+        return {
+            "user": index.split("/")[0], "index": index, "scope": "read"}
+
+    def _xom_with_sro(self, sro_names):
+        """Build a stub xom whose bound stage's sro() yields stages with
+        the given ``user/index`` names. ``read_transaction()`` is a
+        no-op context manager.
+        """
+        stages = [MagicMock(name=n) for n in sro_names]
+        for stage, n in zip(stages, sro_names):
+            stage.name = n
+        bound_stage = MagicMock()
+        bound_stage.sro.return_value = iter(stages)
+
+        xom = MagicMock()
+        xom.model.getstage.return_value = bound_stage
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=ctx)
+        ctx.__exit__ = MagicMock(return_value=False)
+        xom.keyfs.read_transaction.return_value = ctx
+        return xom
+
+    def test_file_download_on_base_index_allowed(self):
+        # staging → private → pypi: pip follows mirror file link.
+        xom = self._xom_with_sro(
+            ["villapro/staging", "villapro/private", "root/pypi"])
+        result = _admin_token_check(
+            self._make("GET", "/root/pypi/+f/ab/cdef/setuptools-1.0.whl"),
+            self._meta(), xom)
+        self.assertIsNone(result)
+
+    def test_file_download_on_intermediate_base_allowed(self):
+        xom = self._xom_with_sro(
+            ["villapro/staging", "villapro/private", "root/pypi"])
+        result = _admin_token_check(
+            self._make("GET", "/villapro/private/+f/ab/cdef/pkg-1.0.whl"),
+            self._meta(), xom)
+        self.assertIsNone(result)
+
+    def test_file_download_on_unrelated_index_blocked(self):
+        xom = self._xom_with_sro(
+            ["villapro/staging", "villapro/private", "root/pypi"])
+        result = _admin_token_check(
+            self._make("GET", "/charlie/secret/+f/ab/cdef/pkg-1.0.whl"),
+            self._meta(), xom)
+        self.assertIsNotNone(result)
+
+    def test_simple_listing_on_base_not_exempted(self):
+        # Bases exception is scoped to +f/ file downloads only — pip
+        # always queries +simple/ on the bound stage URL (devpi merges
+        # the views), so cross-index +simple has no legitimate flow and
+        # must remain blocked to keep token scope meaningful.
+        xom = self._xom_with_sro(
+            ["villapro/staging", "root/pypi"])
+        result = _admin_token_check(
+            self._make("GET", "/root/pypi/+simple/setuptools/"),
+            self._meta(), xom)
+        self.assertIsNotNone(result)
+
+    def test_bound_stage_missing_denies(self):
+        xom = MagicMock()
+        xom.model.getstage.return_value = None
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=ctx)
+        ctx.__exit__ = MagicMock(return_value=False)
+        xom.keyfs.read_transaction.return_value = ctx
+        result = _admin_token_check(
+            self._make("GET", "/root/pypi/+f/ab/cdef/pkg.whl"),
+            self._meta(), xom)
+        self.assertIsNotNone(result)
+
+    def test_sro_lookup_exception_denies(self):
+        # Best-effort: any error in SRO traversal falls through to deny,
+        # rather than masking a misconfiguration as accidental access.
+        xom = MagicMock()
+        xom.keyfs.read_transaction.side_effect = RuntimeError("boom")
+        result = _admin_token_check(
+            self._make("GET", "/root/pypi/+f/ab/cdef/pkg.whl"),
+            self._meta(), xom)
+        self.assertIsNotNone(result)
+
+    def test_upload_scope_does_not_use_bases_exception(self):
+        # Upload tokens write to the bound stage; cross-base writes
+        # don't have an analogous "+f link in +simple" justification.
+        # POST /root/pypi/... must stay blocked even with SRO match.
+        xom = self._xom_with_sro(["villapro/staging", "root/pypi"])
+        meta = {"user": "villapro", "index": "villapro/staging",
+                "scope": "upload"}
+        result = _admin_token_check(
+            self._make("POST", "/root/pypi/+f/ab/cdef/pkg.whl"),
+            meta, xom)
+        self.assertIsNotNone(result)
 
 
 class UserListingCheckTests(unittest.TestCase):

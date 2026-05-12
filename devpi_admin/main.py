@@ -444,7 +444,7 @@ def devpi_admin_tween_factory(handler, registry):
                 # Cache for the identity hook so it doesn't re-read keyfs.
                 request.environ["adm.token_meta"] = meta
                 request.environ["adm.is_admin_token"] = True
-                denied = _admin_token_check(request, meta)
+                denied = _admin_token_check(request, meta, xom)
                 if denied is not None:
                     return denied
             # Invalid/expired token: let the identity hook return None and
@@ -510,7 +510,7 @@ def _request_carries_admin_token(request):
     return _extract_admin_token_secret(request) is not None
 
 
-def _admin_token_check(request, token_meta):
+def _admin_token_check(request, token_meta, xom):
     """Restrict admin-token requests by scope and bound index.
 
     A token carries a ``scope`` (``read`` / ``upload``) and is bound to a
@@ -523,6 +523,13 @@ def _admin_token_check(request, token_meta):
       ``/<user>/<index>/...``. A token bound to ``alice/dev`` cannot
       reach ``/bob/prod`` or any management endpoint (``/+admin*``,
       ``/+admin-api/*``, ``/+login``, ``/+status``, ``/<user>``).
+    * Cross-base file downloads (``GET /<base>/<idx>/+f/...``) are
+      allowed when the target index is reachable through the bound
+      stage's SRO (bases inheritance). devpi's ``+simple/`` on a stage
+      returns links pointing to the base index hosting the file (e.g.
+      ``/root/pypi/+f/...`` for a mirror-fed package on
+      ``villapro/staging``); without this exception pip would follow
+      the link with the bound token and get 403.
 
     Returns ``None`` to allow, or an HTTPForbidden response to deny.
     """
@@ -553,9 +560,43 @@ def _admin_token_check(request, token_meta):
     prefix = "/" + bound
     if path == prefix or path.startswith(prefix + "/"):
         return None
+    # Bases inheritance for file downloads: a stage's +simple/ surfaces
+    # links into the base index (e.g. mirror) rather than rewriting them
+    # under the stage URL. Allow the resulting cross-index GET as long
+    # as the target is part of the bound stage's SRO.
+    if request.method == "GET":
+        file_match = _PKG_FILE_RE.match(path)
+        if file_match is not None:
+            other_user, other_index = file_match.group(1), file_match.group(2)
+            if _index_in_bound_sro(xom, bound, other_user, other_index):
+                return None
     return HTTPForbidden(json_body={
         "error": f"admin token bound to {bound} cannot access {path}",
     })
+
+
+def _index_in_bound_sro(xom, bound, other_user, other_index):
+    """Return True iff ``other_user/other_index`` is in bound stage's SRO.
+
+    SRO (Stage Resolution Order) is devpi's transitive bases traversal —
+    the same chain its ``+simple/`` view follows when emitting links.
+    Best-effort: missing stage or any error returns False (deny). Runs
+    inside a read transaction because ``sro()`` touches each base's
+    ``ixconfig`` in keyfs.
+    """
+    bound_user, bound_idx = bound.split("/", 1)
+    try:
+        with xom.keyfs.read_transaction(allow_reuse=True):
+            bound_stage = xom.model.getstage(bound_user, bound_idx)
+            if bound_stage is None:
+                return False
+            target_name = f"{other_user}/{other_index}"
+            for stage in bound_stage.sro():
+                if stage.name == target_name:
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def _user_listing_check(request):

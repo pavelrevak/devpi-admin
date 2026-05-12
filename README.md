@@ -98,6 +98,12 @@ talks to the standard devpi JSON API directly.
   `DELETE` is **never** granted, even with `upload` scope - package removal must use
   password auth. Anything outside the bound index path returns 403, including the SPA,
   `/+admin-api/*` (so a token cannot mint further tokens), `/+login`, `/`, and `/<user>`.
+  **Bases exception**: `GET /<base>/<idx>/+f/<...>` is also allowed when `<base>/<idx>`
+  is in the bound stage's SRO (bases inheritance). devpi's `+simple/` view on a stage
+  emits file links pointing directly at the base index (e.g. mirror-fed packages on
+  `villapro/staging` link to `/root/pypi/+f/...`); without this exception pip would
+  follow the link with the bound token and get 403. Limited to `GET` on `+f/` —
+  cross-index `+simple/` and writes remain blocked.
 - **Issuance rules**: regular users may issue for themselves; root may issue for *other*
   users (admin delegation) but not for itself. Admin-token-authenticated requests cannot
   issue further tokens. Issuance verifies the target user is in `acl_read` /
