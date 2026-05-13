@@ -1242,9 +1242,64 @@
     // Token types supported by the unified Issue modal. The selector at the
     // top of the modal switches the form between Devpi tokens (multi-index,
     // permission checkboxes) and Admin tokens (single index, scope select).
-    // Devpi is the default unless the plugin isn't installed.
+    // When the caller doesn't pin a type, the modal defaults to whichever
+    // backend the user *most recently* issued against — saves picking the
+    // same radio every time. Falls back to Devpi (or Admin if the plugin
+    // isn't installed) for users with no tokens yet.
     var TOKEN_TYPE_DEVPI = 'devpi';
     var TOKEN_TYPE_ADMIN = 'admin';
+
+    function _detectRecentTokenType(username) {
+        // Returns Promise<TOKEN_TYPE_*|null>. ``null`` means the user has
+        // no tokens (or detection failed) — caller picks a static default.
+        //
+        // Admin tokens carry ``issued_at`` (epoch). Macaroon tokens have
+        // no first-class issuance timestamp; we use ``not_before`` when
+        // present (it tracks the issue moment for the typical "starts
+        // now" flow) and fall back to ``expires`` so a freshly-issued
+        // long-TTL token still wins over an older short-TTL one.
+        var pAdmin = Api.get(
+            '/+admin-api/users/' + encodeURIComponent(username) + '/tokens')
+            .then(function (data) {
+                var tokens = (data && data.result) || [];
+                var max = 0;
+                for (var i = 0; i < tokens.length; i++) {
+                    var t = tokens[i].issued_at || 0;
+                    if (t > max) max = t;
+                }
+                return max || null;
+            })
+            .catch(function () { return null; });
+
+        var pDevpi = hasDevpiTokens()
+            ? Api.get('/' + encodeURIComponent(username) + '/+tokens')
+                .then(function (data) {
+                    var tokens = (data && data.result
+                        && data.result.tokens) || {};
+                    var max = 0;
+                    for (var id in tokens) {
+                        if (!Object.prototype.hasOwnProperty.call(
+                                tokens, id)) continue;
+                        var parsed = parseMacaroonRestrictions(
+                            tokens[id].restrictions);
+                        var t = parsed.not_before
+                            || parsed.expires || 0;
+                        if (t > max) max = t;
+                    }
+                    return max || null;
+                })
+                .catch(function () { return null; })
+            : Promise.resolve(null);
+
+        return Promise.all([pAdmin, pDevpi]).then(function (results) {
+            var adminTs = results[0];
+            var devpiTs = results[1];
+            if (!adminTs && !devpiTs) return null;
+            if (!adminTs) return TOKEN_TYPE_DEVPI;
+            if (!devpiTs) return TOKEN_TYPE_ADMIN;
+            return adminTs >= devpiTs ? TOKEN_TYPE_ADMIN : TOKEN_TYPE_DEVPI;
+        });
+    }
 
     // Public entry point. `options` may include:
     //  • `preselectType` — 'devpi' or 'admin'
@@ -1259,18 +1314,25 @@
     function showIssueTokenModal(username, options) {
         options = options || {};
         var presel = (options.preselectIndexes || []).slice();
-        var preselType = options.preselectType || TOKEN_TYPE_DEVPI;
+        var explicitType = options.preselectType || null;
         _issueReturnTo = options.returnTo || function () {
             showTokensModal(username);
         };
         _issueLockedIndex = (options.lockIndex && presel.length)
             ? presel[0] : null;
-        // If the user asked for Devpi but the plugin isn't installed, silently
-        // fall back to Admin — saves them a trip back through the kebab.
-        if (preselType === TOKEN_TYPE_DEVPI && !hasDevpiTokens()) {
-            preselType = TOKEN_TYPE_ADMIN;
-        }
-        fetchRoot().then(function (rootResult) {
+        // Caller pinned the type → honour it; otherwise detect from the
+        // user's existing tokens (most-recently-issued backend wins).
+        // Detection failure falls back to Devpi (or Admin if the plugin
+        // isn't installed).
+        var pType = explicitType
+            ? Promise.resolve(explicitType)
+            : _detectRecentTokenType(username);
+        Promise.all([fetchRoot(), pType]).then(function (results) {
+            var rootResult = results[0];
+            var preselType = results[1] || TOKEN_TYPE_DEVPI;
+            if (preselType === TOKEN_TYPE_DEVPI && !hasDevpiTokens()) {
+                preselType = TOKEN_TYPE_ADMIN;
+            }
             var indexInfos = getAllIndexes(rootResult);
             var aclByIndex = {};
             // Indexes accessible to the bound user: ones they own, ones
@@ -1304,11 +1366,13 @@
             };
             _renderIssueTokenModal(username, presel, preselType);
         }).catch(function () {
+            var fallbackType = explicitType
+                || (hasDevpiTokens() ? TOKEN_TYPE_DEVPI : TOKEN_TYPE_ADMIN);
             _issueContext = {
                 accessibleIndexes: presel.slice(),
                 aclByIndex: {},
             };
-            _renderIssueTokenModal(username, presel, preselType);
+            _renderIssueTokenModal(username, presel, fallbackType);
         });
     }
 

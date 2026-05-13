@@ -277,6 +277,23 @@ class UnifiedIssueModalTests(unittest.TestCase):
     def test_unified_entry_point_exists(self):
         self.assertIn("function showIssueTokenModal(username, options)", self.js)
 
+    def test_recent_token_type_detector_present(self):
+        # Auto-preselect: when caller doesn't pin a type, pick the
+        # backend the user most recently issued against.
+        self.assertIn("function _detectRecentTokenType(username)", self.js)
+        # Admin tokens compared by issued_at, macaroons by
+        # not_before / expires.
+        self.assertIn("tokens[i].issued_at", self.js)
+        self.assertIn("parsed.not_before", self.js)
+
+    def test_issue_modal_uses_detector_when_caller_is_silent(self):
+        # `options.preselectType` short-circuits detection; absence
+        # triggers _detectRecentTokenType.
+        self.assertIn("var explicitType = options.preselectType || null;",
+                      self.js)
+        self.assertIn("explicitType\n            ? Promise.resolve(explicitType)\n"
+                      "            : _detectRecentTokenType(username);", self.js)
+
     def test_unified_listing_has_issue_button(self):
         # Single Issue entry point on the unified per-user Tokens modal —
         # no preselectType so the user picks devpi/admin in the form.
