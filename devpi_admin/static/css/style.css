@@ -428,7 +428,7 @@ body {
 
 .index-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
     gap: 12px;
 }
 
@@ -461,10 +461,19 @@ body {
     gap: 8px;
 }
 
+.index-card-path {
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
 .index-card-tags {
     display: flex;
     gap: 4px;
     margin-left: auto;
+    flex-shrink: 0;
 }
 
 .index-card-owner {
@@ -481,7 +490,7 @@ body {
 .index-card-sep {
     font-size: 16px;
     color: var(--text-faint);
-    margin: 0 1px;
+    margin: 0;
 }
 
 .index-card-name {
@@ -1086,6 +1095,44 @@ body {
     font-weight: 500;
     background: var(--tag-bg);
     color: var(--tag-text);
+}
+
+/* Compact single-letter variant used in index-card heads where the
+   full word (mirror/stage/volatile/...) would push the kebab off the
+   row in narrow grid columns. Hover tooltip (data-tooltip) carries
+   the long form — uses a CSS pseudo so it appears instantly instead
+   of waiting for the browser's native title delay. */
+.tag-letter {
+    padding: 1px 6px;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: var(--mono, ui-monospace, monospace);
+    min-width: 18px;
+    text-align: center;
+    position: relative;
+}
+
+.tag-letter[data-tooltip]:hover::after,
+.tag-letter[data-tooltip]:focus-visible::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    padding: 5px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 400;
+    font-family: inherit;
+    white-space: normal;
+    max-width: 260px;
+    width: max-content;
+    z-index: 100;
+    pointer-events: none;
 }
 
 .tag-volatile {

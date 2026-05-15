@@ -2825,47 +2825,61 @@
 
                 // Card header: name + type badge
                 var cardHead = el('div', {className: 'index-card-head'});
-                cardHead.appendChild(el('a', {
+                // Path container groups owner / sep / name so the only
+                // wide flex gap in the head is between path, tags, and
+                // kebab — the separator hugs both sides like a real
+                // filesystem path.
+                var pathWrap = el('div', {className: 'index-card-path'});
+                pathWrap.appendChild(el('a', {
                     href: '#indexes/' + idx._user,
                     className: 'index-card-owner',
                     textContent: idx._user,
                 }));
-                cardHead.appendChild(el('span', {
+                pathWrap.appendChild(el('span', {
                     className: 'index-card-sep',
                     textContent: '/',
                 }));
-                cardHead.appendChild(el('a', {
+                pathWrap.appendChild(el('a', {
                     href: '#packages/' + idx._full,
                     className: 'index-card-name',
                     textContent: idx._name,
                 }));
+                cardHead.appendChild(pathWrap);
+                // Type / state badges. Single-letter labels (M/S/V/W/N)
+                // keep multi-badge headers from wrapping in tight grids;
+                // `title` exposes the full word on hover for clarity.
                 var tagGroup = el('div', {className: 'index-card-tags'});
                 tagGroup.appendChild(el('span', {
-                    className: 'tag' + (isMirror ? ' tag-mirror' : ' tag-stage'),
-                    textContent: idx.type || 'stage',
+                    className: 'tag tag-letter'
+                        + (isMirror ? ' tag-mirror' : ' tag-stage'),
+                    textContent: isMirror ? 'M' : 'S',
+                    'data-tooltip': idx.type || 'stage',
                 }));
                 if (!isMirror && idx.volatile) {
                     tagGroup.appendChild(el('span', {
-                        className: 'tag tag-volatile',
-                        textContent: 'volatile',
+                        className: 'tag tag-letter tag-volatile',
+                        textContent: 'V',
+                        'data-tooltip': 'volatile — uploads may overwrite '
+                            + 'existing versions',
                     }));
                 }
                 if (!isMirror && isAnonymousAclUpload(idx.acl_upload)) {
                     tagGroup.appendChild(el('span', {
-                        className: 'tag tag-world-writable',
-                        textContent: 'world-writable',
-                        title: 'acl_upload contains :ANONYMOUS: — anyone, '
-                            + 'including unauthenticated callers, can '
-                            + 'publish packages to this index.',
+                        className: 'tag tag-letter tag-world-writable',
+                        textContent: 'W',
+                        'data-tooltip': 'world-writable — acl_upload '
+                            + 'contains :ANONYMOUS:; anyone (including '
+                            + 'unauthenticated callers) can publish to '
+                            + 'this index.',
                     }));
                 } else if (!isMirror && isUploadFrozen(idx.acl_upload)) {
                     tagGroup.appendChild(el('span', {
-                        className: 'tag tag-no-upload',
-                        textContent: 'no upload',
-                        title: 'acl_upload is empty — nobody can publish '
-                            + 'to this index, not even the owner or root. '
-                            + 'Add a principal to acl_upload to enable '
-                            + 'uploads.',
+                        className: 'tag tag-letter tag-no-upload',
+                        textContent: 'N',
+                        'data-tooltip': 'no upload — acl_upload is empty; '
+                            + 'nobody can publish to this index, not even '
+                            + 'the owner or root. Add a principal to '
+                            + 'acl_upload to enable uploads.',
                     }));
                 }
                 cardHead.appendChild(tagGroup);
