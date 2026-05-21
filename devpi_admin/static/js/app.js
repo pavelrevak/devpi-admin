@@ -2421,7 +2421,13 @@
                 closeModal();
                 updateAuthUI();
                 navigate();
-                _triggerPasswordSave(user, pass);
+                // Preserve the current hash through the PRG redirect that
+                // form.submit() to /+admin triggers — otherwise the
+                // browser lands on /+admin/ with no fragment and the
+                // user's original deep link (or the page they were on
+                // when the session expired) is lost.
+                var currentHash = (window.location.hash || '').replace(/^#/, '');
+                _triggerPasswordSave(user, pass, currentHash);
             })
             .catch(showModalError);
     }
