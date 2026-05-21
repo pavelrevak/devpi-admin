@@ -255,6 +255,16 @@ def devpiserver_pyramid_configure(config, pyramid_config):
         _revoke_token_view, route_name="devpi_admin_token_revoke",
         request_method="DELETE")
 
+    # Mirror cache refresh — invalidate per-project retrieve-times and
+    # the project-names list so the next pip request re-fetches upstream.
+    pyramid_config.add_route(
+        "devpi_admin_mirror_refresh_cache",
+        "/+admin-api/mirror/{user}/{index}/refresh-cache")
+    pyramid_config.add_view(
+        _refresh_mirror_cache_view,
+        route_name="devpi_admin_mirror_refresh_cache",
+        request_method="POST")
+
     # Redirect browser visits to "/" to the SPA. Other routes (JSON API
     # calls, CLI requests) pass through untouched because they send
     # Accept: application/json.
@@ -1413,6 +1423,61 @@ def _revoke_token_view(request):
     _check_can_manage(request, meta.get("user", ""))
     tokens.revoke(xom, tid)
     return _json_response({"revoked": True, "id": tid})
+
+
+def _refresh_mirror_cache_view(request):
+    """POST /+admin-api/mirror/{user}/{index}/refresh-cache
+
+    Invalidate the in-memory mirror caches so the next pip request goes
+    back to upstream:
+
+    * ``cache_retrieve_times`` — per-project last-fetch timestamp + etag.
+      Expiring forces a conditional GET on the next ``+simple/<project>/``
+      lookup; etag match still reuses the persisted ``PROJSIMPLELINKS``
+      keyfs entry, so the only cost is one HTTP round-trip per project
+      that pip actually queries (we don't pre-fetch).
+    * ``cache_projectnames`` — full PyPI manifest. Expiring forces the
+      next "list all projects" call to refetch (rare path — mostly used
+      by ``pip install <unknown>`` to discover the project exists).
+
+    Caches are process-local: this only works on the primary (the
+    replica's local cache is meaningless to invalidate, and replicas
+    sync persisted state via the changelog stream). Any authenticated
+    user may trigger the refresh — anonymous spam is blocked by auth,
+    upstream-side abuse is bounded by mirror semantics (etag-conditional
+    requests dominate).
+    """
+    xom = request.registry["xom"]
+    _refuse_on_replica(xom)
+    _require_authenticated(request)
+    user = request.matchdict["user"]
+    index = request.matchdict["index"]
+    _validate_name(user, "user")
+    _validate_name(index, "index")
+    with xom.keyfs.read_transaction(allow_reuse=True):
+        stage = xom.model.getstage(user, index)
+        if stage is None:
+            raise HTTPNotFound(
+                json_body={"error": f"index {user}/{index} does not exist"})
+        if stage.ixconfig.get("type") != "mirror":
+            raise HTTPBadRequest(json_body={
+                "error": "cache refresh applies to mirror indexes only"})
+    # `_project2time` is the per-xom singleton dict that backs the
+    # per-project cache; iterating its keys lets us expire only entries
+    # devpi has actually populated. The public `expire(project)` API is
+    # safe for non-tracked projects too (it's pop-with-default), so we
+    # don't need to special-case empty caches.
+    crt = stage.cache_retrieve_times
+    projects = list(getattr(crt, "_project2time", {}).keys())
+    for project in projects:
+        crt.expire(project)
+    stage.cache_projectnames.expire()
+    return _json_response({
+        "result": {
+            "projects_invalidated": len(projects),
+            "projectnames_invalidated": True,
+        },
+    })
 
 
 def _reset_tokens_view(request):

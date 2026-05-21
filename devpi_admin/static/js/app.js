@@ -2973,6 +2973,22 @@
                         });
                     })(idx);
                 }
+                // Mirror-only: any authenticated user may trigger an
+                // upstream re-fetch (etag-conditional, low cost). Useful
+                // when waiting for a freshly-published upstream release
+                // that's hidden behind the `mirror_cache_expiry` TTL.
+                if (isMirror && loggedIn) {
+                    (function (idxRef) {
+                        menuItems.push({
+                            label: 'Refresh cache',
+                            onclick: function () {
+                                closeAllKebabs();
+                                refreshMirrorCache(
+                                    idxRef._user, idxRef._name);
+                            },
+                        });
+                    })(idx);
+                }
                 if (menuItems.length) {
                     cardHead.appendChild(buildKebabMenu(menuItems));
                 }
@@ -3235,6 +3251,51 @@
         Api.del('/' + fullName)
             .then(function () { loadIndexes(); })
             .catch(handleApiError);
+    }
+
+    function refreshMirrorCache(user, index) {
+        // Non-destructive: just bumps the upstream-fetch clocks. Skip
+        // the confirm dialog; show a small result modal so the user
+        // knows whether the request reached the primary.
+        Api.post(
+            '/+admin-api/mirror/'
+                + encodeURIComponent(user) + '/'
+                + encodeURIComponent(index) + '/refresh-cache',
+            {})
+            .then(function (data) {
+                var r = (data && data.result) || {};
+                var count = r.projects_invalidated;
+                openModal('Cache refreshed', function (body) {
+                    body.appendChild(el('p', {
+                        textContent: 'Mirror "' + user + '/' + index
+                            + '" cache invalidated. '
+                            + count + ' project'
+                            + (count === 1 ? '' : 's')
+                            + ' will re-check upstream on next access.',
+                    }));
+                    body.appendChild(el('p', {
+                        className: 'note',
+                        textContent: 'Note: cache is process-local; '
+                            + 'replicas will sync once the primary refetches.',
+                    }));
+                }, [el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'OK',
+                    onclick: closeModal,
+                })]);
+            })
+            .catch(function (err) {
+                openModal('Cache refresh failed', function (body) {
+                    body.appendChild(el('p', {
+                        className: 'error',
+                        textContent: (err && err.message) || String(err),
+                    }));
+                }, [el('button', {
+                    className: 'btn btn-primary',
+                    textContent: 'Close',
+                    onclick: closeModal,
+                })]);
+            });
     }
 
     // ========== PACKAGES ==========

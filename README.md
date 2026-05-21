@@ -37,6 +37,10 @@ talks to the standard devpi JSON API directly.
   - **`Tokens`** (owner / root only) — opens the per-index unified Tokens modal with two
     sections (Admin + Devpi), shows existing tokens for this index, lets you issue new
     ones with the index pre-filled and locked
+  - **`Refresh cache`** (mirror indexes only, any authenticated user) — invalidates
+    the in-memory per-project and project-names caches; the next `+simple/<project>/`
+    query (from pip, the UI, or `devpi-client`) goes back to upstream
+    (etag-conditional, cheap)
   - **`Edit`** / **`Delete`** (owner / root)
 - Create / edit / delete indexes via modal dialogs
 - `bases` editor with drag & drop priority ordering and transitive inheritance display
@@ -572,6 +576,30 @@ Revoke a single token.
 - **Auth:** owner of the token, or root
 - **200:** `{"revoked": true, "id": "abc..."}`
 - **404:** token id not found
+
+### Mirror cache
+
+#### `POST /+admin-api/mirror/{user}/{index}/refresh-cache`
+Invalidate the in-memory mirror caches so the next pip / UI / `devpi-client` request
+re-checks upstream. Lazy — no upstream fetch happens at the moment of the call; the
+re-fetch is triggered by the next `+simple/<project>/` lookup that traverses this
+mirror (etag-conditional, typically one cheap HTTP round-trip per project actually
+queried). Two caches are expired:
+
+- `cache_retrieve_times` — per-project last-fetch timestamp + etag (every tracked
+  project, in one pass)
+- `cache_projectnames` — full PyPI project-name list (refetched on the next "list all
+  projects" call)
+
+Useful when waiting for a freshly-published upstream release that's still hidden
+behind the `mirror_cache_expiry` TTL (default 30 min).
+
+- **Auth:** required (any authenticated user)
+- **Primary only:** replicas return 400 (caches are process-local; replicas sync the
+  persisted state via the changelog stream once the primary refetches)
+- **200:** `{"result": {"projects_invalidated": N, "projectnames_invalidated": true}}`
+- **400:** index is not a mirror, or the call hit a replica
+- **404:** index doesn't exist
 
 ### Replication observability (primary only)
 

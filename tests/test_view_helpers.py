@@ -1,10 +1,13 @@
 """Tests for view-layer helpers (_get_stage_or_404, _check_read_access)."""
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from pyramid.httpexceptions import HTTPForbidden, HTTPNotFound
+from pyramid.httpexceptions import HTTPBadRequest, HTTPForbidden, HTTPNotFound
 
-from devpi_admin.main import _check_read_access, _get_stage_or_404, _serve_index
+from devpi_admin.main import (
+    _check_read_access, _get_stage_or_404, _refresh_mirror_cache_view,
+    _serve_index)
 
 
 class GetStageOr404Tests(unittest.TestCase):
@@ -73,6 +76,75 @@ class ServeIndexTests(unittest.TestCase):
         resp = self._serve()
         self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
         self.assertEqual(resp.headers.get("Referrer-Policy"), "no-referrer")
+
+
+class RefreshMirrorCacheViewTests(unittest.TestCase):
+
+    def _stub_xom(self, stage=None, is_replica=False):
+        xom = MagicMock()
+        xom.config.role = "replica" if is_replica else "primary"
+        xom.model.getstage.return_value = stage
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=ctx)
+        ctx.__exit__ = MagicMock(return_value=False)
+        xom.keyfs.read_transaction.return_value = ctx
+        return xom
+
+    def _stub_mirror_stage(self, tracked_projects=("setuptools", "pip")):
+        stage = MagicMock()
+        stage.ixconfig = {"type": "mirror"}
+        stage.cache_retrieve_times._project2time = {
+            p: (1.0, None) for p in tracked_projects}
+        stage.cache_retrieve_times.expire = MagicMock()
+        stage.cache_projectnames.expire = MagicMock()
+        return stage
+
+    def _make(self, xom, user="root", index="pypi", auth_user="alice"):
+        req = MagicMock()
+        req.registry = {"xom": xom}
+        req.matchdict = {"user": user, "index": index}
+        req.authenticated_userid = auth_user
+        return req
+
+    def test_expires_all_tracked_projects_and_projectnames(self):
+        stage = self._stub_mirror_stage(("setuptools", "pip", "wheel"))
+        xom = self._stub_xom(stage=stage)
+        with patch("devpi_admin.main._is_replica", return_value=False):
+            resp = _refresh_mirror_cache_view(self._make(xom))
+        body = json.loads(resp.body)
+        self.assertEqual(body["result"]["projects_invalidated"], 3)
+        self.assertTrue(body["result"]["projectnames_invalidated"])
+        # Every tracked project must have been expired exactly once;
+        # the project-names cache must be expired regardless.
+        self.assertEqual(stage.cache_retrieve_times.expire.call_count, 3)
+        stage.cache_projectnames.expire.assert_called_once_with()
+
+    def test_404_when_index_missing(self):
+        xom = self._stub_xom(stage=None)
+        with patch("devpi_admin.main._is_replica", return_value=False):
+            with self.assertRaises(HTTPNotFound):
+                _refresh_mirror_cache_view(self._make(xom))
+
+    def test_400_when_index_is_not_mirror(self):
+        stage = MagicMock()
+        stage.ixconfig = {"type": "stage"}
+        xom = self._stub_xom(stage=stage)
+        with patch("devpi_admin.main._is_replica", return_value=False):
+            with self.assertRaises(HTTPBadRequest):
+                _refresh_mirror_cache_view(self._make(xom))
+
+    def test_replica_refuses(self):
+        xom = self._stub_xom(stage=self._stub_mirror_stage())
+        with patch("devpi_admin.main._is_replica", return_value=True):
+            with self.assertRaises(HTTPBadRequest):
+                _refresh_mirror_cache_view(self._make(xom))
+
+    def test_unauthenticated_blocked(self):
+        xom = self._stub_xom(stage=self._stub_mirror_stage())
+        with patch("devpi_admin.main._is_replica", return_value=False):
+            with self.assertRaises(HTTPForbidden):
+                _refresh_mirror_cache_view(
+                    self._make(xom, auth_user=None))
 
 
 if __name__ == "__main__":
