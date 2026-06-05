@@ -2637,46 +2637,71 @@
         openModal(
             isEdit ? 'Edit User: ' + editName : 'New User',
             function (body) {
+                // A real <form> is required — Safari only offers
+                // strong-password generation for password fields inside
+                // a form (and only over HTTPS).
+                var form = el('form', {id: 'user-form'});
+                form.addEventListener('submit', function (e) {
+                    e.preventDefault();
+                    submitUserModal(editName);
+                });
                 if (!isEdit) {
-                    body.appendChild(formGroup('Username', el('input', {type: 'text', id: 'form-username'})));
+                    var userInput = el('input', {type: 'text', id: 'form-username'});
+                    // Keep the browser from pairing this with the masked
+                    // field below as a login form (saved-creds autofill).
+                    userInput.setAttribute('autocomplete', 'off');
+                    userInput.setAttribute('spellcheck', 'false');
+                    userInput.setAttribute('autocapitalize', 'off');
+                    form.appendChild(formGroup('Username', userInput));
                 }
-                body.appendChild(formGroup('Email', el('input', {
+                form.appendChild(formGroup('Email', el('input', {
                     type: 'email',
                     id: 'form-email',
                     value: (editInfo && editInfo.email) || '',
                 })));
-                var isSelf = isEdit && editName === Api.getUser();
-                // Hidden username input so browser associates saved password correctly
-                if (isSelf) {
-                    var hiddenUser = el('input', {type: 'text', id: 'form-hidden-username'});
-                    hiddenUser.setAttribute('autocomplete', 'username');
-                    hiddenUser.setAttribute('aria-hidden', 'true');
-                    hiddenUser.style.display = 'none';
+                // Hidden username input so a browser save prompt (if any)
+                // is associated with the TARGET account. Without it Chrome
+                // guesses the username — typically the admin's own saved
+                // login — and saving would overwrite the admin's entry.
+                // Offscreen instead of display:none — Safari skips
+                // display:none fields when wiring up its AutoFill.
+                var hiddenUser = el('input', {
+                    type: 'text',
+                    id: 'form-hidden-username',
+                    name: 'username',
+                    className: 'offscreen-input',
+                });
+                hiddenUser.setAttribute('autocomplete', 'username');
+                hiddenUser.setAttribute('aria-hidden', 'true');
+                hiddenUser.setAttribute('tabindex', '-1');
+                if (isEdit) {
                     hiddenUser.value = editName;
-                    body.appendChild(hiddenUser);
-                }
-                var pwInput;
-                if (isSelf) {
-                    // Own password: type="password" + autocomplete so browser offers to save
-                    pwInput = el('input', {type: 'password', id: 'form-password'});
-                    pwInput.setAttribute('autocomplete', 'new-password');
-                } else {
-                    // Other user: plain text — Safari won't offer to save
-                    // text fields. Visual masking via CSS text-security
-                    // keeps the password manager out of the loop.
-                    pwInput = el('input', {
-                        type: 'text',
-                        id: 'form-password',
-                        className: 'masked-input',
+                } else if (userInput) {
+                    // Create flow: mirror the typed username
+                    userInput.addEventListener('input', function () {
+                        hiddenUser.value = userInput.value;
                     });
-                    pwInput.setAttribute('autocomplete', 'off');
-                    pwInput.setAttribute('spellcheck', 'false');
-                    pwInput.setAttribute('autocapitalize', 'off');
                 }
-                body.appendChild(formGroup(
+                form.appendChild(hiddenUser);
+                // Real password input: masked, and Safari/Chrome offer to
+                // GENERATE a strong password ("new-password" also keeps the
+                // saved-credentials autofill out of the dropdown). Any save
+                // prompt is anchored to the hidden username above, so the
+                // admin's own keychain entry is never overwritten.
+                var pwInput = el('input', {
+                    type: 'password',
+                    id: 'form-password',
+                    name: 'password',
+                });
+                pwInput.setAttribute('autocomplete', 'new-password');
+                form.appendChild(formGroup(
                     isEdit ? 'New Password (leave empty to keep)' : 'Password',
                     pwInput
                 ));
+                // Hidden submit button enables implicit submission
+                // (Enter key) for a multi-field form.
+                form.appendChild(el('button', {type: 'submit', hidden: true}));
+                body.appendChild(form);
             },
             [
                 el('button', {
@@ -2720,12 +2745,15 @@
         var method = isEdit ? Api.patch : Api.put;
         method(url, data)
             .then(function () {
-                if (password && isEdit && editName === Api.getUser()) {
-                    // Own password — trigger "Save Password" before closing modal
+                if (password) {
+                    // Browsers only offer to save credentials on a real
+                    // form navigation — SPA DOM changes never trigger it.
+                    // The fake POST carries the TARGET username, so the
+                    // prompt saves a separate entry for that account.
                     closeModal();
-                    _triggerPasswordSave(editName, password, 'users');
+                    _triggerPasswordSave(
+                        isEdit ? editName : username, password, 'users');
                 } else {
-                    // Other user — wipe field value before close so browser has nothing to save
                     if (passwordEl) passwordEl.value = '';
                     closeModal();
                 }

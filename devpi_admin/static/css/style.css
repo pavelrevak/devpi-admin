@@ -1313,11 +1313,17 @@ body {
     font-family: inherit;
 }
 
-/* Visually mask admin-set passwords for other users. The input stays
-   type="text" on purpose — type="password" would make the browser
-   offer to save someone else's credentials as the admin's own. */
-.masked-input {
-    -webkit-text-security: disc;
+/* Offscreen but real — Safari ignores display:none username fields
+   when deciding whether to offer AutoFill / password generation.
+   Selector must out-rank `.modal-body input[type="text"]` above. */
+.modal-body input.offscreen-input,
+.offscreen-input {
+    position: absolute;
+    left: -9999px;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
 }
 
 .modal-body select:not(.tag-picker-add) {
