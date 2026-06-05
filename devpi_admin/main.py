@@ -382,32 +382,29 @@ def _versiondata_view(request):
         return HTTPNotFound(json_body={"error": "version not found"})
     # Convert to plain dict with JSON-safe types
     result = _to_json_safe(verdata)
-    # Include file links — filter releaselinks to this version
-    try:
-        all_links = stage.get_releaselinks(project)
-    except Exception:
-        _log.warning(
-            "Failed to get releaselinks for %s/%s/%s",
-            user, index, project, exc_info=True)
-        all_links = []
+    # Build file links from the verdata's own +elinks. Unlike
+    # get_releaselinks() — which reconstructs ELinks from simplelinks
+    # metadata and therefore has no "_log" — these carry the upload
+    # log entries (who/when). Mirror elinks have no "_log" at all;
+    # the "log" key is then simply absent.
     result["+links"] = []
-    for link in all_links:
-        if link.version != version:
+    for linkdict in result.pop("+elinks", None) or []:
+        if linkdict.get("rel") != "releasefile":
             continue
+        entrypath = linkdict.get("entrypath") or ""
+        hashes = linkdict.get("hashes") or {}
+        if hashes.get("sha256"):
+            hash_spec = "sha256=" + hashes["sha256"]
+        else:
+            hash_spec = linkdict.get("hash_spec") or ""
         link_info = {
-            "href": "/" + link.relpath,
-            "basename": link.basename,
-            "hash_spec": link.best_available_hash_spec,
+            "href": "/" + entrypath,
+            "basename": entrypath.rsplit("/", 1)[-1],
+            "hash_spec": hash_spec,
         }
-        try:
-            log = link._log
-            link_info["log"] = [
-                {k: (list(v) if k == "when" else v)
-                 for k, v in entry.items()}
-                for entry in log
-            ]
-        except (AttributeError, TypeError):
-            pass
+        log = linkdict.get("_log")
+        if log:
+            link_info["log"] = log
         result["+links"].append(link_info)
     return _json_response({"result": result})
 

@@ -3341,6 +3341,18 @@
             Api.get('/' + indexPath + '/' + pkg).then(function (pkgData) {
                 var vers = Object.keys(pkgData.result).sort(compareVersions);
                 versionEl.textContent = vers.length ? 'v' + vers[0] : 'no versions';
+                // Last update across all versions of the package
+                var best = null;
+                for (var i = 0; i < vers.length; i++) {
+                    var w = lastLogWhen(pkgData.result[vers[i]]['+links']);
+                    if (w && (!best || cmpLogWhen(w, best) > 0)) best = w;
+                }
+                if (best) {
+                    card.appendChild(el('div', {
+                        className: 'pkg-card-updated',
+                        textContent: 'Updated ' + formatLogWhen(best),
+                    }));
+                }
             }).catch(function () {
                 versionEl.textContent = '';
             });
@@ -3599,7 +3611,22 @@
             content.appendChild(el('div', {className: 'view-header'}, [
                 buildBreadcrumb(indexPath, [
                     ' / ',
-                    el('a', {href: '#package/' + indexPath + '/' + pkg, textContent: pkg}),
+                    el('a', {
+                        href: '#package/' + indexPath + '/' + pkg,
+                        textContent: pkg,
+                        onclick: function (e) {
+                            // Same-hash click fires no hashchange event —
+                            // force a reload of the package detail.
+                            if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+                            e.preventDefault();
+                            var target = '#package/' + indexPath + '/' + pkg;
+                            if (window.location.hash !== target) {
+                                _skipHashChange = true;
+                                window.location.hash = target;
+                            }
+                            loadPackageDetail(indexPath, pkg);
+                        },
+                    }),
                     ' ',
                     el('span', {className: 'page-heading-version', textContent: 'v' + currentVer}),
                 ]),
@@ -3633,6 +3660,18 @@
                 infoCard.appendChild(el('div', {
                     className: 'pkg-sidebar-summary',
                     textContent: info.summary,
+                }));
+            }
+
+            var uploadedWhen = lastLogWhen(info['+links']);
+            if (uploadedWhen) {
+                infoCard.appendChild(el('div', {
+                    className: 'pkg-sidebar-label',
+                    textContent: 'Uploaded',
+                }));
+                infoCard.appendChild(el('div', {
+                    className: 'pkg-sidebar-text',
+                    textContent: formatLogWhen(uploadedWhen),
                 }));
             }
 
@@ -3736,9 +3775,7 @@
                     var dateStr = '';
                     if (link.log && link.log.length) {
                         var log = link.log[0];
-                        var when = log.when;
-                        dateStr = when[0] + '-' + pad(when[1]) + '-' + pad(when[2]) + ' ' +
-                            pad(when[3]) + ':' + pad(when[4]);
+                        dateStr = formatLogWhen(log.when);
                         if (log.who) dateStr = log.who + ', ' + dateStr;
                     }
                     if (dateStr && dateStr !== lastDate) {
@@ -3918,6 +3955,36 @@
 
     function pad(n) {
         return n < 10 ? '0' + n : '' + n;
+    }
+
+    function formatLogWhen(when) {
+        // keyfs link log 'when' is a UTC tuple [Y, M, D, h, m, s]
+        return when[0] + '-' + pad(when[1]) + '-' + pad(when[2]) + ' ' +
+            pad(when[3]) + ':' + pad(when[4]);
+    }
+
+    function cmpLogWhen(a, b) {
+        for (var i = 0; i < a.length && i < b.length; i++) {
+            if (a[i] !== b[i]) return a[i] - b[i];
+        }
+        return 0;
+    }
+
+    function lastLogWhen(links) {
+        // Latest log timestamp across release links — upload, push and
+        // overwrite entries all represent a content update. Mirror links
+        // carry no log → returns null.
+        var best = null;
+        for (var i = 0; i < (links || []).length; i++) {
+            var log = links[i].log || [];
+            for (var j = 0; j < log.length; j++) {
+                var when = log[j].when;
+                if (when && (!best || cmpLogWhen(when, best) > 0)) {
+                    best = when;
+                }
+            }
+        }
+        return best;
     }
 
     var _preReleaseOrder = {dev: 0, a: 1, alpha: 1, b: 2, beta: 2, rc: 3, c: 3};

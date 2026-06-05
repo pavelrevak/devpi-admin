@@ -7,7 +7,7 @@ from pyramid.httpexceptions import HTTPBadRequest, HTTPForbidden, HTTPNotFound
 
 from devpi_admin.main import (
     _check_read_access, _get_stage_or_404, _refresh_mirror_cache_view,
-    _serve_index)
+    _serve_index, _versiondata_view)
 
 
 class GetStageOr404Tests(unittest.TestCase):
@@ -145,6 +145,84 @@ class RefreshMirrorCacheViewTests(unittest.TestCase):
             with self.assertRaises(HTTPForbidden):
                 _refresh_mirror_cache_view(
                     self._make(xom, auth_user=None))
+
+
+class VersiondataViewTests(unittest.TestCase):
+    """+links must be built from verdata +elinks (which carry _log).
+
+    Regression: get_releaselinks() reconstructs ELinks from simplelinks
+    metadata without "_log", so the upload timestamps never reached the
+    response when the view used it.
+    """
+
+    def _make(self, verdata):
+        stage = MagicMock()
+        stage.get_versiondata.return_value = verdata
+        xom = MagicMock()
+        xom.model.getstage.return_value = stage
+        req = MagicMock()
+        req.registry = {"xom": xom}
+        req.matchdict = {
+            "user": "alice", "index": "dev",
+            "project": "testpkg", "version": "1.0"}
+        req.has_permission.return_value = True
+        req.authenticated_userid = "alice"
+        return req
+
+    def test_links_carry_upload_log(self):
+        verdata = {
+            "name": "testpkg", "version": "1.0",
+            "+elinks": [
+                {
+                    "rel": "releasefile",
+                    "entrypath": "alice/dev/+f/b28/abc/testpkg-1.0.tar.gz",
+                    "hash_spec": "md5=deadbeef",
+                    "hashes": {"sha256": "cafe"},
+                    "_log": [{
+                        "what": "upload", "who": "alice",
+                        "when": (2026, 6, 5, 8, 10, 44),
+                        "dst": "alice/dev"}],
+                },
+                {
+                    # non-releasefile links must be filtered out
+                    "rel": "toxresult",
+                    "entrypath": "alice/dev/+f/123/tox.json",
+                },
+            ],
+        }
+        body = json.loads(_versiondata_view(self._make(verdata)).body)
+        result = body["result"]
+        self.assertNotIn("+elinks", result)
+        self.assertEqual(len(result["+links"]), 1)
+        link = result["+links"][0]
+        self.assertEqual(
+            link["href"], "/alice/dev/+f/b28/abc/testpkg-1.0.tar.gz")
+        self.assertEqual(link["basename"], "testpkg-1.0.tar.gz")
+        self.assertEqual(link["hash_spec"], "sha256=cafe")
+        self.assertEqual(link["log"][0]["when"], [2026, 6, 5, 8, 10, 44])
+        self.assertEqual(link["log"][0]["who"], "alice")
+
+    def test_mirror_links_without_log(self):
+        # Mirror elinks carry no "_log" — the "log" key must be absent,
+        # not present-but-empty.
+        verdata = {
+            "name": "testpkg", "version": "1.0",
+            "+elinks": [{
+                "rel": "releasefile",
+                "entrypath": "root/pypi/+f/abc/testpkg-1.0.tar.gz",
+                "hash_spec": "md5=deadbeef",
+                "hashes": {},
+            }],
+        }
+        body = json.loads(_versiondata_view(self._make(verdata)).body)
+        link = body["result"]["+links"][0]
+        self.assertNotIn("log", link)
+        self.assertEqual(link["hash_spec"], "md5=deadbeef")
+
+    def test_no_elinks_yields_empty_links(self):
+        verdata = {"name": "testpkg", "version": "1.0"}
+        body = json.loads(_versiondata_view(self._make(verdata)).body)
+        self.assertEqual(body["result"]["+links"], [])
 
 
 if __name__ == "__main__":
