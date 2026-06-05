@@ -2661,10 +2661,17 @@
                     pwInput = el('input', {type: 'password', id: 'form-password'});
                     pwInput.setAttribute('autocomplete', 'new-password');
                 } else {
-                    // Other user: plain text — Safari won't offer to save text fields
-                    pwInput = el('input', {type: 'text', id: 'form-password'});
+                    // Other user: plain text — Safari won't offer to save
+                    // text fields. Visual masking via CSS text-security
+                    // keeps the password manager out of the loop.
+                    pwInput = el('input', {
+                        type: 'text',
+                        id: 'form-password',
+                        className: 'masked-input',
+                    });
                     pwInput.setAttribute('autocomplete', 'off');
                     pwInput.setAttribute('spellcheck', 'false');
+                    pwInput.setAttribute('autocapitalize', 'off');
                 }
                 body.appendChild(formGroup(
                     isEdit ? 'New Password (leave empty to keep)' : 'Password',
