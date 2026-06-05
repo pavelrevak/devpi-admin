@@ -3958,9 +3958,14 @@
     }
 
     function formatLogWhen(when) {
-        // keyfs link log 'when' is a UTC tuple [Y, M, D, h, m, s]
-        return when[0] + '-' + pad(when[1]) + '-' + pad(when[2]) + ' ' +
-            pad(when[3]) + ':' + pad(when[4]);
+        // keyfs link log 'when' is a UTC tuple [Y, M, D, h, m, s] —
+        // render it in the browser's local time zone.
+        var d = new Date(Date.UTC(
+            when[0], when[1] - 1, when[2],
+            when[3], when[4], when[5] || 0));
+        return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' +
+            pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' +
+            pad(d.getMinutes());
     }
 
     function cmpLogWhen(a, b) {
