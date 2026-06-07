@@ -461,6 +461,9 @@ def devpi_admin_tween_factory(handler, registry):
         if request.method in ("GET", "HEAD"):
             if request.path == "/" and _wants_html(request):
                 return HTTPFound("/+admin/")
+            denied = _status_check(request)
+            if denied is not None:
+                return denied
             denied = _user_listing_check(request)
             if denied is not None:
                 return denied
@@ -604,6 +607,22 @@ def _index_in_bound_sro(xom, bound, other_user, other_index):
     except Exception:
         return False
     return False
+
+
+def _status_check(request):
+    """Restrict ``GET /+status`` to authenticated users.
+
+    devpi-server serves /+status publicly; it exposes component
+    versions, serials, replica UUIDs/outside-URLs and event-loop
+    internals — useful recon for an attacker. Replication itself is
+    unaffected (replicas poll ``/+changelog``, not ``/+status``).
+    403 (not 404) so clients can retry with credentials.
+    """
+    if request.path != "/+status":
+        return None
+    if request.authenticated_userid is None:
+        return HTTPForbidden(json_body={"error": "authentication required"})
+    return None
 
 
 def _user_listing_check(request):

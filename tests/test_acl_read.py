@@ -8,6 +8,7 @@ from devpi_admin import main
 from devpi_admin.main import (
     _INDEX_ANY_RE, _NAME_RE, _USER_PATH_RE,
     _admin_token_check, _filter_root_listing, _request_carries_admin_token,
+    _status_check,
     _user_listing_check,
     devpiserver_indexconfig_defaults, devpiserver_stage_get_principals_for_pkg_read)
 
@@ -368,6 +369,30 @@ class UserListingCheckTests(unittest.TestCase):
     def test_other_user_blocked(self):
         result = _user_listing_check(self._make("/alice", auth_user="bob"))
         self.assertIsNotNone(result)
+
+
+class StatusCheckTests(unittest.TestCase):
+    """GET /+status must require authentication (recon hardening)."""
+
+    def _make(self, path, auth_user=None):
+        req = MagicMock()
+        req.path = path
+        req.authenticated_userid = auth_user
+        return req
+
+    def test_other_paths_passthrough(self):
+        for path in ("/", "/+api", "/+status/extra", "/alice/dev"):
+            self.assertIsNone(_status_check(self._make(path)))
+
+    def test_anonymous_blocked_with_403(self):
+        result = _status_check(self._make("/+status", auth_user=None))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status_code, 403)
+
+    def test_authenticated_allowed(self):
+        for user in ("alice", "root"):
+            self.assertIsNone(
+                _status_check(self._make("/+status", auth_user=user)))
 
 
 class FilterRootListingTests(unittest.TestCase):

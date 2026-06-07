@@ -5,6 +5,7 @@
     var loginBtn = document.getElementById('login-btn');
     var logoutBtn = document.getElementById('logout-btn');
     var navUsers = document.getElementById('nav-users');
+    var navStatus = document.getElementById('nav-status');
 
     // Modal elements
     var modalOverlay = document.getElementById('modal-overlay');
@@ -2373,11 +2374,14 @@
             logoutBtn.hidden = false;
             logoutBtn.classList.toggle('is-root', user === 'root');
             navUsers.hidden = user !== 'root';
+            // Status page (and /+status backing it) is auth-only
+            navStatus.hidden = false;
             document.body.classList.add('authenticated');
         } else {
             loginBtn.hidden = false;
             logoutBtn.hidden = true;
             navUsers.hidden = true;
+            navStatus.hidden = true;
             document.body.classList.remove('authenticated');
         }
     }
@@ -4076,6 +4080,13 @@
     }
 
     function loadStatus(silent) {
+        if (!Api.getUser()) {
+            // Status page (and /+status behind it) is auth-only —
+            // anonymous visitors get the public Indexes listing instead.
+            _stopStatusRefresh();
+            window.location.hash = '#indexes';
+            return;
+        }
         if (!silent) showLoading();
         // Replica poll info is auth-gated and only used in the replicas
         // section, which itself is hidden from anonymous visitors. Skip
