@@ -8,6 +8,8 @@ from devpi_admin import main
 from devpi_admin.main import (
     _INDEX_ANY_RE, _NAME_RE, _USER_PATH_RE,
     _admin_token_check, _filter_root_listing, _request_carries_admin_token,
+    _REPLICA_USER_NAME,
+    _changelog_auth_check,
     _status_check,
     _user_listing_check,
     devpiserver_indexconfig_defaults, devpiserver_stage_get_principals_for_pkg_read)
@@ -369,6 +371,44 @@ class UserListingCheckTests(unittest.TestCase):
     def test_other_user_blocked(self):
         result = _user_listing_check(self._make("/alice", auth_user="bob"))
         self.assertIsNotNone(result)
+
+
+class ChangelogAuthCheckTests(unittest.TestCase):
+    """/+changelog/ must be readable only by the replica principal.
+
+    devpi-server core lets anonymous (identity None) requests stream the
+    full keyfs changelog — password hashes, token secrets. We gate it
+    fail-closed: only the '+replica' principal passes.
+    """
+
+    def _make(self, path, auth_user=None):
+        req = MagicMock()
+        req.path = path
+        req.authenticated_userid = auth_user
+        return req
+
+    def test_non_changelog_passthrough(self):
+        for path in ("/", "/+status", "/root/pypi/+simple/", "/+changelogx"):
+            self.assertIsNone(_changelog_auth_check(self._make(path)))
+
+    def test_anonymous_blocked(self):
+        for path in ("/+changelog/0", "/+changelog/5-", "/+changelog"):
+            result = _changelog_auth_check(self._make(path, auth_user=None))
+            self.assertIsNotNone(result, path)
+            self.assertEqual(result.status_code, 403)
+
+    def test_normal_user_blocked(self):
+        # A regular authenticated user (even root) is not a replica.
+        for user in ("alice", "root"):
+            result = _changelog_auth_check(
+                self._make("/+changelog/0-", auth_user=user))
+            self.assertIsNotNone(result)
+            self.assertEqual(result.status_code, 403)
+
+    def test_replica_allowed(self):
+        result = _changelog_auth_check(
+            self._make("/+changelog/0-", auth_user=_REPLICA_USER_NAME))
+        self.assertIsNone(result)
 
 
 class StatusCheckTests(unittest.TestCase):

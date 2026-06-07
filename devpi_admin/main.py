@@ -26,6 +26,15 @@ from devpi_admin import tokens
 from devpi_admin.customizer import (
     DevpiAdminMirrorCustomizer, is_version_allowed, parse_rules)
 
+# devpi-server's special replica principal. Imported so a future rename
+# surfaces loudly; the literal fallback keeps the guard fail-closed even
+# if the symbol moves (an unknown principal simply never matches, so the
+# changelog stays locked rather than silently opening).
+try:
+    from devpi_server.replica import REPLICA_USER_NAME as _REPLICA_USER_NAME
+except Exception:  # pragma: no cover - defensive across devpi versions
+    _REPLICA_USER_NAME = "+replica"
+
 
 STATIC_DIR = Path(__file__).parent / "static"
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,49}$")
@@ -440,6 +449,14 @@ def devpi_admin_tween_factory(handler, registry):
         # short-circuits (it shouldn't for replica polls, but defensive).
         _record_replica_poll(request)
 
+        # Gate the replication changelog before anything else — it leaks
+        # the full keyfs (password hashes, token secrets) to anonymous
+        # callers in devpi-server core. Runs for every method so no verb
+        # slips through.
+        denied = _changelog_auth_check(request)
+        if denied is not None:
+            return denied
+
         # Detect admin token directly from header instead of forcing
         # request.identity to load. Pyramid caches identity per-request,
         # and POST /+login mutates X-Devpi-Auth mid-request — pre-loading
@@ -607,6 +624,38 @@ def _index_in_bound_sro(xom, bound, other_user, other_index):
     except Exception:
         return False
     return False
+
+
+def _changelog_auth_check(request):
+    """Require a replica identity for ``/+changelog/`` (fail-closed).
+
+    devpi-server's ``verify_primary()`` only rejects an identity that is
+    *present but not* a replica — an anonymous request (identity ``None``)
+    falls through and streams the entire keyfs changelog, which contains
+    every user's ``pwhash`` and, with devpi-tokens, raw token HMAC keys.
+    The public primary UUID (echoed in response headers) is all an
+    attacker needs. See SECURITY-REPORT-changelog.md; fix belongs in
+    devpi-server core, this is defense in depth.
+
+    Legitimate replicas authenticate with a Bearer token (signed with the
+    shared replica secret) which devpi validates into the replica
+    principal; we accept only that. Everyone else — anonymous or any
+    normal user/token — is denied. Fail-closed: if devpi ever renames the
+    replica principal, nothing matches and the endpoint stays locked
+    (replication breaks loudly) rather than silently reopening.
+
+    Accessing ``authenticated_userid`` forces pyramid identity resolution,
+    which the tween otherwise avoids; that is safe here because
+    ``/+changelog/`` never carries the mid-request auth mutation that
+    ``/+login`` does.
+    """
+    path = request.path
+    if path != "/+changelog" and not path.startswith("/+changelog/"):
+        return None
+    if request.authenticated_userid != _REPLICA_USER_NAME:
+        return HTTPForbidden(json_body={
+            "error": "replication endpoint requires replica authentication"})
+    return None
 
 
 def _status_check(request):
