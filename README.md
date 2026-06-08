@@ -404,19 +404,104 @@ adds POST/PUT to the bound index - usable from `twine` or `devpi upload`:
 
 Upload tokens still cannot DELETE - package removal must use password auth.
 
-### Trusted proxy for client IP logging
+## Running behind a reverse proxy
 
-The `client_ip` field on issued tokens (visible in the token list) is taken from
-`request.client_addr` by default. When devpi-server runs behind a reverse proxy, set
-`DEVPI_ADMIN_TRUSTED_PROXIES` to a comma-separated list of CIDRs whose `X-Forwarded-For`
-header should be honoured:
+For an internet-facing or shared deployment, terminate TLS at a reverse proxy and apply a
+few hardening rules there. devpi-server is open by design - read privacy, rate-limiting
+and banner hiding are added by this plugin and the proxy, not by core. **The plugin must
+be installed on every node** (primary *and* every replica) - a node without it serves
+everything unfiltered; see [Replicas: install on every node](#replicas-install-on-every-node).
+
+Annotated nginx example (adapt CIDRs, cert paths and the backend address):
+
+```nginx
+http {
+    upstream devpi_backend { server 127.0.0.1:3141; }
+
+    # Per-client-IP counter for login throttling (see "Login rate-limiting").
+    #   $binary_remote_addr - key: client IP (needs the real IP, see below)
+    #   zone=login:10m      - name + ~160k-IP table
+    #   rate=20r/m          - 20 logins/min/IP; generous on purpose, a whole
+    #                         office often shares one NAT IP
+    limit_req_zone $binary_remote_addr zone=login:10m rate=20r/m;
+    limit_req_status 429;                 # return 429, not nginx's default 503
+
+    server {
+        listen 443 ssl;
+        # ssl_certificate ...; ssl_certificate_key ...;
+        server_tokens off;                # hide nginx's own version banner
+
+        # Trust X-Forwarded-For only from your own proxy/LB so the *real*
+        # client IP drives rate-limiting and token client_ip logging.
+        # Mirror this in DEVPI_ADMIN_TRUSTED_PROXIES on devpi-server.
+        set_real_ip_from 10.0.0.0/8;
+        real_ip_header X-Forwarded-For;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_hide_header X-Devpi-Server-Version;   # hide devpi version banner
+        # more_clear_headers Server;                # 'Server: waitress' - needs
+                                                    # headers-more-nginx-module
+
+        location / {
+            proxy_pass http://devpi_backend;
+        }
+
+        # Throttle the login endpoint (password auth runs an expensive hash).
+        location = /+login {
+            limit_req zone=login burst=10 nodelay;
+            proxy_pass http://devpi_backend;
+        }
+
+        # /+authcheck only exists for devpi-lockdown's auth_request subrequest.
+        # If you don't run devpi-lockdown it's an unused ACL-probe endpoint - deny it.
+        location = /+authcheck { return 404; }
+    }
+}
+```
+
+### Real client IP
+
+`DEVPI_ADMIN_TRUSTED_PROXIES` (a comma-separated CIDR list) tells the plugin whose
+`X-Forwarded-For` to honour for the `client_ip` shown on issued tokens; without it the
+header is ignored so clients can't forge their logged IP:
 
 ```
 DEVPI_ADMIN_TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1
 ```
 
-Without this variable, `X-Forwarded-For` is ignored - preventing clients from forging
-their logged IP.
+The nginx `set_real_ip_from` / `real_ip_header` pair is the proxy-side equivalent: without
+it, `$binary_remote_addr` is the proxy's own IP and the login limit collapses to a single
+bucket for everyone. Set both, consistently.
+
+### Hide version banners
+
+`X-Devpi-Server-Version`, nginx's `Server` token and `Server: waitress` only help an
+attacker match known CVEs. Strip them as shown above. **Keep the other `X-Devpi-*`
+headers** - they are protocol, not banners, and stripping them breaks things:
+
+- `X-Devpi-Api-Version` - the `devpi` client checks it for compatibility
+- `X-Devpi-Serial` - drives replica sync and the client's `wait_replicas` logic
+- `X-Devpi-Uuid` / `X-Devpi-Master-Uuid` / `X-Devpi-Primary-Uuid` - replicas use these to
+  confirm they are talking to the expected primary
+
+### Login rate-limiting
+
+devpi hashes passwords with Argon2 (`m=65536,t=3,p=4` → ~64 MiB RAM + CPU **per attempt**).
+That cost slows password guessing but is also a DoS lever: every `POST /+login` - and every
+request carrying a **raw password** in `Authorization: Basic` / `X-Devpi-Auth` - runs one
+hash, so a few hundred concurrent attempts can exhaust RAM/CPU. (Clients that log in once
+and reuse the returned signed token don't pay the hash again - only raw-password attempts
+do.) devpi-server has no built-in throttling.
+
+- `burst=10 nodelay` lets a short legitimate spike (e.g. a CI fan-out) through immediately;
+  only requests beyond the burst get 429.
+- Tune `rate`/`burst` to your login volume - or better, have CI exchange the password for a
+  token once (see the token API above) and reuse it so it never re-hits `/+login`.
+- This stops single-source login floods and guessing - the realistic threat for an internal
+  index. nginx can't tell a raw password from a signed token in the auth header, so it can't
+  single out the other hash-triggering requests; a distributed (many-IP) flood is an
+  infrastructure-layer concern (upstream DDoS protection), not this rule's job.
 
 ## How it works
 
