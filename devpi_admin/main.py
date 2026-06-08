@@ -478,9 +478,6 @@ def devpi_admin_tween_factory(handler, registry):
         if request.method in ("GET", "HEAD"):
             if request.path == "/" and _wants_html(request):
                 return HTTPFound("/+admin/")
-            denied = _status_check(request)
-            if denied is not None:
-                return denied
             denied = _user_listing_check(request)
             if denied is not None:
                 return denied
@@ -495,6 +492,8 @@ def devpi_admin_tween_factory(handler, registry):
             response = handler(request)
             if request.path in ("/", "") and _is_json_response(response):
                 return _filter_root_listing(request, response, xom)
+            if request.path == "/+status" and _is_json_response(response):
+                return _filter_status(request, response)
             return response
         return handler(request)
     return tween
@@ -658,20 +657,45 @@ def _changelog_auth_check(request):
     return None
 
 
-def _status_check(request):
-    """Restrict ``GET /+status`` to authenticated users.
+def _coarse_health(result):
+    """Threshold-free health verdict from a ``/+status`` result dict.
 
-    devpi-server serves /+status publicly; it exposes component
-    versions, serials, replica UUIDs/outside-URLs and event-loop
-    internals — useful recon for an attacker. Replication itself is
-    unaffected (replicas poll ``/+changelog``, not ``/+status``).
-    403 (not 404) so clients can retry with credentials.
+    A replica with active ``replication-errors`` is the one unambiguous
+    "broken" signal (stuck replica / plugin mismatch — see CLAUDE.md).
+    Everything else that answered 200 is reported healthy. Fine-grained
+    lag thresholds are deliberately left to the authenticated full
+    ``/+status`` to keep the public probe simple and non-flapping.
     """
-    if request.path != "/+status":
-        return None
-    if request.authenticated_userid is None:
-        return HTTPForbidden(json_body={"error": "authentication required"})
-    return None
+    if result.get("role") == "REPLICA" and result.get("replication-errors"):
+        return "fatal"
+    return "ok"
+
+
+def _filter_status(request, response):
+    """Reduce ``/+status`` to a health verdict for anonymous callers.
+
+    devpi-server serves the full status publicly; it exposes the
+    serverdir path, node UUIDs (the changelog-leak key), component
+    versions, replica outside-URLs and serials — recon. Authenticated
+    principals get the unchanged detail; anonymous monitoring (e.g.
+    Zabbix) gets only ``{"status": "ok"|"fatal"}`` — enough to alert on a
+    down or stuck node without leaking anything.
+    """
+    if request.authenticated_userid is not None:
+        return response
+    try:
+        body = json.loads(response.body)
+        result = body.get("result") if isinstance(body, dict) else None
+    except (ValueError, TypeError):
+        result = None
+    health = _coarse_health(result if isinstance(result, dict) else {})
+    minimal = json.dumps({"type": "status", "result": {"status": health}})
+    new_body = minimal.encode("utf-8")
+    response.body = new_body
+    response.content_length = len(new_body)
+    # Per-principal output — never let a shared cache serve it to others.
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 def _user_listing_check(request):

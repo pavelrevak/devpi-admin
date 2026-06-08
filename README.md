@@ -56,8 +56,10 @@ talks to the standard devpi JSON API directly.
 - Special principals: `:ANONYMOUS:` (everyone, including unauthenticated) and `:AUTHENTICATED:`
   (any logged-in user)
 - Enforced natively by devpi via the `pkg_read` permission on every download path,
-  plus a tween that filters out invisible indexes from the root listing (`GET /`)
-  and rejects direct access to private indexes with 404
+  plus a tween that filters the root listing (`GET /`) — invisible indexes are
+  removed, and any user left with no readable index is dropped entirely so the
+  listing can't be used to enumerate accounts (root sees everyone; you always see
+  yourself) — and rejects direct access to private indexes with 404
 
 ### Mirror access control (allow/deny lists)
 - Per-mirror `package_allowlist` and `package_denylist` filter the projects, versions
@@ -83,6 +85,23 @@ talks to the standard devpi JSON API directly.
     private packages on a public mirror
   - **Whitelist-only mirrors** — paste curated `requirements.txt` style entries
     into `package_allowlist`; everything else is blocked
+
+### Status endpoint & monitoring (`/+status`)
+- devpi-server's `/+status` is public by design and exposes operational detail
+  (server data directory path, node UUIDs, component versions, replica outside-URLs
+  and serials). This plugin reduces it for **anonymous** callers to a coarse health
+  verdict only:
+
+  ```json
+  {"type": "status", "result": {"status": "ok"}}
+  ```
+
+- **Authenticated** callers (password or token auth) still get the full, unchanged
+  detail — so the SPA dashboard and ad-hoc `curl -u user:pass …/+status` work as before.
+- **Monitoring without credentials:** point Zabbix / Nagios / an uptime check at
+  `GET /+status` and alert on `HTTP != 200` or `result.status != "ok"`. `status` is
+  `"fatal"` when a replica has active replication errors (stuck replica / plugin
+  mismatch); otherwise `"ok"`. Fine-grained lag thresholds require authentication.
 
 ### Admin tokens (scoped, revocable)
 - Opaque `adm_<id>.<secret>` tokens bound to a `(user, index, scope)` triple. Scope is

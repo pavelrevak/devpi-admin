@@ -10,7 +10,8 @@ from devpi_admin.main import (
     _admin_token_check, _filter_root_listing, _request_carries_admin_token,
     _REPLICA_USER_NAME,
     _changelog_auth_check,
-    _status_check,
+    _coarse_health,
+    _filter_status,
     _user_listing_check,
     devpiserver_indexconfig_defaults, devpiserver_stage_get_principals_for_pkg_read)
 
@@ -411,28 +412,83 @@ class ChangelogAuthCheckTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class StatusCheckTests(unittest.TestCase):
-    """GET /+status must require authentication (recon hardening)."""
+class CoarseHealthTests(unittest.TestCase):
 
-    def _make(self, path, auth_user=None):
+    def test_ok_for_primary(self):
+        self.assertEqual(_coarse_health({"role": "MASTER"}), "ok")
+
+    def test_ok_for_healthy_replica(self):
+        self.assertEqual(
+            _coarse_health({"role": "REPLICA", "replication-errors": {}}), "ok")
+
+    def test_fatal_for_replica_with_errors(self):
+        self.assertEqual(
+            _coarse_health(
+                {"role": "REPLICA", "replication-errors": {"7": "boom"}}),
+            "fatal")
+
+    def test_ok_on_empty_or_missing(self):
+        self.assertEqual(_coarse_health({}), "ok")
+
+
+class FilterStatusTests(unittest.TestCase):
+    """/+status is reduced to a coarse health verdict for anonymous callers,
+    full detail kept for authenticated principals (recon hardening)."""
+
+    _FULL = {
+        "type": "status",
+        "result": {
+            "role": "REPLICA", "serverdir": "/var/lib/pypi/.devpi/server",
+            "uuid": "abc123", "versioninfo": {"devpi-server": "6.19.3"},
+            "serial": 758, "replication-errors": {},
+            "polling_replicas": {"uuid": {"outside-url": "http://r"}}},
+    }
+
+    def _make_response(self, body):
+        resp = MagicMock()
+        resp.body = json.dumps(body).encode()
+        resp.content_type = "application/json"
+        resp.status_code = 200
+        resp.headers = {}
+        return resp
+
+    def _make_request(self, auth_user=None):
         req = MagicMock()
-        req.path = path
         req.authenticated_userid = auth_user
         return req
 
-    def test_other_paths_passthrough(self):
-        for path in ("/", "/+api", "/+status/extra", "/alice/dev"):
-            self.assertIsNone(_status_check(self._make(path)))
+    def test_authenticated_gets_full_detail(self):
+        resp = self._make_response(self._FULL)
+        out = _filter_status(self._make_request(auth_user="alice"), resp)
+        body = json.loads(out.body)
+        self.assertIn("serverdir", body["result"])
+        self.assertIn("versioninfo", body["result"])
 
-    def test_anonymous_blocked_with_403(self):
-        result = _status_check(self._make("/+status", auth_user=None))
-        self.assertIsNotNone(result)
-        self.assertEqual(result.status_code, 403)
+    def test_anonymous_gets_only_health(self):
+        resp = self._make_response(self._FULL)
+        out = _filter_status(self._make_request(auth_user=None), resp)
+        body = json.loads(out.body)
+        # Nothing sensitive survives — only the verdict.
+        self.assertEqual(body, {"type": "status", "result": {"status": "ok"}})
+        self.assertIn("private", out.headers.get("Cache-Control", ""))
 
-    def test_authenticated_allowed(self):
-        for user in ("alice", "root"):
-            self.assertIsNone(
-                _status_check(self._make("/+status", auth_user=user)))
+    def test_anonymous_sees_fatal_on_replica_errors(self):
+        full = json.loads(json.dumps(self._FULL))
+        full["result"]["replication-errors"] = {"7": "import failed"}
+        out = _filter_status(
+            self._make_request(auth_user=None), self._make_response(full))
+        self.assertEqual(
+            json.loads(out.body)["result"]["status"], "fatal")
+
+    def test_anonymous_unparseable_body_yields_opaque_ok(self):
+        resp = MagicMock()
+        resp.body = b"not json"
+        resp.content_type = "application/json"
+        resp.status_code = 200
+        resp.headers = {}
+        out = _filter_status(self._make_request(auth_user=None), resp)
+        self.assertEqual(
+            json.loads(out.body), {"type": "status", "result": {"status": "ok"}})
 
 
 class FilterRootListingTests(unittest.TestCase):
