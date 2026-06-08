@@ -778,11 +778,17 @@ def _is_json_response(response):
 
 
 def _filter_root_listing(request, response, xom):
-    """Strip indexes the requestor cannot read from GET / response.
+    """Strip indexes — and whole users — the requestor cannot see.
 
-    The root listing returns every user with their full indexes dict —
-    including private index names and ixconfig. We rebuild the body with
-    only the indexes the current principal has pkg_read for.
+    The root listing returns every user with their full indexes dict
+    (private index names + ixconfig) AND every username with
+    created/modified, enabling account enumeration by anyone. We rebuild
+    the body keeping only indexes the principal has ``pkg_read`` for, and
+    drop any user left with no readable index.
+
+    A user is kept iff: the requestor is ``root`` (administers everyone
+    via the Users page), OR the user has at least one readable index, OR
+    it is the requestor's own account (they already know their name).
     """
     try:
         body = json.loads(response.body)
@@ -791,27 +797,33 @@ def _filter_root_listing(request, response, xom):
     result = body.get("result")
     if not isinstance(result, dict):
         return response
+    auth_user = request.authenticated_userid
+    is_root = auth_user == "root"
     filtered = {}
     for username, userdata in result.items():
         if not isinstance(userdata, dict):
-            filtered[username] = userdata
+            # Malformed entry, nothing to gate on — only root may see it.
+            if is_root:
+                filtered[username] = userdata
             continue
         indexes = userdata.get("indexes")
-        if not isinstance(indexes, dict):
-            filtered[username] = userdata
-            continue
         kept = {}
-        for index_name in indexes:
-            try:
-                stage = xom.model.getstage(username, index_name)
-            except Exception:
-                stage = None
-            if stage is None:
-                continue
-            if request.has_permission("pkg_read", context=stage):
-                kept[index_name] = indexes[index_name]
+        if isinstance(indexes, dict):
+            for index_name in indexes:
+                try:
+                    stage = xom.model.getstage(username, index_name)
+                except Exception:
+                    stage = None
+                if stage is None:
+                    continue
+                if request.has_permission("pkg_read", context=stage):
+                    kept[index_name] = indexes[index_name]
+        # Drop users the requestor can see no index of — hides account
+        # enumeration. root and the requestor's own account are exempt.
+        if not kept and not is_root and username != auth_user:
+            continue
         new_userdata = dict(userdata)
-        new_userdata["indexes"] = kept
+        new_userdata["indexes"] = kept if isinstance(indexes, dict) else indexes
         filtered[username] = new_userdata
     body["result"] = filtered
     new_body = json.dumps(body).encode("utf-8")

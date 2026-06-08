@@ -458,8 +458,9 @@ class FilterRootListingTests(unittest.TestCase):
         xom.model.getstage.side_effect = getstage
         return xom
 
-    def _make_request(self, xom):
+    def _make_request(self, xom, auth_user=None):
         req = MagicMock()
+        req.authenticated_userid = auth_user
         req.has_permission.side_effect = (
             lambda perm, context=None: getattr(context, "_adm_visible", False))
         return req
@@ -491,14 +492,44 @@ class FilterRootListingTests(unittest.TestCase):
         out = _filter_root_listing(req, resp, xom)
         self.assertIn("private", out.headers.get("Cache-Control", ""))
 
-    def test_keeps_users_with_no_visible_indexes_but_empty(self):
+    def test_drops_users_with_no_visible_indexes(self):
+        # Account enumeration hardening: a user whose only index the
+        # requestor cannot read is removed entirely from the listing.
         body = {"result": {"alice": {"indexes": {"secret": {}}}}}
         xom = self._make_xom({"alice/secret": False})
         resp = self._make_response(body)
-        req = self._make_request(xom)
+        req = self._make_request(xom, auth_user=None)
         out = _filter_root_listing(req, resp, xom)
         filtered = json.loads(out.body)
+        self.assertNotIn("alice", filtered["result"])
+
+    def test_root_sees_all_users_even_empty(self):
+        # root administers everyone — zero-index / no-readable-index users
+        # must remain so the Users page works.
+        body = {"result": {
+            "alice": {"indexes": {"secret": {}}},
+            "ghost": {"indexes": {}},
+        }}
+        xom = self._make_xom({"alice/secret": False})
+        resp = self._make_response(body)
+        req = self._make_request(xom, auth_user="root")
+        out = _filter_root_listing(req, resp, xom)
+        filtered = json.loads(out.body)
+        self.assertEqual(set(filtered["result"]), {"alice", "ghost"})
         self.assertEqual(filtered["result"]["alice"]["indexes"], {})
+
+    def test_requestor_sees_own_account_even_without_indexes(self):
+        body = {"result": {
+            "alice": {"indexes": {}},
+            "bob": {"indexes": {"secret": {}}},
+        }}
+        xom = self._make_xom({"bob/secret": False})
+        resp = self._make_response(body)
+        req = self._make_request(xom, auth_user="alice")
+        out = _filter_root_listing(req, resp, xom)
+        filtered = json.loads(out.body)
+        self.assertIn("alice", filtered["result"])
+        self.assertNotIn("bob", filtered["result"])
 
     def test_passthrough_when_body_not_json(self):
         resp = MagicMock()
@@ -521,28 +552,40 @@ class FilterRootListingTests(unittest.TestCase):
         out = _filter_root_listing(MagicMock(), resp, MagicMock())
         self.assertIs(out, resp)
 
-    def test_userdata_not_dict_kept_as_is(self):
+    def test_userdata_not_dict_kept_only_for_root(self):
         body = {"result": {"alice": "raw-string", "bob": {"indexes": {}}}}
         xom = self._make_xom({})
-        req = self._make_request(xom)
-        out = _filter_root_listing(req, self._make_response(body), xom)
-        filtered = json.loads(out.body)
-        self.assertEqual(filtered["result"]["alice"], "raw-string")
+        # root sees the malformed entry; anonymous does not.
+        out_root = _filter_root_listing(
+            self._make_request(xom, auth_user="root"),
+            self._make_response(body), xom)
+        self.assertEqual(json.loads(out_root.body)["result"]["alice"], "raw-string")
+        out_anon = _filter_root_listing(
+            self._make_request(xom, auth_user=None),
+            self._make_response(body), xom)
+        self.assertNotIn("alice", json.loads(out_anon.body)["result"])
 
-    def test_indexes_not_dict_kept_as_is(self):
+    def test_indexes_not_dict_kept_only_for_root(self):
         body = {"result": {"alice": {"indexes": "weird-value"}}}
         xom = self._make_xom({})
-        req = self._make_request(xom)
-        out = _filter_root_listing(req, self._make_response(body), xom)
-        filtered = json.loads(out.body)
-        self.assertEqual(filtered["result"]["alice"]["indexes"], "weird-value")
+        out_root = _filter_root_listing(
+            self._make_request(xom, auth_user="root"),
+            self._make_response(body), xom)
+        self.assertEqual(
+            json.loads(out_root.body)["result"]["alice"]["indexes"], "weird-value")
+        out_anon = _filter_root_listing(
+            self._make_request(xom, auth_user=None),
+            self._make_response(body), xom)
+        self.assertNotIn("alice", json.loads(out_anon.body)["result"])
 
     def test_getstage_exception_drops_index(self):
+        # Broken index is excluded without crashing; for root the user
+        # stays (with empty indexes), proving the exception path is hit.
         body = {"result": {"alice": {"indexes": {"broken": {}}}}}
         xom = MagicMock()
         xom.model.getstage.side_effect = RuntimeError("boom")
         resp = self._make_response(body)
-        req = self._make_request(xom)
+        req = self._make_request(xom, auth_user="root")
         out = _filter_root_listing(req, resp, xom)
         filtered = json.loads(out.body)
         self.assertEqual(filtered["result"]["alice"]["indexes"], {})
