@@ -1417,11 +1417,17 @@
                     textContent: 'Admin tokens — single index/scope, hash-only storage, audit log',
                 }));
                 typeSel.value = initialType;
-                if (hasDevpiTokens()) {
-                    body.appendChild(formGroup('Token type', typeSel));
+                // Always present in the DOM so the collector can read
+                // `.value` even when the chooser is hidden. With only Admin
+                // tokens available we keep the element but hide its group —
+                // otherwise getElementById returns null and the collector
+                // wrongly defaults to the devpi backend, POSTing to the
+                // missing `/<user>/+token-create` endpoint (404).
+                var typeGroup = formGroup('Token type', typeSel);
+                if (!hasDevpiTokens()) {
+                    typeGroup.hidden = true;
                 }
-                // Always present so the collector can read `.value` even
-                // when the chooser is hidden.
+                body.appendChild(typeGroup);
 
                 // Devpi-only: security banner (optionally dismissed).
                 var _bn = buildMacaroonSecurityBanner();
@@ -1735,7 +1741,11 @@
 
     function _collectIssueForm() {
         var typeEl = document.getElementById('token-type-select');
-        var type = (typeEl && typeEl.value) || TOKEN_TYPE_DEVPI;
+        // Fall back to the only available backend when the chooser is
+        // absent — never blindly assume devpi, or we POST to a missing
+        // endpoint on servers without the devpi-tokens plugin.
+        var type = (typeEl && typeEl.value)
+            || (hasDevpiTokens() ? TOKEN_TYPE_DEVPI : TOKEN_TYPE_ADMIN);
 
         // Common: expires (preset TTL or absolute datetime).
         var expSel = document.getElementById('macaroon-expires-select');
