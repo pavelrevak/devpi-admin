@@ -7,7 +7,7 @@ from pyramid.httpexceptions import HTTPBadRequest, HTTPForbidden, HTTPNotFound
 
 from devpi_admin.main import (
     _check_read_access, _get_stage_or_404, _refresh_mirror_cache_view,
-    _serve_index, _versiondata_view)
+    _serve_index, _versiondata_view, _versions_view)
 
 
 class GetStageOr404Tests(unittest.TestCase):
@@ -223,6 +223,61 @@ class VersiondataViewTests(unittest.TestCase):
         verdata = {"name": "testpkg", "version": "1.0"}
         body = json.loads(_versiondata_view(self._make(verdata)).body)
         self.assertEqual(body["result"]["+links"], [])
+
+
+class VersionsViewTests(unittest.TestCase):
+    """_versions_view separates local (deletable) from inherited versions."""
+
+    def _req(self, staging):
+        xom = MagicMock()
+        xom.model.getstage.return_value = staging
+        req = MagicMock()
+        req.registry = {"xom": xom}
+        req.matchdict = {
+            "user": "villapro", "index": "staging", "project": "mypkg"}
+        req.has_permission.return_value = True
+        req.authenticated_userid = "villapro"
+        return req
+
+    def test_splits_local_and_inherited_with_origin(self):
+        # Chain: pypi <- production <- staging. Staging holds the rc
+        # versions, production the released ones; the view must mark only
+        # the staging versions as local and label the rest by origin.
+        staging = MagicMock()
+        staging.name = "villapro/staging"
+        production = MagicMock()
+        production.name = "villapro/production"
+        staging.ixconfig = {"volatile": True}
+        staging.list_versions.return_value = {
+            "1.2.3", "1.2.3rc1", "1.2.2", "1.2.2rc1"}
+        staging.op_sro_check_mirror_whitelist.return_value = [
+            (staging, {"1.2.3rc1", "1.2.2rc1"}),
+            (production, {"1.2.3", "1.2.2"}),
+        ]
+        body = json.loads(_versions_view(self._req(staging)).body)
+        self.assertEqual(body["local_versions"], ["1.2.3rc1", "1.2.2rc1"])
+        self.assertEqual(body["version_origin"], {
+            "1.2.3": "villapro/production",
+            "1.2.2": "villapro/production"})
+        # Local versions never get an origin label.
+        self.assertNotIn("1.2.3rc1", body["version_origin"])
+        self.assertTrue(body["volatile"])
+
+    def test_fallback_when_sro_walk_unavailable(self):
+        # If devpi internals change and the SRO walk raises, degrade to a
+        # plain perstage lookup (no origin labels) instead of erroring.
+        staging = MagicMock()
+        staging.name = "villapro/staging"
+        staging.ixconfig = {"volatile": False}
+        staging.list_versions.return_value = {"1.0", "2.0"}
+        staging.op_sro_check_mirror_whitelist.side_effect = AttributeError
+        # 9.9 isn't in the merged list → must be filtered out.
+        staging.list_versions_perstage.return_value = {"2.0", "9.9"}
+        body = json.loads(_versions_view(self._req(staging)).body)
+        self.assertEqual(body["local_versions"], ["2.0"])
+        self.assertEqual(body["version_origin"], {})
+        # Non-volatile flag is surfaced so the UI can disable delete actions.
+        self.assertFalse(body["volatile"])
 
 
 if __name__ == "__main__":

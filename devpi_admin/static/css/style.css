@@ -114,6 +114,17 @@ body {
     color: #fff;
 }
 
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Keep disabled danger buttons inert on hover (no fill/colour swap). */
+.btn-danger:disabled:hover {
+    background: transparent;
+    color: var(--error);
+}
+
 .btn-small {
     padding: 4px 10px;
     font-size: 12px;
@@ -1049,6 +1060,20 @@ body {
     color: #fff;
 }
 
+.kebab-item:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Disabled kebab items stay inert on hover. */
+.kebab-item:disabled:hover {
+    background: none;
+}
+
+.kebab-item-danger:disabled:hover {
+    color: var(--error);
+}
+
 /* --- Data tables (matching LPR) --- */
 
 .data-table {
@@ -1694,6 +1719,40 @@ body {
 
 .pkg-version-del:hover {
     background: var(--table-hover);
+}
+
+.pkg-version-del:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.pkg-version-del:disabled:hover {
+    background: none;
+}
+
+/* Inherited (base-index) versions: read-only, visually de-emphasised. */
+.pkg-version-inherited .pkg-version-link {
+    opacity: 0.65;
+}
+
+.pkg-version-src {
+    flex-shrink: 0;
+    padding: 2px 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-decoration: none;
+    border-radius: 4px;
+}
+
+/* When the origin index is known the badge is a link to that package. */
+a.pkg-version-src:hover {
+    color: var(--text);
+    background: var(--table-hover);
+    text-decoration: underline;
 }
 
 .pkg-main {

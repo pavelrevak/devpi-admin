@@ -374,7 +374,43 @@ def _versions_view(request):
     stage = _get_stage_or_404(xom, user, index)
     _check_read_access(request, stage)
     versions = sorted(stage.list_versions(project), reverse=True)
-    return _json_response({"versions": versions})
+    # Split the inherited (base) versions from the ones actually stored in
+    # this stage. Only local versions are deletable here — deleting an
+    # inherited version via this stage's path is a no-op on devpi (it lives
+    # in a base index). We also map each inherited version to its origin
+    # index so the UI can label where it comes from. Reuse the same
+    # SRO + mirror-whitelist walk `list_versions` itself uses, so we don't
+    # pay an extra upstream fetch and stay consistent with the merged list.
+    version_set = set(versions)
+    local_versions = []
+    version_origin = {}
+    try:
+        seen_local = set()
+        for src_stage, res in stage.op_sro_check_mirror_whitelist(
+                "list_versions_perstage", project=project):
+            is_local = src_stage.name == stage.name
+            for ver in res:
+                if ver not in version_set:
+                    continue
+                if is_local:
+                    seen_local.add(ver)
+                elif ver not in version_origin:
+                    version_origin[ver] = src_stage.name
+        local_versions = sorted(seen_local, reverse=True)
+    except Exception:  # noqa: BLE001 - degrade if devpi internals change
+        # Fall back to a plain perstage lookup without origin labels.
+        local_versions = sorted(
+            set(stage.list_versions_perstage(project)) & version_set,
+            reverse=True)
+    return _json_response({
+        "versions": versions,
+        "local_versions": local_versions,
+        "version_origin": version_origin,
+        # Raw volatile flag (may be None for index types without it) so the
+        # UI can disable delete affordances on non-volatile indexes, where
+        # devpi rejects deletion.
+        "volatile": stage.ixconfig.get("volatile"),
+    })
 
 
 def _versiondata_view(request):

@@ -173,11 +173,21 @@
         }));
         var dropdownItems = [];
         for (var i = 0; i < items.length; i++) {
-            dropdownItems.push(el('button', {
-                className: 'kebab-item' + (items[i].danger ? ' kebab-item-danger' : ''),
-                textContent: items[i].label,
-                onclick: items[i].onclick,
-            }));
+            var it = items[i];
+            var itemAttrs = {
+                className: 'kebab-item' + (it.danger ? ' kebab-item-danger' : ''),
+                textContent: it.label,
+            };
+            if (it.disabled) {
+                // Disabled-with-reason: keep the action discoverable but
+                // inert, with a tooltip explaining why (e.g. non-volatile
+                // index can't be deleted from).
+                itemAttrs.disabled = true;
+                if (it.title) itemAttrs.title = it.title;
+            } else {
+                itemAttrs.onclick = it.onclick;
+            }
+            dropdownItems.push(el('button', itemAttrs));
         }
         menu.appendChild(el('div', {className: 'kebab-dropdown', hidden: true}, dropdownItems));
         return menu;
@@ -397,6 +407,20 @@
 
     function isPublicAclRead(aclRead) {
         if (!aclRead || !aclRead.length) return true;
+        for (var i = 0; i < aclRead.length; i++) {
+            if (aclRead[i] === ':ANONYMOUS:') return true;
+        }
+        return false;
+    }
+
+    function isExplicitlyPublicRead(aclRead) {
+        // Stricter than isPublicAclRead: only an explicit ':ANONYMOUS:'
+        // counts as public. Real public indexes always carry it (e.g.
+        // root/pypi → [':ANONYMOUS:']); an empty/absent acl_read is
+        // ambiguous — it may simply be hidden from the current (read-only)
+        // user — so we must NOT advertise the credential-free pip.conf
+        // quick action for it.
+        if (!aclRead || !aclRead.length) return false;
         for (var i = 0; i < aclRead.length; i++) {
             if (aclRead[i] === ':ANONYMOUS:') return true;
         }
@@ -2988,7 +3012,7 @@
                 // user picks scope/TTL and gets a credentialed pip.conf.
                 var loggedIn = Api.getUser();
                 var menuItems = [];
-                if (isPublicAclRead(idx.acl_read)) {
+                if (isExplicitlyPublicRead(idx.acl_read)) {
                     (function (path) {
                         menuItems.push({
                             label: 'pip.conf',
@@ -3003,7 +3027,8 @@
                 // separate "pip.conf + token" / ".pypirc + token" / "Devpi
                 // tokens" trio. Issuance is now consistent across user and
                 // index contexts.
-                if (loggedIn === 'root' || loggedIn === idx._user) {
+                if (canIssueTokenForIndex(
+                        idx._user, idx.acl_read, idx.acl_upload)) {
                     (function (idxRef) {
                         menuItems.push({
                             label: 'Tokens',
@@ -3024,6 +3049,9 @@
                         });
                         menuItems.push({
                             label: 'Delete', danger: true,
+                            disabled: isNonVolatile(idxRef.volatile),
+                            title: isNonVolatile(idxRef.volatile)
+                                ? NON_VOLATILE_DELETE_HINT : null,
                             onclick: function () { closeAllKebabs(); deleteIndex(idxRef._full); },
                         });
                     })(idx);
@@ -3363,7 +3391,43 @@
         return user === 'root' || user === indexPath.split('/')[0];
     }
 
-    function buildPackageCard(indexPath, pkg, fetchVersion) {
+    // Devpi rejects deletion on a non-volatile index (index delete: hard
+    // 403, no override; package/version delete: 403 unless ?force). We keep
+    // the delete affordances visible but disabled with this explanation so
+    // the capability stays discoverable. Treat only an explicit `false` as
+    // non-volatile — when the flag is unknown, leave the action enabled and
+    // let the server have the final say.
+    var NON_VOLATILE_DELETE_HINT =
+        'Index is non-volatile — open Edit and enable "volatile" to allow '
+        + 'deletion.';
+
+    function isNonVolatile(volatileFlag) {
+        return volatileFlag === false;
+    }
+
+    // Editing or deleting an index (or its packages) is an owner-or-root
+    // action — same predicate as canDeleteFromIndex, named for the intent.
+    function canManageIndex(indexPath) {
+        return canDeleteFromIndex(indexPath);
+    }
+
+    // Issuing a token only needs READ access to the index: the owner, root,
+    // a principal listed in acl_read/acl_upload, or a public index. Such a
+    // user can mint a token bound to themselves for indexes they can reach,
+    // so the Tokens action is offered to them even though they can't manage
+    // the index.
+    function canIssueTokenForIndex(ownerUser, aclRead, aclUpload) {
+        var user = Api.getUser();
+        if (!user) return false;
+        if (user === 'root' || user === ownerUser) return true;
+        aclRead = aclRead || [];
+        aclUpload = aclUpload || [];
+        return isPublicAclRead(aclRead)
+            || aclRead.indexOf(user) !== -1
+            || aclUpload.indexOf(user) !== -1;
+    }
+
+    function buildPackageCard(indexPath, pkg, fetchVersion, nonVolatile) {
         var card = el('div', {className: 'pkg-card'});
         var cardHead = el('div', {className: 'pkg-card-head'});
         cardHead.appendChild(el('a', {
@@ -3374,7 +3438,12 @@
 
         if (canDeleteFromIndex(indexPath)) {
             cardHead.appendChild(buildKebabMenu([
-                {label: 'Delete all versions', danger: true, onclick: function () { closeAllKebabs(); deletePackage(indexPath, pkg); }},
+                {
+                    label: 'Delete all versions', danger: true,
+                    disabled: !!nonVolatile,
+                    title: nonVolatile ? NON_VOLATILE_DELETE_HINT : null,
+                    onclick: function () { closeAllKebabs(); deletePackage(indexPath, pkg); },
+                },
             ]));
         }
         card.appendChild(cardHead);
@@ -3469,9 +3538,11 @@
             }
             (function () {
                 var aclRead = (indexInfo && indexInfo.acl_read) || [];
-                // Quick-action pip.conf only useful for public indexes
-                // (no creds required). Private indexes go through Tokens.
-                if (isPublicAclRead(aclRead)) {
+                // Quick-action pip.conf only meaningful for explicitly
+                // public indexes (no creds required). Private indexes — and
+                // any index whose acl_read is hidden from this user — go
+                // through Tokens.
+                if (isExplicitlyPublicRead(aclRead)) {
                     actions.push(el('button', {
                         className: 'btn',
                         textContent: 'pip.conf',
@@ -3482,39 +3553,48 @@
                 }
             })();
             (function () {
-                // Unified Tokens flow — replaces the old "pip.conf + token"
-                // and ".pypirc + token" buttons. Owner / root only.
-                var loggedIn = Api.getUser();
-                var idxUser = indexPath.split('/')[0];
-                if (loggedIn === 'root' || loggedIn === idxUser) {
-                    var idxName = indexPath.split('/')[1];
-                    var aclRead = (indexInfo && indexInfo.acl_read) || null;
+                // Unified Tokens flow. Offered to anyone who can read the
+                // index (owner, root, acl_read/acl_upload member, public) —
+                // they can mint a token bound to themselves.
+                var hUser = indexPath.split('/')[0];
+                var hName = indexPath.split('/')[1];
+                var aclRead = (indexInfo && indexInfo.acl_read) || null;
+                var aclUpload = (indexInfo && indexInfo.acl_upload) || null;
+                if (canIssueTokenForIndex(hUser, aclRead, aclUpload)) {
                     actions.push(el('button', {
                         className: 'btn auth-only',
                         textContent: 'Tokens',
                         onclick: function () {
-                            showIndexTokensModal(idxUser, idxName, aclRead);
+                            showIndexTokensModal(hUser, hName, aclRead);
                         },
                     }));
                 }
             })();
-            actions.push(el('button', {
-                className: 'btn auth-only',
-                textContent: 'Edit',
-                onclick: function () {
-                    fetchRoot().then(function (result) {
-                        var idx = Object.assign(
-                            {}, indexInfo,
-                            {_user: idxUser, _name: idxName, _full: indexPath});
-                        showIndexModal(idx, result);
-                    }).catch(handleApiError);
-                },
-            }));
-            actions.push(el('button', {
-                className: 'btn btn-danger auth-only',
-                textContent: 'Delete',
-                onclick: function () { deleteIndex(indexPath); },
-            }));
+            // Edit / Delete are owner-or-root only (a read-only user never
+            // sees them) and are less frequent than pip.conf / Tokens, so
+            // they live in a kebab menu rather than as top-level buttons.
+            if (canManageIndex(indexPath)) {
+                var manageItems = [{
+                    label: 'Edit',
+                    onclick: function () {
+                        closeAllKebabs();
+                        fetchRoot().then(function (result) {
+                            var idx = Object.assign(
+                                {}, indexInfo,
+                                {_user: idxUser, _name: idxName, _full: indexPath});
+                            showIndexModal(idx, result);
+                        }).catch(handleApiError);
+                    },
+                }];
+                var hdrNonVolatile = isNonVolatile(indexInfo && indexInfo.volatile);
+                manageItems.push({
+                    label: 'Delete', danger: true,
+                    disabled: hdrNonVolatile,
+                    title: hdrNonVolatile ? NON_VOLATILE_DELETE_HINT : null,
+                    onclick: function () { closeAllKebabs(); deleteIndex(indexPath); },
+                });
+                actions.push(buildKebabMenu(manageItems));
+            }
             content.appendChild(el('div', {className: 'view-header'}, [
                 heading,
                 el('div', {className: 'view-header-actions'}, actions),
@@ -3525,6 +3605,7 @@
 
     function renderPackages(indexPath, result, isMirror) {
         var projects = result.projects || [];
+        var nonVolatile = isNonVolatile(result && result.volatile);
         var loading = content.querySelector('.loading');
         if (loading) loading.remove();
 
@@ -3604,7 +3685,8 @@
             }
 
             for (var k = 0; k < matches.length; k++) {
-                grid.appendChild(buildPackageCard(indexPath, matches[k], !isMirror));
+                grid.appendChild(buildPackageCard(
+                    indexPath, matches[k], !isMirror, nonVolatile));
             }
         }
 
@@ -3634,6 +3716,15 @@
         var versionsUrl = '/+admin-api/versions/' + indexPath + '/' + pkg;
         Api.get(versionsUrl).then(function (verData) {
             var versions = (verData.versions || []).sort(compareVersions);
+            // Versions stored in THIS stage (deletable) vs inherited from a
+            // base index. Inherited versions are shown read-only with an
+            // origin badge; only local versions get a delete (×) button.
+            var localSet = {};
+            (verData.local_versions || versions).forEach(function (v) {
+                localSet[v] = true;
+            });
+            var origin = verData.version_origin || {};
+            var nonVolatile = isNonVolatile(verData.volatile);
             var currentVer = selectedVersion && versions.indexOf(selectedVersion) !== -1
                 ? selectedVersion : versions[0];
             if (!currentVer) {
@@ -3644,15 +3735,20 @@
             var detailUrl = '/+admin-api/versiondata/' + indexPath + '/' + pkg + '/' + currentVer;
             return Api.get(detailUrl).then(function (detail) {
                 return {versions: versions, currentVer: currentVer,
+                    localSet: localSet, origin: origin, nonVolatile: nonVolatile,
                     info: detail.result || {}};
             }).catch(function () {
                 return {versions: versions, currentVer: currentVer,
+                    localSet: localSet, origin: origin, nonVolatile: nonVolatile,
                     info: {version: currentVer, name: pkg}};
             });
         }).then(function (ctx) {
             if (!ctx) return;
             var versions = ctx.versions;
             var currentVer = ctx.currentVer;
+            var localSet = ctx.localSet;
+            var origin = ctx.origin;
+            var nonVolatile = ctx.nonVolatile;
             var info = ctx.info;
             clear(content);
 
@@ -3679,13 +3775,25 @@
                     ' ',
                     el('span', {className: 'page-heading-version', textContent: 'v' + currentVer}),
                 ]),
-                el('div', {className: 'view-header-actions'}, canDeleteFromIndex(indexPath) ? [
-                    el('button', {
-                        className: 'btn btn-danger',
-                        textContent: 'Delete package',
-                        onclick: function () { deletePackage(indexPath, pkg); },
-                    }),
-                ] : []),
+                el('div', {className: 'view-header-actions'},
+                    (canDeleteFromIndex(indexPath)
+                        && Object.keys(localSet).length > 0) ? [
+                        (function () {
+                            var pkgDelAttrs = {
+                                className: 'btn btn-danger',
+                                textContent: 'Delete package',
+                            };
+                            if (nonVolatile) {
+                                pkgDelAttrs.disabled = true;
+                                pkgDelAttrs.title = NON_VOLATILE_DELETE_HINT;
+                            } else {
+                                pkgDelAttrs.onclick = function () {
+                                    deletePackage(indexPath, pkg);
+                                };
+                            }
+                            return el('button', pkgDelAttrs);
+                        })(),
+                    ] : []),
             ]));
 
             if (versions.length === 0) {
@@ -3852,28 +3960,63 @@
                 el('span', {className: 'pkg-sidebar-count', textContent: String(versions.length)}),
             ]));
 
+            // Delete affordances only for users who can manage the index
+            // (owner / root); a read-only viewer never sees a \u00d7 button.
+            var canDel = canDeleteFromIndex(indexPath);
             var versList = el('div', {className: 'pkg-version-list'});
             for (var v = 0; v < versions.length; v++) {
                 var ver = versions[v];
-                var rowCls = 'pkg-version-row' + (ver === currentVer ? ' pkg-version-active' : '');
+                var isLocal = !!localSet[ver];
+                var rowCls = 'pkg-version-row'
+                    + (ver === currentVer ? ' pkg-version-active' : '')
+                    + (isLocal ? '' : ' pkg-version-inherited');
                 var row = el('div', {className: rowCls});
                 row.appendChild(el('a', {
                     href: '#package/' + indexPath + '/' + pkg + '?version=' + encodeURIComponent(ver),
                     className: 'pkg-version-link',
                     textContent: 'v' + ver,
                 }));
-                row.appendChild((function (verLocal) {
-                    return el('button', {
-                        className: 'pkg-version-del auth-only',
-                        textContent: '\u00d7',
-                        title: 'Delete version',
-                        onclick: function (e) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            deleteVersion(indexPath, pkg, verLocal);
-                        },
-                    });
-                })(ver));
+                if (isLocal && canDel) {
+                    // Local to this stage \u2192 deletable (unless non-volatile,
+                    // where devpi rejects deletion \u2192 show disabled).
+                    row.appendChild((function (verLocal) {
+                        var delAttrs = {
+                            className: 'pkg-version-del',
+                            textContent: '\u00d7',
+                        };
+                        if (nonVolatile) {
+                            delAttrs.disabled = true;
+                            delAttrs.title = NON_VOLATILE_DELETE_HINT;
+                        } else {
+                            delAttrs.title = 'Delete version';
+                            delAttrs.onclick = function (e) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                deleteVersion(indexPath, pkg, verLocal);
+                            };
+                        }
+                        return el('button', delAttrs);
+                    })(ver));
+                } else if (!isLocal) {
+                    // Inherited from a base index \u2192 read-only. When we know
+                    // the origin index, link straight to the package there.
+                    var src = origin[ver];
+                    if (src) {
+                        row.appendChild(el('a', {
+                            className: 'pkg-version-src',
+                            href: '#package/' + src + '/' + pkg
+                                + '?version=' + encodeURIComponent(ver),
+                            textContent: '\u2191 ' + src,
+                            title: 'Open ' + pkg + ' ' + ver + ' in ' + src,
+                        }));
+                    } else {
+                        row.appendChild(el('span', {
+                            className: 'pkg-version-src',
+                            textContent: 'inherited',
+                            title: 'Inherited from a base index',
+                        }));
+                    }
+                }
                 versList.appendChild(row);
             }
             versCard.appendChild(versList);

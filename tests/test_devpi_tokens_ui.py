@@ -251,16 +251,30 @@ class IndexTokensFilterTests(unittest.TestCase):
         self.assertIn("if (!parsed.indexes || !parsed.indexes.length) return true",
             self.js)
 
-    def test_index_tokens_kebab_gated_to_owner_or_root(self):
-        # Unified Tokens kebab is offered for both Admin and Devpi tokens,
-        # so it doesn't depend on hasDevpiTokens — owner/root see it
-        # always, then the modal hides any empty section internally.
+    def test_index_tokens_kebab_offered_to_readers(self):
+        # The Tokens kebab is offered to anyone who can read the index
+        # (owner, root, acl_read/acl_upload member, public) so a read-only
+        # user can mint a token bound to themselves — not just owner/root.
         self.assertIn(
-            "if (loggedIn === 'root' || loggedIn === idx._user) {\n"
+            "if (canIssueTokenForIndex(\n"
+            "                        idx._user, idx.acl_read, idx.acl_upload)) {\n"
             "                    (function (idxRef) {\n"
             "                        menuItems.push({\n"
             "                            label: 'Tokens',",
             self.js)
+
+    def test_token_issuance_allows_acl_read_members(self):
+        # The read-access predicate honours acl_read / acl_upload membership
+        # and public indexes, not only ownership.
+        self.assertIn(
+            "function canIssueTokenForIndex(ownerUser, aclRead, aclUpload)",
+            self.js)
+        self.assertIn("aclRead.indexOf(user) !== -1", self.js)
+        self.assertIn("aclUpload.indexOf(user) !== -1", self.js)
+
+    def test_index_manage_actions_owner_or_root_only(self):
+        # Edit / Delete stay gated to owner-or-root in the detail header.
+        self.assertIn("if (canManageIndex(indexPath)) {", self.js)
 
 
 class UnifiedIssueModalTests(unittest.TestCase):
@@ -449,7 +463,11 @@ class IndexKebabTests(unittest.TestCase):
     def test_pip_conf_kebab_only_for_public_indexes(self):
         # Private indexes route through the unified Tokens flow so the
         # user explicitly chooses scope/TTL and gets credentialed config.
-        self.assertIn("if (isPublicAclRead(idx.acl_read))", self.js)
+        # The quick action requires an EXPLICIT ':ANONYMOUS:' — an empty or
+        # hidden acl_read (e.g. a read-only user who can't see the ACL) must
+        # not be mistaken for public.
+        self.assertIn("if (isExplicitlyPublicRead(idx.acl_read))", self.js)
+        self.assertIn("function isExplicitlyPublicRead(aclRead)", self.js)
         # The private-side "pip.conf + token" / ".pypirc + token" quick
         # actions are gone.
         self.assertNotIn("'pip.conf' + (needsToken ? ' + token' : '')", self.js)
